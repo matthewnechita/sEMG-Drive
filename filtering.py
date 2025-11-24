@@ -58,3 +58,4 @@ if __name__ == "__main__":
     filtered_emg = apply_filters(fi, emg)
 
     save_filtered_data(output_file, filtered_emg, fs)
+    
