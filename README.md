@@ -1,3 +1,5 @@
+# Ignore this readme, its Delsys README file
+
 # DelsysAPI Python Example
 
 This is an example Python GUI application that uses the DelsysAPI AeroPy Layer to demonstrate functionality that users can implement in their own code. This example allows a user to connect to the base station, pair new sensors, scan for paired sensors, then stream EMG data visualized by plots. 
