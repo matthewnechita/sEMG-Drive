@@ -1,7 +1,5 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import scipy as sp
-import libemg as emg
+from libemg import filtering
 
 # LOAD IN THE RAW EMG DATA
 def load_emg_data(file_path):
