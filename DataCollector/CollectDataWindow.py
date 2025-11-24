@@ -1,0 +1,715 @@
+"""
+Data Collector GUI
+This is the GUI that lets you connect to a base, scan via rf for sensors, and stream data from them in real time.
+"""
+
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+from PySide6.QtCore import *
+from PySide6.QtGui import *
+from PySide6.QtWidgets import *
+from DataCollector.CollectDataController import *
+import tkinter as tk
+from tkinter import filedialog
+import numpy as np
+
+from DataCollector.CollectionMetricsManagement import CollectionMetricsManagement
+from Plotter import GenericPlot as gp
+
+
+@dataclass
+class TrialConfig:
+    gestures: List[str]
+    gesture_duration: float
+    neutral_duration: float
+    repetitions: int
+    subject: str
+    session: str
+    prep_duration: float = 3.0
+
+
+class CollectDataWindow(QWidget):
+    plot_enabled = False
+
+    def __init__(self, controller):
+        QWidget.__init__(self)
+        self.pipelinetext = "Off"
+        self.controller = controller
+        self.buttonPanel = self.ButtonPanel()
+        self.plotPanel = None
+        self.collectionLabelPanel = self.CollectionLabelPanel()
+        self.instructionsPanel = self.InstructionPanel()
+
+        self.grid = QGridLayout(self)
+
+        self.MetricsConnector = CollectionMetricsManagement()
+        self.collectionLabelPanel.setFixedHeight(275)
+        self.MetricsConnector.collectionmetrics.setFixedHeight(275)
+
+        self.metricspanel = QWidget()
+        self.metricspane = QHBoxLayout()
+        self.metricspane.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.metricspane.addWidget(self.collectionLabelPanel)
+        self.metricspane.addWidget(self.MetricsConnector.collectionmetrics)
+        self.metricspanel.setLayout(self.metricspane)
+        self.metricspanel.setFixedWidth(400)
+        self.grid.addWidget(self.buttonPanel, 0, 0)
+        self.grid.addWidget(self.metricspanel, 0, 1)
+        self.grid.addWidget(self.instructionsPanel, 1, 0, 1, 2)
+
+        self.setStyleSheet("background-color:#3d4c51;")
+        self.setLayout(self.grid)
+        self.setWindowTitle("Collect Data GUI")
+        self.pairing = False
+        self.selectedSensor = None
+        self.protocol_running = False
+        self.protocol_abort = False
+
+    def AddPlotPanel(self):
+        self.plotPanel = self.Plotter()
+        self.grid.addWidget(self.plotPanel, 0, 2)
+
+    def SetCallbackConnector(self):
+        if self.plot_enabled:
+            self.CallbackConnector = PlottingManagement(self, self.MetricsConnector, self.plotCanvas)
+        else:
+            self.CallbackConnector = PlottingManagement(self, self.MetricsConnector)
+
+    # -----------------------------------------------------------------------
+    # ---- GUI Components
+    def ButtonPanel(self):
+        buttonPanel = QWidget()
+        buttonPanel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        buttonLayout = QVBoxLayout()
+        findSensor_layout = QHBoxLayout()
+        # ---- Pair Button
+        self.pair_button = QPushButton('Pair', self)
+        self.pair_button.setToolTip('Pair Sensors')
+        self.pair_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.pair_button.objectName = 'Pair'
+        self.pair_button.clicked.connect(self.pair_callback)
+        self.pair_button.setStyleSheet('QPushButton {color: grey;}')
+        self.pair_button.setEnabled(False)
+        self.pair_button.setFixedHeight(50)
+        findSensor_layout.addWidget(self.pair_button)
+
+        # ---- Scan Button
+        self.scan_button = QPushButton('Scan', self)
+        self.scan_button.setToolTip('Scan for Sensors')
+        self.scan_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.scan_button.objectName = 'Scan'
+        self.scan_button.clicked.connect(self.scan_callback)
+        self.scan_button.setStyleSheet('QPushButton {color: grey;}')
+        self.scan_button.setEnabled(False)
+        self.scan_button.setFixedHeight(50)
+        findSensor_layout.addWidget(self.scan_button)
+
+        buttonLayout.addLayout(findSensor_layout)
+
+        triggerLayout = QHBoxLayout()
+
+        self.starttriggerlabel = QLabel('Start Trigger', self)
+        self.starttriggerlabel.setStyleSheet("color : grey")
+        triggerLayout.addWidget(self.starttriggerlabel)
+        self.starttriggercheckbox = QCheckBox()
+        self.starttriggercheckbox.setEnabled(False)
+        triggerLayout.addWidget(self.starttriggercheckbox)
+        self.stoptriggerlabel = QLabel('Stop Trigger', self)
+        self.stoptriggerlabel.setStyleSheet("color : grey")
+        triggerLayout.addWidget(self.stoptriggerlabel)
+        self.stoptriggercheckbox = QCheckBox()
+        self.stoptriggercheckbox.setEnabled(False)
+        triggerLayout.addWidget(self.stoptriggercheckbox)
+
+        buttonLayout.addLayout(triggerLayout)
+
+        # ---- Start Button
+        self.start_button = QPushButton('Start', self)
+        self.start_button.setToolTip('Start Sensor Stream')
+        self.start_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.start_button.objectName = 'Start'
+        self.start_button.clicked.connect(self.start_callback)
+        self.start_button.setStyleSheet('QPushButton {color: grey;}')
+        self.start_button.setEnabled(False)
+        self.start_button.setFixedHeight(50)
+        buttonLayout.addWidget(self.start_button)
+
+        # ---- Stop Button
+        self.stop_button = QPushButton('Stop', self)
+        self.stop_button.setToolTip('Stop Sensor Stream')
+        self.stop_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.stop_button.objectName = 'Stop'
+        self.stop_button.clicked.connect(self.stop_callback)
+        self.stop_button.setStyleSheet('QPushButton {color: grey;}')
+        self.stop_button.setEnabled(False)
+        self.stop_button.setFixedHeight(50)
+        buttonLayout.addWidget(self.stop_button)
+
+        # ---- Export CSV Button
+        self.exportcsv_button = QPushButton('Export CSV', self)
+        self.exportcsv_button.setToolTip('Export collected data to project root - data.csv')
+        self.exportcsv_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.exportcsv_button.objectName = 'Export'
+        self.exportcsv_button.clicked.connect(self.exportcsv_callback)
+        self.exportcsv_button.setStyleSheet('QPushButton {color: grey;}')
+        self.exportcsv_button.setEnabled(False)
+        self.exportcsv_button.setFixedHeight(50)
+        buttonLayout.addWidget(self.exportcsv_button)
+
+        # ---- Labeled Protocol (NPZ) Button
+        self.recordnpz_button = QPushButton('Run Protocol + Save NPZ', self)
+        self.recordnpz_button.setToolTip('Run scripted gesture/rest protocol and save .npz with labels')
+        self.recordnpz_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.recordnpz_button.clicked.connect(self.protocol_callback)
+        self.recordnpz_button.setStyleSheet('QPushButton {color: grey;}')
+        self.recordnpz_button.setEnabled(False)
+        self.recordnpz_button.setFixedHeight(50)
+        buttonLayout.addWidget(self.recordnpz_button)
+
+        # ---- Drop-down menu of sensor modes
+        self.SensorModeList = QComboBox(self)
+        self.SensorModeList.setToolTip('Sensor Modes')
+        self.SensorModeList.objectName = 'PlaceHolder'
+        self.SensorModeList.setStyleSheet('QComboBox {color: white;background: #848482}')
+        buttonLayout.addWidget(self.SensorModeList)
+
+        # ---- List of detected sensors
+        self.SensorListBox = QListWidget(self)
+        self.SensorListBox.setToolTip('Sensor List')
+        self.SensorListBox.objectName = 'PlaceHolder'
+        self.SensorListBox.setStyleSheet('QListWidget {color: white;background:#848482}')
+        self.SensorListBox.itemClicked.connect(self.sensorList_callback)
+        self.SensorListBox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        buttonLayout.addWidget(self.SensorListBox)
+        buttonPanel.setLayout(buttonLayout)
+        buttonPanel.setFixedWidth(275)
+        return buttonPanel
+
+    def InstructionPanel(self):
+        panel = QWidget()
+        layout = QVBoxLayout()
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self.instruction_label = QLabel("Protocol idle.")
+        self.instruction_label.setWordWrap(True)
+        self.instruction_label.setStyleSheet("color:white; font-size:14pt; font-weight:bold;")
+
+        self.next_label = QLabel("Next: --")
+        self.next_label.setWordWrap(True)
+        self.next_label.setStyleSheet("color:white; font-size:12pt;")
+
+        self.timer_label = QLabel("Timer: --")
+        self.timer_label.setStyleSheet("color:white; font-size:12pt;")
+
+        self.reps_label = QLabel("Reps remaining: --")
+        self.reps_label.setStyleSheet("color:white; font-size:12pt;")
+
+        layout.addWidget(self.instruction_label)
+        layout.addWidget(self.next_label)
+        layout.addWidget(self.timer_label)
+        layout.addWidget(self.reps_label)
+        panel.setLayout(layout)
+        return panel
+
+    def Plotter(self):
+        widget = QWidget()
+        widget.setLayout(QVBoxLayout())
+
+        plot_mode = 'windowed'  # Select between 'scrolling' and 'windowed'
+        pc = gp.GenericPlot(plot_mode)
+        pc.native.objectName = 'vispyCanvas'
+        pc.native.parent = self
+        label = QLabel("*This Demo plots EMG Channels only")
+        label.setStyleSheet('.QLabel { font-size: 8pt;}')
+        label.setFixedHeight(20)
+        label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        widget.layout().addWidget(pc.native)
+        widget.layout().addWidget(label)
+        self.plotCanvas = pc
+
+        return widget
+
+    def CollectionLabelPanel(self):
+        collectionLabelPanel = QWidget()
+        collectionlabelsLayout = QVBoxLayout()
+
+        pipelinelabel = QLabel('Pipeline State:')
+        pipelinelabel.setAlignment(Qt.AlignCenter | Qt.AlignRight)
+        pipelinelabel.setStyleSheet("color:white")
+        collectionlabelsLayout.addWidget(pipelinelabel)
+
+        sensorsconnectedlabel = QLabel('Sensors Connected:', self)
+        sensorsconnectedlabel.setAlignment(Qt.AlignCenter | Qt.AlignRight)
+        sensorsconnectedlabel.setStyleSheet("color:white")
+        collectionlabelsLayout.addWidget(sensorsconnectedlabel)
+
+        totalchannelslabel = QLabel('Total Channels:', self)
+        totalchannelslabel.setAlignment(Qt.AlignCenter | Qt.AlignRight)
+        totalchannelslabel.setStyleSheet("color:white")
+        collectionlabelsLayout.addWidget(totalchannelslabel)
+
+        framescollectedlabel = QLabel('Frames Collected:', self)
+        framescollectedlabel.setAlignment(Qt.AlignCenter | Qt.AlignRight)
+        framescollectedlabel.setStyleSheet("color:white")
+        collectionlabelsLayout.addWidget(framescollectedlabel)
+
+        collectionLabelPanel.setFixedWidth(200)
+        collectionLabelPanel.setLayout(collectionlabelsLayout)
+
+        return collectionLabelPanel
+
+    # -----------------------------------------------------------------------
+    # ---- Callback Functions
+    def getpipelinestate(self):
+        self.pipelinetext = self.CallbackConnector.base.PipelineState_Callback()
+        self.MetricsConnector.pipelinestatelabel.setText(self.pipelinetext)
+
+    def connect_callback(self):
+        self.CallbackConnector.base.Connect_Callback()
+
+        self.pair_button.setEnabled(True)
+        self.pair_button.setStyleSheet('QPushButton {color: white;}')
+        self.scan_button.setEnabled(True)
+        self.scan_button.setStyleSheet('QPushButton {color: white;}')
+        self.starttriggerlabel.setStyleSheet("color : white")
+        self.stoptriggerlabel.setStyleSheet("color : white")
+        self.starttriggercheckbox.setEnabled(True)
+        self.stoptriggercheckbox.setEnabled(True)
+        self.getpipelinestate()
+        self.MetricsConnector.pipelinestatelabel.setText(self.pipelinetext + " (Base Connected)")
+
+    def pair_callback(self):
+        """Pair button callback"""
+        self.Pair_Window()
+        self.getpipelinestate()
+        self.exportcsv_button.setEnabled(False)
+        self.exportcsv_button.setStyleSheet("color : gray")
+
+    def Pair_Window(self):
+        """Open pair sensor window to set pair number and begin pairing process"""
+        pair_number, pressed = QInputDialog.getInt(QWidget(), "Input Pair Number", "Pair Number:",
+                                                   1, 0, 100, 1)
+        if pressed:
+            self.pairing = True
+            self.pair_canceled = False
+            self.CallbackConnector.base.pair_number = pair_number
+            self.PairThreadManager()
+
+    def PairThreadManager(self):
+        """Start t1 thread to begin pairing operation in DelsysAPI
+           Start t2 thread to await result of CheckPairStatus() to return False
+           Once threads begin, display awaiting sensor pair request window/countdown"""
+
+        self.t1 = threading.Thread(target=self.CallbackConnector.base.Pair_Callback)
+        self.t1.start()
+
+        self.t2 = threading.Thread(target=self.awaitPairThread)
+        self.t2.start()
+
+        self.BeginPairingUISequence()
+
+
+    def BeginPairingUISequence(self):
+        """The awaiting sensor window will stay open until either:
+           A) The pairing countdown timer completes (The end of the countdown will send a CancelPair request to the DelsysAPI)
+           or...
+           B) A sensor has been paired to the base (via self.pairing flag set by DelsysAPI CheckPairStatus() bool)
+
+           If a sensor is paired, ask the user if they want to pair another sensor (No = start a scan for all previously paired sensors)
+        """
+
+        pair_success = False
+        self.pair_countdown_seconds = 15
+
+        awaitingPairWindow = QDialog()
+        awaitingPairWindow.setWindowTitle(
+            "Sensor (" + str(self.CallbackConnector.base.pair_number) + ") Awaiting sensor pair request. . . Cancel in: " + str(self.pair_countdown_seconds))
+        awaitingPairWindow.setFixedWidth(500)
+        awaitingPairWindow.setFixedHeight(80)
+        awaitingPairWindow.show()
+
+        while self.pair_countdown_seconds > 0:
+            if self.pairing:
+                time.sleep(1)
+                self.pair_countdown_seconds -= 1
+                self.UpdateTimerUI(awaitingPairWindow)
+            else:
+                pair_success = True
+                break
+
+        awaitingPairWindow.close()
+        if not pair_success:
+            self.CallbackConnector.base.TrigBase.CancelPair()
+        else:
+            self.ShowPairAnotherSensorDialog()
+
+    def awaitPairThread(self):
+        """ Wait for a sensor to be paired
+        Once PairSensor() command is sent to the DelsysAPI, CheckPairStatus() will return True until a sensor has been paired to the base"""
+        time.sleep(1)
+        while self.pairing:
+            pairstatus = self.CallbackConnector.base.CheckPairStatus()
+            if not pairstatus:
+                self.pairing = False
+
+    def UpdateTimerUI(self, awaitingPairWindow):
+        awaitingPairWindow.setWindowTitle(
+            "Sensor (" + str(self.CallbackConnector.base.pair_number) + ") Awaiting sensor pair request. . . Cancel in: " + str(self.pair_countdown_seconds))
+
+    def ShowPairAnotherSensorDialog(self):
+        messagebox = QMessageBox()
+        messagebox.setText("Pair another sensor?")
+        messagebox.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        messagebox.setIcon(QMessageBox.Question)
+        button = messagebox.exec_()
+
+        if button == QMessageBox.Yes:
+            self.Pair_Window()
+        else:
+            self.scan_callback()
+
+    def scan_callback(self):
+        sensorList = self.CallbackConnector.base.Scan_Callback()
+
+        self.set_sensor_list_box(sensorList)
+
+        if len(sensorList) > 0:
+            self.start_button.setEnabled(True)
+            self.start_button.setStyleSheet("color : white")
+            self.stop_button.setEnabled(True)
+            self.stop_button.setStyleSheet("color : white")
+            self.recordnpz_button.setEnabled(True)
+            self.recordnpz_button.setStyleSheet("color : white")
+            self.MetricsConnector.sensorsconnected.setText(str(len(sensorList)))
+            self.starttriggercheckbox.setEnabled(True)
+            self.stoptriggercheckbox.setEnabled(True)
+        self.getpipelinestate()
+        self.exportcsv_button.setEnabled(False)
+        self.exportcsv_button.setStyleSheet("color : gray")
+
+    def set_sensor_list_box(self, sensorList):
+        self.SensorListBox.clear()
+
+        number_and_names_str = []
+        for i in range(len(sensorList)):
+            number_and_names_str.append("(" + str(sensorList[i].PairNumber) + ") " + sensorList[i].FriendlyName)
+            for j in range(len(sensorList[i].TrignoChannels)):
+                if sensorList[i].TrignoChannels[j].IsEnabled and not str(sensorList[i].TrignoChannels[j].Type) == "SkinCheck":
+                    number_and_names_str[i] += "\n     -" + sensorList[i].TrignoChannels[j].Name + " (" + str(
+                        round(sensorList[i].TrignoChannels[j].SampleRate, 3)) + " Hz)"
+
+        self.SensorListBox.addItems(number_and_names_str)
+
+    def start_callback(self):
+        self.CallbackConnector.base.Start_Callback(self.starttriggercheckbox.isChecked(),
+                                                   self.stoptriggercheckbox.isChecked())
+        self.CallbackConnector.resetmetrics()
+        self.starttriggercheckbox.setEnabled(False)
+        self.stoptriggercheckbox.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.exportcsv_button.setEnabled(False)
+        self.exportcsv_button.setStyleSheet("color : gray")
+        self.getpipelinestate()
+
+    def stop_callback(self):
+        if self.protocol_running:
+            self.protocol_abort = True
+            self.update_instruction("Stopping protocol...", None, 0, 0)
+            try:
+                self.CallbackConnector.base.Stop_Callback()
+            except Exception:
+                pass
+            return
+
+        self.CallbackConnector.base.Stop_Callback()
+        self.getpipelinestate()
+        self.exportcsv_button.setEnabled(True)
+        self.exportcsv_button.setStyleSheet("color : white")
+
+    def exportcsv_callback(self):
+        export = None
+        if self.CallbackConnector.streamYTData:
+            export = self.CallbackConnector.base.csv_writer.exportYTCSV()
+        else:
+            export = self.CallbackConnector.base.csv_writer.exportCSV()
+        self.getpipelinestate()
+        print("CSV Export: " + str(export))
+
+    def sensorList_callback(self):
+        current_selected = self.SensorListBox.currentRow()
+        if self.selectedSensor is None or self.selectedSensor != current_selected:
+            if self.selectedSensor is not None:
+                self.SensorModeList.currentIndexChanged.disconnect(self.sensorModeList_callback)
+            self.selectedSensor = self.SensorListBox.currentRow()
+            modeList = self.CallbackConnector.base.getSampleModes(self.selectedSensor)
+            curMode = self.CallbackConnector.base.getCurMode(self.selectedSensor)
+
+            if curMode is not None:
+                self.resetModeList(modeList)
+                self.SensorModeList.setCurrentText(curMode)
+                self.starttriggercheckbox.setEnabled(True)
+                self.stoptriggercheckbox.setEnabled(True)
+                self.SensorModeList.currentIndexChanged.connect(self.sensorModeList_callback)
+
+    def resetModeList(self, mode_list):
+        self.SensorModeList.clear()
+        self.SensorModeList.addItems(mode_list)
+
+    def sensorModeList_callback(self):
+        curItem = self.SensorListBox.currentRow()
+        curMode = self.CallbackConnector.base.getCurMode(curItem)
+        selMode = self.SensorModeList.currentText()
+        if curMode != selMode:
+            if selMode != '':
+                self.CallbackConnector.base.setSampleMode(curItem, selMode)
+                self.getpipelinestate()
+                self.starttriggercheckbox.setEnabled(True)
+                self.stoptriggercheckbox.setEnabled(True)
+
+                sensorList = self.CallbackConnector.base.TrigBase.GetScannedSensorsFound()
+                self.set_sensor_list_box(sensorList)
+                self.SensorModeList.setCurrentText(selMode)
+                self.SensorListBox.setCurrentRow(curItem)
+
+    # -----------------------------------------------------------------------
+    # ---- Labeled protocol runner (with plot)
+    def protocol_callback(self):
+        if not self.CallbackConnector or not hasattr(self, "CallbackConnector"):
+            QMessageBox.critical(self, "Error", "CallbackConnector not ready. Connect and scan first.")
+            return
+
+        # Basic inputs; keep lightweight
+        subject, ok = QInputDialog.getText(self, "Subject ID", "Subject (e.g., S01):", text="S01")
+        if not ok or subject.strip() == "":
+            return
+        session, ok = QInputDialog.getText(self, "Session ID", "Session (e.g., 01):", text="01")
+        if not ok or session.strip() == "":
+            return
+
+        # Defaults can be tweaked here
+        # (These could also be exposed via UI fields later)
+        config = TrialConfig(
+            gestures=["left_turn", "right_turn", "neutral"],
+            gesture_duration=5.0,  # allow time for ramp contractions
+            neutral_duration=3.0,
+            repetitions=5,
+            subject=subject.strip(),
+            session=session.strip(),
+            prep_duration=3.0,
+        )
+
+        dest_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(Path.cwd() / "data"))
+        if dest_dir == "":
+            return
+        output_path = Path(dest_dir) / f"emg_subject{config.subject}_session{config.session}.npz"
+
+        try:
+            self.run_protocol_with_plot(config, output_path)
+            QMessageBox.information(self, "Saved", f"Saved to {output_path}")
+            self.exportcsv_button.setEnabled(False)
+            self.exportcsv_button.setStyleSheet("color : gray")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def run_protocol_with_plot(self, config: TrialConfig, output_path: Path):
+        # Use YT data (time,value) to keep timestamps
+        self.CallbackConnector.streamYTData = True
+        self.CallbackConnector.pauseFlag = False
+        base = self.CallbackConnector.base
+        base.start_trigger = False
+        base.stop_trigger = False
+
+        configured = base.ConfigureCollectionOutput()
+        if not configured:
+            raise RuntimeError("Failed to configure pipeline.")
+
+        channel_count = base.channelcount
+        plotter = self.plotCanvas if self.plot_enabled else None
+        emg_idx = getattr(base, "emgChannelsIdx", [])
+        self.protocol_abort = False
+        self.protocol_running = True
+
+        base.TrigBase.Start(self.CallbackConnector.streamYTData)
+
+        all_ts: List[List[float]] = []
+        all_x: List[List[float]] = []
+        all_labels: List[str] = []
+        events = [{"event": "session_start", "t_wall": time.time()}]
+
+        try:
+            if config.prep_duration > 0:
+                events.append({"event": "prep_start", "t_wall": time.time(), "duration_s": config.prep_duration})
+                next_label = config.gestures[0] if config.gestures else None
+                self.update_instruction("Get ready", next_label, config.repetitions * len(config.gestures), config.prep_duration)
+                self.run_prep_buffer(config.prep_duration)
+
+            for rep in range(config.repetitions):
+                for idx, gesture in enumerate(config.gestures):
+                    if self.protocol_abort:
+                        break
+                    if idx + 1 < len(config.gestures):
+                        next_gesture = config.gestures[idx + 1]
+                    elif rep + 1 < config.repetitions:
+                        next_gesture = config.gestures[0]
+                    else:
+                        next_gesture = None
+
+                    duration = config.neutral_duration if gesture == "neutral" else config.gesture_duration
+                    reps_left = (config.repetitions - rep - 1) * len(config.gestures) + (len(config.gestures) - idx - 1)
+                    self.update_instruction(f"Do: {gesture}", next_gesture, reps_left, duration)
+                    events.append({"event": f"{gesture}_start", "t_wall": time.time(), "rep": rep + 1})
+                    seg_ts, seg_x, seg_labels = self.collect_segment_with_plot(
+                        self.CallbackConnector.DataHandler,
+                        gesture,
+                        duration,
+                        channel_count,
+                        plotter,
+                        emg_idx,
+                        stop_flag=self.protocol_abort_requested,
+                    )
+                    all_ts.extend(seg_ts)
+                    all_x.extend(seg_x)
+                    all_labels.extend(seg_labels)
+
+                if self.protocol_abort:
+                    break
+            if self.protocol_abort:
+                events.append({"event": "session_abort", "t_wall": time.time()})
+        finally:
+            base.Stop_Callback()
+            events.append({"event": "session_stop", "t_wall": time.time()})
+            self.protocol_running = False
+            status_text = "Protocol complete." if not self.protocol_abort else "Protocol stopped early."
+            self.update_instruction(status_text, None, 0, 0)
+
+        X = np.asarray(all_x, dtype=float)
+        timestamps = np.asarray(all_ts, dtype=float)
+        y = np.asarray(all_labels, dtype=object)
+
+        metadata = {
+            "subject": config.subject,
+            "session": config.session,
+            "gestures": config.gestures,
+            "gesture_duration_s": config.gesture_duration,
+            "neutral_duration_s": config.neutral_duration,
+            "repetitions": config.repetitions,
+            "channel_count": channel_count,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "prep_duration_s": config.prep_duration,
+            "ramp_style": "ramp contractions (longer window for non-neutral gestures)",
+        }
+
+        if self.protocol_abort:
+            if output_path.exists():
+                try:
+                    output_path.unlink()
+                except Exception:
+                    pass
+            return
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            output_path,
+            X=X,
+            timestamps=timestamps,
+            y=y,
+            events=np.asarray(events, dtype=object),
+            metadata=metadata,
+        )
+        print(f"Saved {X.shape[0]} samples to {output_path}")
+
+    def collect_segment_with_plot(
+        self,
+        kernel,
+        label: str,
+        duration_s: float,
+        channel_count: int,
+        plotter=None,
+        emg_idx: Optional[List[int]] = None,
+        stop_flag=None,
+    ) -> Tuple[List[List[float]], List[List[float]], List[str]]:
+        ts_buffer: List[List[float]] = []
+        x_buffer: List[List[float]] = []
+        labels: List[str] = []
+        end_time = time.time() + duration_s
+
+        while time.time() < end_time:
+            if stop_flag and stop_flag():
+                break
+            remaining = max(0, end_time - time.time())
+            self.update_timer(remaining)
+            out = kernel.GetYTData()
+            if out is None:
+                time.sleep(0.001)
+                continue
+
+            channel_times = []
+            channel_values = []
+            for channel in out:
+                if not channel:
+                    continue
+                chan_array = np.asarray(channel[0], dtype=object)
+                if chan_array.size == 0:
+                    continue
+                times, values = zip(*[self._pair_time_value(s) for s in chan_array])
+                channel_times.append(list(times))
+                channel_values.append(list(values))
+
+            if len(channel_values) < channel_count:
+                continue
+
+            sample_count = min(len(c) for c in channel_values)
+            if sample_count == 0:
+                continue
+
+            for idx in range(sample_count):
+                ts_buffer.append([channel_times[ch][idx] for ch in range(channel_count)])
+                x_buffer.append([channel_values[ch][idx] for ch in range(channel_count)])
+                labels.append(label)
+
+            if plotter and emg_idx:
+                try:
+                    emg_data = [channel_values[ch] for ch in emg_idx]
+                    next_vals = [vals[-1] for vals in emg_data]
+                    plotter.plot_new_data(emg_data, next_vals)
+                except Exception as e:
+                    print(f"Plot update error: {e}")
+
+            QApplication.processEvents()
+
+        return ts_buffer, x_buffer, labels
+
+    # --- UI helpers for protocol guidance
+    def protocol_abort_requested(self) -> bool:
+        return self.protocol_abort
+
+    def run_prep_buffer(self, duration: float):
+        """Small countdown before starting gesture collection."""
+        end_time = time.time() + duration
+        while time.time() < end_time and not self.protocol_abort:
+            remaining = max(0, end_time - time.time())
+            self.update_timer(remaining)
+            QApplication.processEvents()
+            time.sleep(0.05)
+
+    def update_instruction(self, text: str, next_gesture: Optional[str], reps_left: int, duration: float):
+        self.instruction_label.setText(text)
+        if next_gesture:
+            self.next_label.setText(f"Next: {next_gesture}")
+        else:
+            self.next_label.setText("Next: --")
+        self.reps_label.setText(f"Reps remaining: {reps_left}")
+        self.timer_label.setText(f"Timer: {duration:.1f}s")
+        QApplication.processEvents()
+
+    def update_timer(self, remaining: float):
+        self.timer_label.setText(f"Timer: {remaining:.1f}s")
+
+    def _pair_time_value(self, sample) -> Tuple[float, float]:
+        if hasattr(sample, "Item1"):
+            return float(sample.Item1), float(sample.Item2)
+        return float(sample[0]), float(sample[1])
