@@ -65,8 +65,10 @@ def apply_filters(fi, emg):
     This method applies the defined filters onto the raw EMG data
     '''
     filtered_data = fi.filter(emg)
+    rectified = np.abs(filtered_data) # new line to add rectification, just pulling absolute value on filtered_
+                                      # data, then return rectified instead of filtered_data
     
-    return np.array(filtered_data)
+    return np.array(rectified)
 
 # SAVE THE FILTERED DATA INTO A .npz FILE
 def save_filtered_data(output_path, filtered, fs, extras):
