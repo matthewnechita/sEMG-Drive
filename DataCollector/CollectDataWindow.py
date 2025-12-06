@@ -68,7 +68,7 @@ class CollectDataWindow(QWidget):
         self.setStyleSheet("background-color:#3d4c51;")
         self.setLayout(self.grid)
         self.setWindowTitle("Collect Data GUI")
-        self.setMinimumSize(1500, 900)
+        self.setMinimumSize(1350, 820)
         self.pairing = False
         self.selectedSensor = None
         self.protocol_running = False
@@ -511,7 +511,7 @@ class CollectDataWindow(QWidget):
             repetitions=5,
             subject=subject.strip(),
             session=session.strip(),
-            prep_duration=3.0,
+            prep_duration=5.0,
         )
 
         dest_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(Path.cwd() / "data"))
