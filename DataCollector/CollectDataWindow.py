@@ -60,10 +60,15 @@ class CollectDataWindow(QWidget):
         self.grid.addWidget(self.buttonPanel, 0, 0)
         self.grid.addWidget(self.metricspanel, 0, 1)
         self.grid.addWidget(self.instructionsPanel, 1, 0, 1, 2)
+        # Let the button/sensor column breathe so sensor settings aren't cut off
+        self.grid.setColumnStretch(0, 3)
+        self.grid.setColumnStretch(1, 2)
+        self.grid.setColumnStretch(2, 4)
 
         self.setStyleSheet("background-color:#3d4c51;")
         self.setLayout(self.grid)
         self.setWindowTitle("Collect Data GUI")
+        self.setMinimumSize(1500, 900)
         self.pairing = False
         self.selectedSensor = None
         self.protocol_running = False
@@ -83,7 +88,7 @@ class CollectDataWindow(QWidget):
     # ---- GUI Components
     def ButtonPanel(self):
         buttonPanel = QWidget()
-        buttonPanel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        buttonPanel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         buttonLayout = QVBoxLayout()
         findSensor_layout = QHBoxLayout()
         # ---- Pair Button
@@ -175,6 +180,10 @@ class CollectDataWindow(QWidget):
         self.SensorModeList.setToolTip('Sensor Modes')
         self.SensorModeList.objectName = 'PlaceHolder'
         self.SensorModeList.setStyleSheet('QComboBox {color: white;background: #848482}')
+        self.SensorModeList.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.SensorModeList.setMinimumWidth(360)
+        self.SensorModeList.setFixedHeight(40)
+        self.SensorModeList.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         buttonLayout.addWidget(self.SensorModeList)
 
         # ---- List of detected sensors
@@ -183,10 +192,13 @@ class CollectDataWindow(QWidget):
         self.SensorListBox.objectName = 'PlaceHolder'
         self.SensorListBox.setStyleSheet('QListWidget {color: white;background:#848482}')
         self.SensorListBox.itemClicked.connect(self.sensorList_callback)
-        self.SensorListBox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.SensorListBox.setMinimumWidth(360)
+        self.SensorListBox.setMinimumHeight(350)
+        self.SensorListBox.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.SensorListBox.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         buttonLayout.addWidget(self.SensorListBox)
         buttonPanel.setLayout(buttonLayout)
-        buttonPanel.setFixedWidth(275)
+        buttonPanel.setMinimumWidth(400)
         return buttonPanel
 
     def InstructionPanel(self):
