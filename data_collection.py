@@ -236,8 +236,11 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    output_name = f"emg_subject{args.subject}_session{args.session}.npz"
-    output_path = args.output_dir / output_name
+    output_name = f"emg_subject{args.subject}_session{args.session}_raw.npz"
+    base_dir = args.output_dir
+    if base_dir.name != "raw":
+        base_dir = base_dir / "raw"
+    output_path = base_dir / output_name
     config = TrialConfig(
         gestures=args.gestures,
         gesture_duration=args.gesture_duration,

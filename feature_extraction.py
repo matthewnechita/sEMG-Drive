@@ -5,13 +5,14 @@ from libemg.utils import get_windows
 
 # Extract a predefined feature group
 # features_2 = fe.extract_feature_group('HTD', windows) # feature group defined by libEMG
-# from research, right now we are using MAV, RMS, WL, ZC, and possibly SSC. This seems to be pretty
-# lightweight and common based on research papers, I think using RMS may change our filtering process a bit 
+# from research, right now we are using MAV, RMS, WL, ZC, and SSC. This seems to be pretty
+# lightweight and common based on research papers, I think using RMS may change our filtering process a bit
 fe = FeatureExtractor()
 root = Path("data")
-feature_list = ['MAV', 'RMS', 'WL', 'ZC'] # list we choose
+feature_list = ['MAV', 'RMS', 'WL', 'ZC', 'SSC']  # list we choose
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
+
 
 def majority_label(segment):
     """Return majority label and confidence (fraction) for a 1D label segment."""
@@ -27,11 +28,27 @@ def majority_label(segment):
     idx = counts.argmax()
     return values[idx], counts[idx] / counts.sum()
 
+
+def destination_for_features(filtered_path: Path) -> Path:
+    """
+    Place features in ../features/ when filtered files are in ../filtered/.
+    Fallback: same directory as the filtered file.
+    """
+    if filtered_path.parent.name == "filtered":
+        base_dir = filtered_path.parent.parent
+        return base_dir / "features" / (filtered_path.stem.replace("_filtered", "") + "_features.npz")
+    return filtered_path.with_name(filtered_path.stem.replace("_filtered", "") + "_features.npz")
+
+
 for fp in root.rglob("*_filtered.npz"):
+    out_path = destination_for_features(fp)
+    if out_path.exists():
+        print(f"Skipping {fp} (features exists at {out_path})")
+        continue
     data = np.load(fp, allow_pickle=True)
     emg = data["emg"]
     fs = float(np.asarray(data["fs"]).squeeze())
-    windows = get_windows(emg, WINDOW_SIZE, WINDOW_STEP) # 200 samples, 100 step, 50% overlap
+    windows = get_windows(emg, WINDOW_SIZE, WINDOW_STEP)  # 200 samples, 100 step, 50% overlap
     n_windows = windows.shape[0]
     starts = np.arange(n_windows) * WINDOW_STEP
     ends = starts + WINDOW_SIZE
@@ -54,8 +71,7 @@ for fp in root.rglob("*_filtered.npz"):
 
     features_1 = fe.extract_features(feature_list, windows)
 
-    out_name = fp.stem.replace("_filtered", "") + "_features.npz"
-    out_path = fp.with_name(out_name)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out_path,
         features=features_1,
@@ -70,4 +86,3 @@ for fp in root.rglob("*_filtered.npz"):
         source_file=str(fp),
     )
     print(f"Wrote {out_path}")
-

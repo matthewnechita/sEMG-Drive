@@ -39,10 +39,17 @@ class CollectDataWindow(QWidget):
         QWidget.__init__(self)
         self.pipelinetext = "Off"
         self.controller = controller
+        # Default identifiers for saving data; editable in UI
+        self.default_subject = "subject01"
+        self.default_session = "01"
         self.buttonPanel = self.ButtonPanel()
         self.plotPanel = None
         self.collectionLabelPanel = self.CollectionLabelPanel()
         self.instructionsPanel = self.InstructionPanel()
+        self.channel_labels_layout = None
+        self.channel_labels_container = None
+        self.x_axis_label = None
+        self.y_axis_label = None
 
         self.grid = QGridLayout(self)
 
@@ -68,7 +75,7 @@ class CollectDataWindow(QWidget):
         self.setStyleSheet("background-color:#3d4c51;")
         self.setLayout(self.grid)
         self.setWindowTitle("Collect Data GUI")
-        self.setMinimumSize(1350, 820)
+        self.setMinimumSize(1550, 820)
         self.pairing = False
         self.selectedSensor = None
         self.protocol_running = False
@@ -165,6 +172,34 @@ class CollectDataWindow(QWidget):
         self.exportcsv_button.setFixedHeight(50)
         buttonLayout.addWidget(self.exportcsv_button)
 
+        # --- Subject / Session inputs (inline instead of popups)
+        idWidget = QWidget()
+        idLayout = QFormLayout()
+        idLayout.setFormAlignment(Qt.AlignLeft)
+        idLayout.setLabelAlignment(Qt.AlignLeft)
+        idLayout.setContentsMargins(0, 0, 0, 0)
+        idLayout.setHorizontalSpacing(8)
+
+        self.subject_input = QLineEdit(self.default_subject)
+        self.subject_input.setPlaceholderText("subject01")
+        self.subject_input.setStyleSheet("color: white; background:#6b6b6b;")
+        self.subject_input.setMinimumWidth(160)
+
+        self.session_input = QLineEdit(self.default_session)
+        self.session_input.setPlaceholderText("01")
+        self.session_input.setStyleSheet("color: white; background:#6b6b6b;")
+        self.session_input.setMinimumWidth(120)
+
+        subj_label = QLabel("Subject ID:")
+        subj_label.setStyleSheet("color: white;")
+        sess_label = QLabel("Session #:")
+        sess_label.setStyleSheet("color: white;")
+
+        idLayout.addRow(subj_label, self.subject_input)
+        idLayout.addRow(sess_label, self.session_input)
+        idWidget.setLayout(idLayout)
+        buttonLayout.addWidget(idWidget)
+
         # ---- Labeled Protocol (NPZ) Button
         self.recordnpz_button = QPushButton('Run Protocol + Save NPZ', self)
         self.recordnpz_button.setToolTip('Run scripted gesture/rest protocol and save .npz with labels')
@@ -180,8 +215,16 @@ class CollectDataWindow(QWidget):
         self.SensorModeList.setToolTip('Sensor Modes')
         self.SensorModeList.objectName = 'PlaceHolder'
         self.SensorModeList.setStyleSheet('QComboBox {color: white;background: #848482}')
-        self.SensorModeList.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.SensorModeList.setMinimumWidth(360)
+        self.SensorModeList.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        # Widen the popup so long mode names aren't truncated
+        popup_view = QListView()
+        popup_view.setMinimumWidth(680)
+        popup_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        popup_view.setWordWrap(True)
+        popup_view.setTextElideMode(Qt.ElideNone)
+        self.SensorModeList.setView(popup_view)
+        self.SensorModeList.setMinimumContentsLength(45)
+        self.SensorModeList.setMinimumWidth(520)
         self.SensorModeList.setFixedHeight(40)
         self.SensorModeList.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         buttonLayout.addWidget(self.SensorModeList)
@@ -229,21 +272,82 @@ class CollectDataWindow(QWidget):
 
     def Plotter(self):
         widget = QWidget()
-        widget.setLayout(QVBoxLayout())
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
 
         plot_mode = 'windowed'  # Select between 'scrolling' and 'windowed'
         pc = gp.GenericPlot(plot_mode)
         pc.native.objectName = 'vispyCanvas'
         pc.native.parent = self
+
+        self.y_axis_label = QLabel("EMG amplitude")
+        self.y_axis_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+        self.y_axis_label.setStyleSheet("color:white; font-size:10pt; font-weight:bold;")
+        self.y_axis_label.setWordWrap(True)
+        self.y_axis_label.setMinimumWidth(28)
+
+        self.channel_labels_container = QWidget()
+        self.channel_labels_layout = QVBoxLayout()
+        self.channel_labels_layout.setContentsMargins(0, 0, 0, 0)
+        self.channel_labels_layout.setSpacing(0)
+        self.channel_labels_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.channel_labels_container.setLayout(self.channel_labels_layout)
+        self.channel_labels_container.setMinimumWidth(180)
+        self.update_channel_labels([])
+
+        grid.addWidget(self.y_axis_label, 0, 0, 2, 1, alignment=Qt.AlignmentFlag.AlignHCenter)
+        grid.addWidget(self.channel_labels_container, 0, 1)
+        grid.addWidget(pc.native, 0, 2)
+
+        self.x_axis_label = QLabel("Time (s)")
+        self.x_axis_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self.x_axis_label.setStyleSheet("color:white; font-size:10pt; font-weight:bold;")
+        self.x_axis_label.setFixedHeight(20)
+
         label = QLabel("*This Demo plots EMG Channels only")
         label.setStyleSheet('.QLabel { font-size: 8pt;}')
         label.setFixedHeight(20)
-        label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        widget.layout().addWidget(pc.native)
-        widget.layout().addWidget(label)
+        label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+
+        grid.addWidget(label, 1, 1, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(self.x_axis_label, 1, 2, alignment=Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+
+        grid.setRowStretch(0, 1)
+        grid.setColumnStretch(2, 1)
+        widget.setLayout(grid)
         self.plotCanvas = pc
 
         return widget
+
+    def update_channel_labels(self, labels: List[str]):
+        if self.channel_labels_layout is None:
+            return
+
+        while self.channel_labels_layout.count():
+            item = self.channel_labels_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        if not labels:
+            placeholder = QLabel("Connect sensors to see channel names")
+            placeholder.setStyleSheet("color: white; font-size:10pt;")
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            placeholder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.channel_labels_layout.addWidget(placeholder)
+            self.channel_labels_layout.setStretch(0, 1)
+            return
+
+        for idx, text in enumerate(labels):
+            channel_label = QLabel(text)
+            channel_label.setStyleSheet("color: white; font-size:10pt;")
+            channel_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            channel_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            channel_label.setWordWrap(True)
+            self.channel_labels_layout.addWidget(channel_label)
+            self.channel_labels_layout.setStretch(idx, 1)
 
     def CollectionLabelPanel(self):
         collectionLabelPanel = QWidget()
@@ -408,11 +512,26 @@ class CollectDataWindow(QWidget):
 
         number_and_names_str = []
         for i in range(len(sensorList)):
-            number_and_names_str.append("(" + str(sensorList[i].PairNumber) + ") " + sensorList[i].FriendlyName)
+            base = getattr(self, "CallbackConnector", None)
+            cur_mode = ""
+            try:
+                cur_mode = base.base.getCurMode(i) if base else ""
+            except Exception:
+                cur_mode = ""
+
+            header = "(" + str(sensorList[i].PairNumber) + ") " + sensorList[i].FriendlyName
+            if cur_mode:
+                header += "\n    Mode: " + cur_mode
+            number_and_names_str.append(header)
             for j in range(len(sensorList[i].TrignoChannels)):
-                if sensorList[i].TrignoChannels[j].IsEnabled and not str(sensorList[i].TrignoChannels[j].Type) == "SkinCheck":
-                    number_and_names_str[i] += "\n     -" + sensorList[i].TrignoChannels[j].Name + " (" + str(
-                        round(sensorList[i].TrignoChannels[j].SampleRate, 3)) + " Hz)"
+                ch = sensorList[i].TrignoChannels[j]
+                if not ch.IsEnabled:
+                    continue
+                ch_type = str(ch.Type)
+                # Only show EMG channels to avoid ACC/IMU noise in the list
+                if ch_type != "EMG":
+                    continue
+                number_and_names_str[i] += "\n     - " + ch.Name
 
         self.SensorListBox.addItems(number_and_names_str)
 
@@ -462,7 +581,11 @@ class CollectDataWindow(QWidget):
 
             if curMode is not None:
                 self.resetModeList(modeList)
-                self.SensorModeList.setCurrentText(curMode)
+                if curMode in modeList:
+                    self.SensorModeList.setCurrentText(curMode)
+                elif len(modeList) > 0:
+                    # If the current mode isn't available, default to the first option
+                    self.SensorModeList.setCurrentText(modeList[0])
                 self.starttriggercheckbox.setEnabled(True)
                 self.stoptriggercheckbox.setEnabled(True)
                 self.SensorModeList.currentIndexChanged.connect(self.sensorModeList_callback)
@@ -494,13 +617,9 @@ class CollectDataWindow(QWidget):
             QMessageBox.critical(self, "Error", "CallbackConnector not ready. Connect and scan first.")
             return
 
-        # Basic inputs; keep lightweight
-        subject, ok = QInputDialog.getText(self, "Subject ID", "Subject (e.g., S01):", text="S01")
-        if not ok or subject.strip() == "":
-            return
-        session, ok = QInputDialog.getText(self, "Session ID", "Session (e.g., 01):", text="01")
-        if not ok or session.strip() == "":
-            return
+        # Subject/session inputs are provided inline (no popups)
+        subject = self.subject_input.text().strip() or self.default_subject
+        session = self.session_input.text().strip() or self.default_session
 
         # Defaults can be tweaked here
         # (These could also be exposed via UI fields later)
@@ -514,10 +633,10 @@ class CollectDataWindow(QWidget):
             prep_duration=5.0,
         )
 
-        dest_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(Path.cwd() / "data"))
-        if dest_dir == "":
-            return
-        output_path = Path(dest_dir) / f"emg_subject{config.subject}_session{config.session}.npz"
+        base_dir = Path.cwd() / "data" / config.subject
+        raw_dir = base_dir / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        output_path = raw_dir / f"{config.subject}_session{config.session}_raw.npz"
 
         try:
             self.run_protocol_with_plot(config, output_path)

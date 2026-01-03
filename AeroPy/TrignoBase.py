@@ -33,6 +33,7 @@ class TrignoBase():
         self.channelcount = 0
         self.pairnumber = 0
         self.csv_writer = CsvWriter()
+        self.emgChannelNames = []
 
     # -- AeroPy Methods --
     def PipelineState_Callback(self):
@@ -114,6 +115,7 @@ class TrignoBase():
                 self.channelobjects = []
                 self.plotCount = 0
                 self.emgChannelsIdx = []
+                self.emgChannelNames = []
                 globalChannelIdx = 0
                 self.channel_guids = []
 
@@ -136,12 +138,13 @@ class TrignoBase():
                             ch_guid = ch_object.Id
                             ch_type = str(ch_object.Type)
 
-                            get_all_channels = True
-                            if get_all_channels:
+                            # Only keep EMG channels for collection/plotting
+                            get_all_channels = False
+                            if ch_type == 'EMG':
                                 self.channel_guids.append(ch_guid)
                                 globalChannelIdx += 1
 
-                                #CSV Export Config
+                                # CSV Export Config for EMG only
                                 if not self.collection_data_handler.streamYTData:
                                     self.csv_writer.appendChannelHeader(ch_object)
                                     if channel > 0 & channel != len(selectedSensor.TrignoChannels):
@@ -154,45 +157,28 @@ class TrignoBase():
                                         self.csv_writer.appendYTSensorHeaderSeperator()
 
 
-
-                            #NOTE: The self.channel_guids list is used to parse select channels during live data streaming in DataManager.py
-                            #      this example will add all available channels to this list (above)
-                            #      if you want to only parse certain channels then add only those channel guids to this list
-                            #      for example: if you only want the EMG channels during live data streaming (flip bool above to false):
-                            if not get_all_channels:
-                                if ch_type == 'EMG':
-                                    self.channel_guids.append(ch_guid)
-                                    self.csv_writer.h2_channels.append(
-                                        ch_object.Name + " (" + str(ch_object.SampleRate) + ")")
-                                    if channel > 0:
-                                        self.csv_writer.h1_sensors.append(",")
-                                    globalChannelIdx += 1
-
-
                             sample_rate = round(selectedSensor.TrignoChannels[channel].SampleRate, 3)
                             print("----" + selectedSensor.TrignoChannels[channel].Name + " (" + str(sample_rate) + " Hz) " + str(selectedSensor.TrignoChannels[channel].Id))
                             self.channelcount += 1
                             self.channelobjects.append(channel)
                             self.collection_data_handler.DataHandler.allcollectiondata.append([])
 
-                            # NOTE: Plotting/Data Output: This demo does not plot non-EMG channel types such as
-                            # accelerometer, gyroscope, magnetometer, and others. However, the data from channels
-                            # that are excluded from plots are still available via output from PollData()
-
                             # ---- Plot EMG Channels
                             if ch_type == 'EMG':
                                 self.emgChannelsIdx.append(globalChannelIdx-1)
+                                channel_label = "(" + str(selectedSensor.PairNumber) + ") " + selectedSensor.FriendlyName + " - " + ch_object.Name
+                                self.emgChannelNames.append(channel_label)
                                 self.plotCount += 1
-
-                            # ---- Exclude non-EMG channels from plots
-                            else:
-                                pass
 
 
 
 
                 if self.collection_data_handler.EMGplot:
                     self.collection_data_handler.EMGplot.initiateCanvas(None, None, self.plotCount, 1, 20000)
+                    try:
+                        self.collection_data_handler.collect_data_window.update_channel_labels(self.emgChannelNames)
+                    except Exception:
+                        pass
 
                 return True
         else:
