@@ -59,6 +59,7 @@ def build_parser():
     parser.add_argument("--smoothing", type=int, default=5)
     parser.add_argument("--min-confidence", type=float, default=0.0)
     parser.add_argument("--low-confidence-label", default="neutral")
+    parser.add_argument("--fs", type=float, default=None)
     parser.add_argument("--poll-sleep", type=float, default=0.001)
     parser.add_argument("--show-confidence", action="store_true")
     return parser
@@ -68,6 +69,8 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     bundle = load_model_bundle(args.model)
     meta = bundle.metadata
+    if args.min_confidence > 0.0 and not hasattr(bundle.model, "predict_proba"):
+        print("Warning: min-confidence set but model lacks predict_proba; retrain with --svm-probability.")
 
     feature_order = bundle.feature_order
     if not feature_order:
@@ -107,6 +110,15 @@ def main(argv=None):
     fe = FeatureExtractor()
     filter_obj = None
     fs = None
+    if args.fs is not None:
+        fs = float(args.fs)
+    else:
+        meta_fs = meta.get("fs_hz") or meta.get("fs")
+        if meta_fs is not None:
+            fs = float(meta_fs)
+    if fs is not None:
+        filter_obj = define_filters(fs)
+        print(f"Using fs: {fs:.2f} Hz")
 
     sample_buffer = deque(maxlen=window_size)
     pending_samples = 0

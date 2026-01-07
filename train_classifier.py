@@ -65,6 +65,7 @@ def load_dataset(root, pattern, min_label_confidence=0.0, channel_mode="pad"):
     feature_order = None
     window_size = None
     window_step = None
+    fs_values = []
 
     for fp in files:
         data = np.load(fp, allow_pickle=True)
@@ -117,6 +118,12 @@ def load_dataset(root, pattern, min_label_confidence=0.0, channel_mode="pad"):
         if X.size == 0:
             continue
 
+        fs_value = data.get("fs")
+        if fs_value is not None:
+            fs_value = float(np.asarray(fs_value).squeeze())
+            if np.isfinite(fs_value):
+                fs_values.append(fs_value)
+
         collected.append((fp, X, labels))
         channel_counts.append(int(X.shape[1]))
         data_files.append(str(fp))
@@ -142,6 +149,15 @@ def load_dataset(root, pattern, min_label_confidence=0.0, channel_mode="pad"):
     X_all = np.vstack(X_list)
     y_all = np.concatenate(y_list)
 
+    fs_hz = None
+    fs_hz_values = None
+    if fs_values:
+        fs_arr = np.asarray(fs_values, dtype=float)
+        if np.allclose(fs_arr, fs_arr[0], rtol=0.0, atol=1e-3):
+            fs_hz = float(fs_arr[0])
+        else:
+            fs_hz_values = sorted({round(float(x), 3) for x in fs_arr})
+
     meta = {
         "feature_order": feature_order,
         "channel_count": int(target_channels),
@@ -151,15 +167,21 @@ def load_dataset(root, pattern, min_label_confidence=0.0, channel_mode="pad"):
         "labels": sorted({str(x) for x in np.unique(y_all)}),
         "data_files": data_files,
     }
+    if fs_hz is not None:
+        meta["fs_hz"] = fs_hz
+    elif fs_hz_values is not None:
+        meta["fs_hz_values"] = fs_hz_values
     return X_all, y_all, meta
 
 
 def build_model(model_name, args):
     if model_name == "svm":
+        class_weight = None if args.class_weight == "none" else "balanced"
         clf = SVC(
             kernel="rbf",
             C=args.svm_c,
             gamma=args.svm_gamma,
+            class_weight=class_weight,
             probability=args.svm_probability,
         )
         return make_pipeline(StandardScaler(), clf)
@@ -185,6 +207,12 @@ def build_parser():
     )
     parser.add_argument("--svm-c", type=float, default=100.0)
     parser.add_argument("--svm-gamma", default="scale")
+    parser.add_argument(
+        "--class-weight",
+        choices=["balanced", "none"],
+        default="balanced",
+        help="Class weighting for SVM.",
+    )
     parser.add_argument("--svm-probability", action="store_true")
     return parser
 
@@ -235,6 +263,7 @@ def main(argv=None):
             "model_params": {
                 "svm_c": args.svm_c,
                 "svm_gamma": args.svm_gamma,
+                "class_weight": args.class_weight,
                 "svm_probability": bool(args.svm_probability),
             },
             "metrics": metrics,
