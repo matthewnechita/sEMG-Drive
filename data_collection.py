@@ -19,6 +19,11 @@ class TrialConfig:
     neutral_duration: float
     repetitions: int
     prep_duration: float = 3.0
+    inter_gesture_rest_s: float = 0.0
+    label_trim_s: float = 0.0
+    calibrate: bool = False
+    calibration_neutral_s: float = 3.0
+    calibration_mvc_s: float = 3.0
 
 
 class _CollectionHandler:
@@ -51,14 +56,17 @@ def collect_segment(
     duration_s: float,
     channel_count: int,
     stop_flag: Optional[Callable[[], bool]] = None,
+    label_trim_s: float = 0.0,
 ):
     """
     Poll the Trigno data queue for a fixed duration, return timestamp/value arrays.
     """
     ts_buffer: List[List[float]] = []
     x_buffer: List[List[float]] = []
-    labels: List[str] = []
+    labels: List[Optional[str]] = []
     end_time = time.time() + duration_s
+    segment_start_ts: Optional[float] = None
+    apply_trim = label_trim_s > 0.0 and duration_s > 2 * label_trim_s
 
     while time.time() < end_time:
         if stop_flag and stop_flag():
@@ -91,7 +99,14 @@ def collect_segment(
         for idx in range(sample_count):
             ts_buffer.append([channel_times[ch][idx] for ch in range(channel_count)])
             x_buffer.append([channel_values[ch][idx] for ch in range(channel_count)])
-            labels.append(label)
+            sample_label = label
+            if apply_trim:
+                if segment_start_ts is None:
+                    segment_start_ts = channel_times[0][idx]
+                elapsed = channel_times[0][idx] - segment_start_ts
+                if elapsed < label_trim_s or elapsed > duration_s - label_trim_s:
+                    sample_label = None
+            labels.append(sample_label)
 
     return ts_buffer, x_buffer, labels
 
@@ -132,6 +147,32 @@ def run_protocol(config: TrialConfig, output_path: Path):
         time.sleep(config.prep_duration)
 
     try:
+        calib_neutral_ts = []
+        calib_neutral_x = []
+        calib_mvc_ts = []
+        calib_mvc_x = []
+
+        if config.calibrate:
+            print(f"Calibration: neutral rest for {config.calibration_neutral_s:.1f}s.")
+            seg_ts, seg_x, _ = collect_segment(
+                handler.DataHandler,
+                "calibration_neutral",
+                config.calibration_neutral_s,
+                channel_count,
+            )
+            calib_neutral_ts = seg_ts
+            calib_neutral_x = seg_x
+
+            print(f"Calibration: max contraction for {config.calibration_mvc_s:.1f}s.")
+            seg_ts, seg_x, _ = collect_segment(
+                handler.DataHandler,
+                "calibration_mvc",
+                config.calibration_mvc_s,
+                channel_count,
+            )
+            calib_mvc_ts = seg_ts
+            calib_mvc_x = seg_x
+
         for rep in range(config.repetitions):
             for idx, gesture in enumerate(config.gestures):
                 if idx + 1 < len(config.gestures):
@@ -154,10 +195,34 @@ def run_protocol(config: TrialConfig, output_path: Path):
                     gesture,
                     duration,
                     channel_count,
+                    label_trim_s=config.label_trim_s,
                 )
                 all_ts.extend(seg_ts)
                 all_x.extend(seg_x)
                 all_labels.extend(seg_labels)
+                if config.inter_gesture_rest_s > 0.0 and (
+                    idx + 1 < len(config.gestures) or rep + 1 < config.repetitions
+                ):
+                    rest_duration = config.inter_gesture_rest_s
+                    print(f"Rest: neutral for {rest_duration:.1f}s")
+                    events.append(
+                        {
+                            "event": "neutral_rest_start",
+                            "t_wall": time.time(),
+                            "rep": rep + 1,
+                            "after": gesture,
+                        }
+                    )
+                    seg_ts, seg_x, seg_labels = collect_segment(
+                        handler.DataHandler,
+                        "neutral",
+                        rest_duration,
+                        channel_count,
+                        label_trim_s=config.label_trim_s,
+                    )
+                    all_ts.extend(seg_ts)
+                    all_x.extend(seg_x)
+                    all_labels.extend(seg_labels)
     except KeyboardInterrupt:
         aborted = True
         events.append({"event": "session_abort", "t_wall": time.time()})
@@ -178,21 +243,38 @@ def run_protocol(config: TrialConfig, output_path: Path):
         "repetitions": config.repetitions,
         "channel_count": channel_count,
         "prep_duration_s": config.prep_duration,
+        "inter_gesture_rest_s": config.inter_gesture_rest_s,
+        "label_trim_s": config.label_trim_s,
         "ramp_style": "ramp contractions (longer window for non-neutral gestures)",
     }
+    if config.calibrate:
+        metadata["calibration"] = {
+            "enabled": True,
+            "neutral_duration_s": config.calibration_neutral_s,
+            "mvc_duration_s": config.calibration_mvc_s,
+        }
 
     if aborted:
         return
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_path,
-        X=X,
-        timestamps=timestamps,
-        y=y,
-        events=np.asarray(events, dtype=object),
-        metadata=metadata,
-    )
+    save_kwargs = {
+        "X": X,
+        "timestamps": timestamps,
+        "y": y,
+        "events": np.asarray(events, dtype=object),
+        "metadata": metadata,
+    }
+    if config.calibrate:
+        save_kwargs.update(
+            {
+                "calib_neutral_X": np.asarray(calib_neutral_x, dtype=float),
+                "calib_neutral_timestamps": np.asarray(calib_neutral_ts, dtype=float),
+                "calib_mvc_X": np.asarray(calib_mvc_x, dtype=float),
+                "calib_mvc_timestamps": np.asarray(calib_mvc_ts, dtype=float),
+            }
+        )
+    np.savez_compressed(output_path, **save_kwargs)
     print(f"Saved {X.shape[0]} samples to {output_path}")
 
 
@@ -203,7 +285,7 @@ def build_parser():
     parser.add_argument(
         "--gestures",
         nargs="+",
-        default=["left_turn", "right_turn", "neutral"],
+        default=["left_turn", "right_turn", "neutral", "signal_left", "signal_right", "horn"],
         help="List of gesture labels to present per repetition.",
     )
     parser.add_argument(
@@ -215,7 +297,7 @@ def build_parser():
     parser.add_argument(
         "--neutral-duration",
         type=float,
-        default=3.0,
+        default=5.0,
         help="Seconds per neutral window.",
     )
     parser.add_argument(
@@ -223,6 +305,35 @@ def build_parser():
         type=float,
         default=3.0,
         help="Seconds of prep time before the first gesture.",
+    )
+    parser.add_argument(
+        "--inter-gesture-rest",
+        type=float,
+        default=0.0,
+        help="Seconds of neutral rest inserted between gestures.",
+    )
+    parser.add_argument(
+        "--label-trim",
+        type=float,
+        default=0.0,
+        help="Seconds to discard at start/end of each segment when labeling.",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Record neutral + max contraction calibration segments at start.",
+    )
+    parser.add_argument(
+        "--calibration-neutral",
+        type=float,
+        default=3.0,
+        help="Seconds for neutral calibration segment.",
+    )
+    parser.add_argument(
+        "--calibration-mvc",
+        type=float,
+        default=3.0,
+        help="Seconds for max contraction calibration segment.",
     )
     parser.add_argument("--repetitions", type=int, default=10, help="Repetitions per gesture.")
     parser.add_argument(
@@ -247,6 +358,11 @@ def main(argv=None):
         neutral_duration=args.neutral_duration,
         repetitions=args.repetitions,
         prep_duration=args.prep_duration,
+        inter_gesture_rest_s=args.inter_gesture_rest,
+        label_trim_s=args.label_trim,
+        calibrate=args.calibrate,
+        calibration_neutral_s=args.calibration_neutral,
+        calibration_mvc_s=args.calibration_mvc,
     )
     run_protocol(config, output_path)
 

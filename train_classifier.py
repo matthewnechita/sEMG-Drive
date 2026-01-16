@@ -7,7 +7,14 @@ from pathlib import Path
 import numpy as np
 
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
+from sklearn.model_selection import (
+    GroupKFold,
+    GroupShuffleSplit,
+    GridSearchCV,
+    StratifiedKFold,
+    cross_validate,
+    train_test_split,
+)
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -134,6 +141,7 @@ def load_dataset(root, pattern, min_label_confidence=0.0, channel_mode="pad"):
     target_channels = resolve_target_channels(channel_counts, channel_mode)
     X_list = []
     y_list = []
+    group_list = []
     for fp, X, labels in collected:
         if channel_mode == "match" and int(X.shape[1]) != target_channels:
             raise ValueError(
@@ -145,9 +153,11 @@ def load_dataset(root, pattern, min_label_confidence=0.0, channel_mode="pad"):
             X = X[:, :target_channels, :]
         X_list.append(X)
         y_list.append(labels)
+        group_list.append(np.array([str(fp)] * len(labels), dtype=object))
 
     X_all = np.vstack(X_list)
     y_all = np.concatenate(y_list)
+    groups_all = np.concatenate(group_list)
 
     fs_hz = None
     fs_hz_values = None
@@ -166,26 +176,59 @@ def load_dataset(root, pattern, min_label_confidence=0.0, channel_mode="pad"):
         "window_step_samples": int(window_step),
         "labels": sorted({str(x) for x in np.unique(y_all)}),
         "data_files": data_files,
+        "group_by": "feature_file",
+        "group_count": int(np.unique(groups_all).size),
     }
     if fs_hz is not None:
         meta["fs_hz"] = fs_hz
     elif fs_hz_values is not None:
         meta["fs_hz_values"] = fs_hz_values
-    return X_all, y_all, meta
+    return X_all, y_all, groups_all, meta
 
 
-def build_model(model_name, args):
+def build_model(model_name, args, svm_c=None, svm_gamma=None):
     if model_name == "svm":
         class_weight = None if args.class_weight == "none" else "balanced"
+        gamma = args.svm_gamma if svm_gamma is None else svm_gamma
+        if isinstance(gamma, str) and gamma not in {"scale", "auto"}:
+            gamma = float(gamma)
         clf = SVC(
             kernel="rbf",
-            C=args.svm_c,
-            gamma=args.svm_gamma,
+            C=args.svm_c if svm_c is None else svm_c,
+            gamma=gamma,
             class_weight=class_weight,
             probability=args.svm_probability,
         )
         return make_pipeline(StandardScaler(), clf)
     raise ValueError(f"Unsupported model: {model_name}")
+
+
+def parse_gamma_values(values):
+    parsed = []
+    for value in values:
+        if isinstance(value, str):
+            lowered = value.lower()
+            if lowered in {"scale", "auto"}:
+                parsed.append(lowered)
+                continue
+        parsed.append(float(value))
+    return parsed
+
+
+def resolve_stratified_cv(y, max_splits, random_state):
+    _, counts = np.unique(y, return_counts=True)
+    splits = min(int(max_splits), int(counts.min()))
+    if splits < 2:
+        splits = 2
+    return StratifiedKFold(n_splits=splits, shuffle=True, random_state=random_state)
+
+
+def resolve_group_cv(groups, max_splits):
+    unique = np.unique(groups)
+    splits = min(int(max_splits), int(unique.size))
+    if splits < 2:
+        return None
+    return GroupKFold(n_splits=splits)
 
 
 def build_parser():
@@ -213,66 +256,206 @@ def build_parser():
         default="balanced",
         help="Class weighting for SVM.",
     )
-    parser.add_argument("--svm-probability", action="store_true")
+    parser.add_argument(
+        "--svm-probability",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable probability estimates (required for confidence gating in realtime).",
+    )
+    parser.add_argument(
+        "--grid-search",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run grid search over SVM C/gamma before training.",
+    )
+    parser.add_argument(
+        "--grid-c",
+        nargs="+",
+        type=float,
+        default=[0.1, 1.0, 10.0, 100.0, 1000.0],
+        help="C values for grid search.",
+    )
+    parser.add_argument(
+        "--grid-gamma",
+        nargs="+",
+        default=["scale", "auto", "1e-4", "1e-3", "1e-2", "1e-1"],
+        help="Gamma values for grid search (numbers or 'scale'/'auto').",
+    )
+    parser.add_argument(
+        "--fit-all",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Refit the final model on all data after evaluation.",
+    )
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    X, y, meta = load_dataset(
+    X, y, groups, meta = load_dataset(
         args.data_root,
         args.pattern,
         args.min_label_confidence,
         channel_mode=args.channel_mode,
     )
     X_flat = X.reshape(X.shape[0], -1)
+    groups = np.asarray(groups, dtype=object)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_flat,
-        y,
-        test_size=args.test_size,
-        random_state=args.random_state,
-        stratify=y,
-    )
+    indices = np.arange(X_flat.shape[0])
+    full_group_cv = resolve_group_cv(groups, args.cv_splits)
+    use_group_split = full_group_cv is not None
+    if use_group_split:
+        splitter = GroupShuffleSplit(
+            n_splits=1,
+            test_size=args.test_size,
+            random_state=args.random_state,
+        )
+        train_idx, test_idx = next(splitter.split(X_flat, y, groups))
+        print(f"Using group split across {np.unique(groups).size} sessions/files.")
+    else:
+        train_idx, test_idx = train_test_split(
+            indices,
+            test_size=args.test_size,
+            random_state=args.random_state,
+            stratify=y,
+        )
+        print("Warning: group split disabled (not enough sessions/files).")
 
-    model = build_model(args.model, args)
-    cv = StratifiedKFold(n_splits=args.cv_splits, shuffle=True, random_state=args.random_state)
-    cv_scores = cross_validate(model, X_flat, y, cv=cv, scoring="accuracy", return_train_score=False)
+    X_train = X_flat[train_idx]
+    X_test = X_flat[test_idx]
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+    groups_train = groups[train_idx] if use_group_split else None
 
-    model.fit(X_train, y_train)
+    train_group_cv = resolve_group_cv(groups_train, args.cv_splits) if use_group_split else None
+    if train_group_cv is None:
+        train_cv = resolve_stratified_cv(y_train, args.cv_splits, args.random_state)
+        train_cv_uses_groups = False
+    else:
+        train_cv = train_group_cv
+        train_cv_uses_groups = True
+
+    if use_group_split:
+        full_cv = full_group_cv
+        full_cv_uses_groups = True
+    else:
+        full_cv = resolve_stratified_cv(y, args.cv_splits, args.random_state)
+        full_cv_uses_groups = False
+
+    best_svm_c = args.svm_c
+    best_svm_gamma = args.svm_gamma
+    grid_results = None
+
+    if args.grid_search:
+        gamma_grid = parse_gamma_values(args.grid_gamma)
+        param_grid = {
+            "svc__C": args.grid_c,
+            "svc__gamma": gamma_grid,
+        }
+        base_model = build_model(args.model, args)
+        grid = GridSearchCV(
+            base_model,
+            param_grid=param_grid,
+            cv=train_cv,
+            scoring="accuracy",
+            refit=True,
+        )
+        if train_cv_uses_groups:
+            grid.fit(X_train, y_train, groups=groups_train)
+        else:
+            grid.fit(X_train, y_train)
+        model = grid.best_estimator_
+        raw_best_params = grid.best_params_
+        best_params = {}
+        for key, value in raw_best_params.items():
+            if isinstance(value, (np.floating, np.integer)):
+                best_params[key] = float(value)
+            else:
+                best_params[key] = value
+        best_svm_c = float(best_params["svc__C"])
+        best_svm_gamma = best_params["svc__gamma"]
+        if isinstance(best_svm_gamma, (np.floating, np.integer)):
+            best_svm_gamma = float(best_svm_gamma)
+        grid_results = {
+            "enabled": True,
+            "best_params": best_params,
+            "best_score": float(grid.best_score_),
+            "param_grid": param_grid,
+        }
+        print(f"Grid search best params: C={best_svm_c}, gamma={best_svm_gamma}")
+    else:
+        model = build_model(args.model, args, svm_c=best_svm_c, svm_gamma=best_svm_gamma)
+        model.fit(X_train, y_train)
+
     y_pred = model.predict(X_test)
+    train_accuracy = float(model.score(X_train, y_train))
+
+    cv_model = build_model(args.model, args, svm_c=best_svm_c, svm_gamma=best_svm_gamma)
+    if full_cv_uses_groups:
+        cv_scores = cross_validate(
+            cv_model,
+            X_flat,
+            y,
+            cv=full_cv,
+            scoring="accuracy",
+            return_train_score=False,
+            groups=groups,
+        )
+    else:
+        cv_scores = cross_validate(
+            cv_model,
+            X_flat,
+            y,
+            cv=full_cv,
+            scoring="accuracy",
+            return_train_score=False,
+        )
 
     metrics = {
         "cv_accuracy_mean": float(cv_scores["test_score"].mean()),
         "cv_accuracy_std": float(cv_scores["test_score"].std()),
         "test_accuracy": float(accuracy_score(y_test, y_pred)),
-        "train_accuracy": float(model.score(X_train, y_train)),
+        "train_accuracy": train_accuracy,
         "n_samples": int(X_flat.shape[0]),
         "n_classes": int(len(np.unique(y))),
     }
+    if grid_results is not None:
+        metrics["grid_search_best_score"] = grid_results["best_score"]
 
     print(f"CV accuracy: {metrics['cv_accuracy_mean']:.3f} +/- {metrics['cv_accuracy_std']:.3f}")
     print(f"Train accuracy: {metrics['train_accuracy']:.3f}")
     print(f"Test accuracy: {metrics['test_accuracy']:.3f}")
     print("\nReport:\n", classification_report(y_test, y_pred))
 
+    final_model = model
+    if args.fit_all:
+        final_model = build_model(args.model, args, svm_c=best_svm_c, svm_gamma=best_svm_gamma)
+        final_model.fit(X_flat, y)
+
     meta.update(
         {
             "created_at": dt.datetime.now().isoformat(),
             "model_type": args.model,
             "model_params": {
-                "svm_c": args.svm_c,
-                "svm_gamma": args.svm_gamma,
+                "svm_c": best_svm_c,
+                "svm_gamma": best_svm_gamma,
                 "class_weight": args.class_weight,
                 "svm_probability": bool(args.svm_probability),
             },
             "metrics": metrics,
+            "grid_search": grid_results or {"enabled": False},
+            "evaluation_split": {
+                "group_split": bool(use_group_split),
+                "test_size": float(args.test_size),
+                "cv_splits": int(getattr(full_cv, "n_splits", args.cv_splits)),
+            },
+            "fit_all_data": bool(args.fit_all),
         }
     )
 
     args.model_out.parent.mkdir(parents=True, exist_ok=True)
     with args.model_out.open("wb") as f:
-        pickle.dump({"model": model, "metadata": meta}, f)
+        pickle.dump({"model": final_model, "metadata": meta}, f)
 
     print(f"Saved model bundle to {args.model_out}")
 

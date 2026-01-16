@@ -51,17 +51,79 @@ def control_hook(gesture: str) -> None:
     return
 
 
+def _collect_samples(
+    handler,
+    duration_s: float,
+    stream_channels: int,
+    model_channels: int | None,
+    poll_sleep: float,
+):
+    samples = []
+    times = []
+    end_time = time.time() + duration_s
+
+    while time.time() < end_time:
+        out = handler.DataHandler.GetYTData()
+        if out is None:
+            time.sleep(poll_sleep)
+            continue
+
+        channel_times = []
+        channel_values = []
+        for channel in out:
+            if not channel:
+                continue
+            chan_array = np.asarray(channel[0], dtype=object)
+            if chan_array.size == 0:
+                continue
+            t_vals, v_vals = zip(*(_pair_time_value(s) for s in chan_array))
+            channel_times.append(list(t_vals))
+            channel_values.append(list(v_vals))
+
+        if len(channel_values) < stream_channels:
+            continue
+
+        sample_count = min(len(c) for c in channel_values)
+        if sample_count == 0:
+            continue
+
+        for idx in range(sample_count):
+            sample = [channel_values[ch][idx] for ch in range(stream_channels)]
+            if model_channels is not None:
+                if len(sample) < model_channels:
+                    sample.extend([0.0] * (model_channels - len(sample)))
+                elif len(sample) > model_channels:
+                    sample = sample[:model_channels]
+            samples.append(sample)
+            if channel_times:
+                times.append(channel_times[0][idx])
+
+    if not samples:
+        target_channels = model_channels if model_channels is not None else stream_channels
+        return np.empty((0, target_channels), dtype=float), np.asarray(times, dtype=float)
+    return np.asarray(samples, dtype=float), np.asarray(times, dtype=float)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Real-time gesture inference from EMG stream.")
     parser.add_argument("--model", default="models/gesture_classifier.pkl")
     parser.add_argument("--window-size", type=int, default=None)
     parser.add_argument("--window-step", type=int, default=None)
     parser.add_argument("--smoothing", type=int, default=5)
-    parser.add_argument("--min-confidence", type=float, default=0.0)
+    parser.add_argument("--min-confidence", type=float, default=0.7)
     parser.add_argument("--low-confidence-label", default="neutral")
     parser.add_argument("--fs", type=float, default=None)
     parser.add_argument("--poll-sleep", type=float, default=0.001)
     parser.add_argument("--show-confidence", action="store_true")
+    parser.add_argument(
+        "--calibrate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run neutral/MVC calibration at startup.",
+    )
+    parser.add_argument("--calibration-neutral", type=float, default=5.0)
+    parser.add_argument("--calibration-mvc", type=float, default=5.0)
+    parser.add_argument("--mvc-percentile", type=float, default=95.0)
     return parser
 
 
@@ -120,10 +182,56 @@ def main(argv=None):
         filter_obj = define_filters(fs)
         print(f"Using fs: {fs:.2f} Hz")
 
+    neutral_mean = None
+    mvc_scale = None
+    if args.calibrate:
+        print(f"Calibration: neutral rest for {args.calibration_neutral:.1f}s.")
+        neutral_samples, neutral_times = _collect_samples(
+            handler,
+            args.calibration_neutral,
+            stream_channels,
+            model_channels,
+            args.poll_sleep,
+        )
+        if fs is None and neutral_times.size:
+            fs = _estimate_fs(neutral_times)
+            if fs is not None and filter_obj is None:
+                filter_obj = define_filters(fs)
+                print(f"Estimated fs: {fs:.2f} Hz")
+
+        if filter_obj is None:
+            print("Warning: calibration skipped (no filter available).")
+        else:
+            print(f"Calibration: max contraction for {args.calibration_mvc:.1f}s.")
+            mvc_samples, mvc_times = _collect_samples(
+                handler,
+                args.calibration_mvc,
+                stream_channels,
+                model_channels,
+                args.poll_sleep,
+            )
+            if fs is None and mvc_times.size:
+                fs = _estimate_fs(mvc_times)
+                if fs is not None and filter_obj is None:
+                    filter_obj = define_filters(fs)
+                    print(f"Estimated fs: {fs:.2f} Hz")
+
+            if mvc_samples.size and neutral_samples.size:
+                neutral_f = apply_filters(filter_obj, neutral_samples)
+                mvc_f = apply_filters(filter_obj, mvc_samples)
+                neutral_mean = np.mean(neutral_f, axis=0)
+                mvc_scale = np.percentile(mvc_f, args.mvc_percentile, axis=0)
+                eps = 1e-6
+                mvc_scale = np.where(mvc_scale < eps, 1.0, mvc_scale)
+                print("Calibration complete.")
+            else:
+                print("Warning: calibration skipped (no samples collected).")
+
     sample_buffer = deque(maxlen=window_size)
     pending_samples = 0
     pred_history = deque(maxlen=max(1, args.smoothing))
     last_output = None
+    last_msg_len = 0
 
     try:
         while True:
@@ -174,6 +282,8 @@ def main(argv=None):
 
                     window = np.asarray(sample_buffer, dtype=float)
                     filtered = apply_filters(filter_obj, window)
+                    if neutral_mean is not None and mvc_scale is not None:
+                        filtered = (filtered - neutral_mean) / mvc_scale
                     # Match libemg.get_windows output: (n_windows, channels, window_size).
                     windows = filtered.T[np.newaxis, :, :]
                     feature_dict = fe.extract_features(feature_order, windows)
@@ -206,6 +316,10 @@ def main(argv=None):
                             msg = f"Gesture: {label} (conf {confidence:.2f})"
                         else:
                             msg = f"Gesture: {label}"
+                        if len(msg) < last_msg_len:
+                            msg = msg.ljust(last_msg_len)
+                        else:
+                            last_msg_len = len(msg)
                         print(msg, end="\r", flush=True)
                         last_output = label
 

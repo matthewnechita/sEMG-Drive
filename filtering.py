@@ -29,6 +29,9 @@ def load_emg_data(file_path):
             "events": events,
             "metadata": metadata,
         }
+        for key in data.files:
+            if key.startswith("calib_"):
+                extras[key] = data.get(key)
         # derive sampling rate from timestamp spacing if not present
         if "fs" in data:
             fs = data["fs"]
@@ -106,6 +109,20 @@ if __name__ == "__main__":
             continue
         fi = define_filters(fs)
         filtered_emg = apply_filters(fi, emg)
+
+        calib_neutral = extras.get("calib_neutral_X")
+        if calib_neutral is not None:
+            calib_neutral = np.asarray(calib_neutral, dtype=float)
+            if calib_neutral.size:
+                extras["calib_neutral_emg"] = apply_filters(fi, calib_neutral)
+            extras.pop("calib_neutral_X", None)
+
+        calib_mvc = extras.get("calib_mvc_X")
+        if calib_mvc is not None:
+            calib_mvc = np.asarray(calib_mvc, dtype=float)
+            if calib_mvc.size:
+                extras["calib_mvc_emg"] = apply_filters(fi, calib_mvc)
+            extras.pop("calib_mvc_X", None)
 
         save_filtered_data(out_path, filtered_emg, fs, extras)
         print(f"Wrote {out_path}")

@@ -30,6 +30,11 @@ class TrialConfig:
     subject: str
     session: str
     prep_duration: float = 3.0
+    inter_gesture_rest_s: float = 0.0
+    label_trim_s: float = 0.0
+    calibrate: bool = False
+    calibration_neutral_s: float = 3.0
+    calibration_mvc_s: float = 3.0
 
 
 class CollectDataWindow(QWidget):
@@ -624,13 +629,18 @@ class CollectDataWindow(QWidget):
         # Defaults can be tweaked here
         # (These could also be exposed via UI fields later)
         config = TrialConfig(
-            gestures=["left_turn", "right_turn", "neutral"],
+            gestures=["left_turn", "right_turn", "neutral", "signal_left", "signal_right", "horn"],
             gesture_duration=5.0,  # allow time for ramp contractions
-            neutral_duration=3.0,
+            neutral_duration=5.0,
             repetitions=5,
             subject=subject.strip(),
             session=session.strip(),
             prep_duration=5.0,
+            inter_gesture_rest_s=1.0,
+            label_trim_s=0.5,
+            calibrate=True,
+            calibration_neutral_s=3.0,
+            calibration_mvc_s=3.0,
         )
 
         base_dir = Path.cwd() / "data" / config.subject
@@ -670,6 +680,10 @@ class CollectDataWindow(QWidget):
         all_x: List[List[float]] = []
         all_labels: List[str] = []
         events = [{"event": "session_start", "t_wall": time.time()}]
+        calib_neutral_ts: List[List[float]] = []
+        calib_neutral_x: List[List[float]] = []
+        calib_mvc_ts: List[List[float]] = []
+        calib_mvc_x: List[List[float]] = []
 
         try:
             if config.prep_duration > 0:
@@ -677,6 +691,51 @@ class CollectDataWindow(QWidget):
                 next_label = config.gestures[0] if config.gestures else None
                 self.update_instruction("Get ready", next_label, config.repetitions * len(config.gestures), config.prep_duration)
                 self.run_prep_buffer(config.prep_duration)
+
+            if config.calibrate and not self.protocol_abort:
+                events.append({"event": "calibration_neutral_start", "t_wall": time.time()})
+                self.update_instruction(
+                    f"Calibration: neutral rest",
+                    "max contraction",
+                    config.repetitions * len(config.gestures),
+                    config.calibration_neutral_s,
+                )
+                seg_ts, seg_x, _ = self.collect_segment_with_plot(
+                    self.CallbackConnector.DataHandler,
+                    "calibration_neutral",
+                    config.calibration_neutral_s,
+                    channel_count,
+                    plotter,
+                    emg_idx,
+                    stop_flag=self.protocol_abort_requested,
+                )
+                calib_neutral_ts = seg_ts
+                calib_neutral_x = seg_x
+                if self.protocol_abort:
+                    events.append({"event": "session_abort", "t_wall": time.time()})
+                    return
+
+                events.append({"event": "calibration_mvc_start", "t_wall": time.time()})
+                self.update_instruction(
+                    f"Calibration: max contraction",
+                    config.gestures[0] if config.gestures else None,
+                    config.repetitions * len(config.gestures),
+                    config.calibration_mvc_s,
+                )
+                seg_ts, seg_x, _ = self.collect_segment_with_plot(
+                    self.CallbackConnector.DataHandler,
+                    "calibration_mvc",
+                    config.calibration_mvc_s,
+                    channel_count,
+                    plotter,
+                    emg_idx,
+                    stop_flag=self.protocol_abort_requested,
+                )
+                calib_mvc_ts = seg_ts
+                calib_mvc_x = seg_x
+                if self.protocol_abort:
+                    events.append({"event": "session_abort", "t_wall": time.time()})
+                    return
 
             for rep in range(config.repetitions):
                 for idx, gesture in enumerate(config.gestures):
@@ -700,11 +759,48 @@ class CollectDataWindow(QWidget):
                         channel_count,
                         plotter,
                         emg_idx,
+                        label_trim_s=config.label_trim_s,
                         stop_flag=self.protocol_abort_requested,
                     )
                     all_ts.extend(seg_ts)
                     all_x.extend(seg_x)
                     all_labels.extend(seg_labels)
+                    if self.protocol_abort:
+                        break
+
+                    if config.inter_gesture_rest_s > 0.0 and (
+                        idx + 1 < len(config.gestures) or rep + 1 < config.repetitions
+                    ):
+                        rest_duration = config.inter_gesture_rest_s
+                        self.update_instruction(
+                            "Rest: neutral buffer",
+                            next_gesture,
+                            reps_left,
+                            rest_duration,
+                        )
+                        events.append(
+                            {
+                                "event": "neutral_rest_start",
+                                "t_wall": time.time(),
+                                "rep": rep + 1,
+                                "after": gesture,
+                            }
+                        )
+                        seg_ts, seg_x, seg_labels = self.collect_segment_with_plot(
+                            self.CallbackConnector.DataHandler,
+                            "neutral",
+                            rest_duration,
+                            channel_count,
+                            plotter,
+                            emg_idx,
+                            label_trim_s=config.label_trim_s,
+                            stop_flag=self.protocol_abort_requested,
+                        )
+                        all_ts.extend(seg_ts)
+                        all_x.extend(seg_x)
+                        all_labels.extend(seg_labels)
+                        if self.protocol_abort:
+                            break
 
                 if self.protocol_abort:
                     break
@@ -731,8 +827,16 @@ class CollectDataWindow(QWidget):
             "channel_count": channel_count,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "prep_duration_s": config.prep_duration,
+            "inter_gesture_rest_s": config.inter_gesture_rest_s,
+            "label_trim_s": config.label_trim_s,
             "ramp_style": "ramp contractions (longer window for non-neutral gestures)",
         }
+        if config.calibrate:
+            metadata["calibration"] = {
+                "enabled": True,
+                "neutral_duration_s": config.calibration_neutral_s,
+                "mvc_duration_s": config.calibration_mvc_s,
+            }
 
         if self.protocol_abort:
             if output_path.exists():
@@ -743,14 +847,23 @@ class CollectDataWindow(QWidget):
             return
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            output_path,
-            X=X,
-            timestamps=timestamps,
-            y=y,
-            events=np.asarray(events, dtype=object),
-            metadata=metadata,
-        )
+        save_kwargs = {
+            "X": X,
+            "timestamps": timestamps,
+            "y": y,
+            "events": np.asarray(events, dtype=object),
+            "metadata": metadata,
+        }
+        if config.calibrate:
+            save_kwargs.update(
+                {
+                    "calib_neutral_X": np.asarray(calib_neutral_x, dtype=float),
+                    "calib_neutral_timestamps": np.asarray(calib_neutral_ts, dtype=float),
+                    "calib_mvc_X": np.asarray(calib_mvc_x, dtype=float),
+                    "calib_mvc_timestamps": np.asarray(calib_mvc_ts, dtype=float),
+                }
+            )
+        np.savez_compressed(output_path, **save_kwargs)
         print(f"Saved {X.shape[0]} samples to {output_path}")
 
     def collect_segment_with_plot(
@@ -761,12 +874,15 @@ class CollectDataWindow(QWidget):
         channel_count: int,
         plotter=None,
         emg_idx: Optional[List[int]] = None,
+        label_trim_s: float = 0.0,
         stop_flag=None,
-    ) -> Tuple[List[List[float]], List[List[float]], List[str]]:
+    ) -> Tuple[List[List[float]], List[List[float]], List[Optional[str]]]:
         ts_buffer: List[List[float]] = []
         x_buffer: List[List[float]] = []
-        labels: List[str] = []
+        labels: List[Optional[str]] = []
         end_time = time.time() + duration_s
+        segment_start_ts: Optional[float] = None
+        apply_trim = label_trim_s > 0.0 and duration_s > 2 * label_trim_s
 
         while time.time() < end_time:
             if stop_flag and stop_flag():
@@ -800,7 +916,14 @@ class CollectDataWindow(QWidget):
             for idx in range(sample_count):
                 ts_buffer.append([channel_times[ch][idx] for ch in range(channel_count)])
                 x_buffer.append([channel_values[ch][idx] for ch in range(channel_count)])
-                labels.append(label)
+                sample_label = label
+                if apply_trim:
+                    if segment_start_ts is None:
+                        segment_start_ts = channel_times[0][idx]
+                    elapsed = channel_times[0][idx] - segment_start_ts
+                    if elapsed < label_trim_s or elapsed > duration_s - label_trim_s:
+                        sample_label = None
+                labels.append(sample_label)
 
             if plotter and emg_idx:
                 try:

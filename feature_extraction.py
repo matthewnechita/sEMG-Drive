@@ -19,6 +19,10 @@ def majority_label(segment):
     if segment.size == 0:
         return None, 0.0
     flat = segment.reshape(-1)
+    if flat.dtype == object:
+        flat = np.array([x for x in flat if x is not None], dtype=object)
+        if flat.size == 0:
+            return None, 0.0
     # drop NaNs if numeric
     if flat.dtype.kind in "fc":
         flat = flat[~np.isnan(flat)]
@@ -40,6 +44,18 @@ def destination_for_features(filtered_path: Path) -> Path:
     return filtered_path.with_name(filtered_path.stem.replace("_filtered", "") + "_features.npz")
 
 
+def compute_calibration(neutral_emg, mvc_emg, percentile=95.0):
+    neutral = np.asarray(neutral_emg, dtype=float)
+    mvc = np.asarray(mvc_emg, dtype=float)
+    if neutral.size == 0 or mvc.size == 0:
+        return None, None
+    neutral_mean = np.mean(neutral, axis=0)
+    mvc_scale = np.percentile(mvc, percentile, axis=0)
+    eps = 1e-6
+    mvc_scale = np.where(mvc_scale < eps, 1.0, mvc_scale)
+    return neutral_mean, mvc_scale
+
+
 for fp in root.rglob("*_filtered.npz"):
     out_path = destination_for_features(fp)
     if out_path.exists():
@@ -48,6 +64,16 @@ for fp in root.rglob("*_filtered.npz"):
     data = np.load(fp, allow_pickle=True)
     emg = data["emg"]
     fs = float(np.asarray(data["fs"]).squeeze())
+
+    calibration_neutral = data.get("calib_neutral_emg")
+    calibration_mvc = data.get("calib_mvc_emg")
+    neutral_mean = None
+    mvc_scale = None
+    if calibration_neutral is not None and calibration_mvc is not None:
+        neutral_mean, mvc_scale = compute_calibration(calibration_neutral, calibration_mvc)
+        if neutral_mean is not None and mvc_scale is not None:
+            emg = (emg - neutral_mean) / mvc_scale
+
     windows = get_windows(emg, WINDOW_SIZE, WINDOW_STEP)  # 200 samples, 100 step, 50% overlap
     n_windows = windows.shape[0]
     starts = np.arange(n_windows) * WINDOW_STEP
@@ -84,5 +110,8 @@ for fp in root.rglob("*_filtered.npz"):
         window_labels=window_labels,
         window_label_confidence=window_label_confidence,
         source_file=str(fp),
+        calibration_neutral_mean=neutral_mean,
+        calibration_mvc_scale=mvc_scale,
+        calibration_mvc_percentile=95.0 if mvc_scale is not None else None,
     )
     print(f"Wrote {out_path}")
