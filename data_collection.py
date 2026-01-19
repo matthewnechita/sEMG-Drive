@@ -21,6 +21,7 @@ class TrialConfig:
     prep_duration: float = 3.0
     inter_gesture_rest_s: float = 0.0
     label_trim_s: float = 0.0
+    rest_label_trim_s: Optional[float] = None
     calibrate: bool = False
     calibration_neutral_s: float = 3.0
     calibration_mvc_s: float = 3.0
@@ -111,6 +112,18 @@ def collect_segment(
     return ts_buffer, x_buffer, labels
 
 
+def resolve_rest_label_trim(
+    label_trim_s: float,
+    rest_label_trim_s: Optional[float],
+    rest_duration_s: float,
+) -> float:
+    if rest_label_trim_s is not None:
+        return max(0.0, float(rest_label_trim_s))
+    if label_trim_s <= 0.0 or rest_duration_s <= 0.0:
+        return 0.0
+    return min(label_trim_s, rest_duration_s * 0.25)
+
+
 def run_protocol(config: TrialConfig, output_path: Path):
     # Wire up the AeroPy base with the minimal handler.
     handler = _CollectionHandler(stream_yt_data=True)
@@ -137,6 +150,13 @@ def run_protocol(config: TrialConfig, output_path: Path):
     all_labels: List[str] = []
     events = []
     aborted = False
+    rest_trim_s = None
+    if config.inter_gesture_rest_s > 0.0:
+        rest_trim_s = resolve_rest_label_trim(
+            config.label_trim_s,
+            config.rest_label_trim_s,
+            config.inter_gesture_rest_s,
+        )
 
     start_wall = time.time()
     events.append({"event": "session_start", "t_wall": start_wall})
@@ -218,7 +238,7 @@ def run_protocol(config: TrialConfig, output_path: Path):
                         "neutral",
                         rest_duration,
                         channel_count,
-                        label_trim_s=config.label_trim_s,
+                        label_trim_s=rest_trim_s or 0.0,
                     )
                     all_ts.extend(seg_ts)
                     all_x.extend(seg_x)
@@ -245,6 +265,7 @@ def run_protocol(config: TrialConfig, output_path: Path):
         "prep_duration_s": config.prep_duration,
         "inter_gesture_rest_s": config.inter_gesture_rest_s,
         "label_trim_s": config.label_trim_s,
+        "rest_label_trim_s": rest_trim_s,
         "ramp_style": "ramp contractions (longer window for non-neutral gestures)",
     }
     if config.calibrate:
@@ -319,6 +340,12 @@ def build_parser():
         help="Seconds to discard at start/end of each segment when labeling.",
     )
     parser.add_argument(
+        "--rest-label-trim",
+        type=float,
+        default=None,
+        help="Seconds to discard at start/end of each inter-gesture rest segment.",
+    )
+    parser.add_argument(
         "--calibrate",
         action="store_true",
         help="Record neutral + max contraction calibration segments at start.",
@@ -360,6 +387,7 @@ def main(argv=None):
         prep_duration=args.prep_duration,
         inter_gesture_rest_s=args.inter_gesture_rest,
         label_trim_s=args.label_trim,
+        rest_label_trim_s=args.rest_label_trim,
         calibrate=args.calibrate,
         calibration_neutral_s=args.calibration_neutral,
         calibration_mvc_s=args.calibration_mvc,

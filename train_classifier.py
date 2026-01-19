@@ -217,9 +217,12 @@ def parse_gamma_values(values):
 
 def resolve_stratified_cv(y, max_splits, random_state):
     _, counts = np.unique(y, return_counts=True)
-    splits = min(int(max_splits), int(counts.min()))
-    if splits < 2:
-        splits = 2
+    if counts.size == 0:
+        return None
+    min_count = int(counts.min())
+    if min_count < 2:
+        return None
+    splits = min(int(max_splits), min_count)
     return StratifiedKFold(n_splits=splits, shuffle=True, random_state=random_state)
 
 
@@ -302,6 +305,12 @@ def main(argv=None):
     groups = np.asarray(groups, dtype=object)
 
     indices = np.arange(X_flat.shape[0])
+    _, class_counts = np.unique(y, return_counts=True)
+    min_class_count = int(class_counts.min()) if class_counts.size else 0
+    cv_ok = min_class_count >= 2
+    if not cv_ok:
+        print("Warning: CV/grid search disabled (a class has <2 samples).")
+
     full_group_cv = resolve_group_cv(groups, args.cv_splits)
     use_group_split = full_group_cv is not None
     if use_group_split:
@@ -310,8 +319,8 @@ def main(argv=None):
             test_size=args.test_size,
             random_state=args.random_state,
         )
-        train_idx, test_idx = next(splitter.split(X_flat, y, groups))
-        print(f"Using group split across {np.unique(groups).size} sessions/files.")
+    train_idx, test_idx = next(splitter.split(X_flat, y, groups))
+    print(f"Using group split across {np.unique(groups).size} sessions/files.")
     else:
         train_idx, test_idx = train_test_split(
             indices,
@@ -328,7 +337,10 @@ def main(argv=None):
     groups_train = groups[train_idx] if use_group_split else None
 
     train_group_cv = resolve_group_cv(groups_train, args.cv_splits) if use_group_split else None
-    if train_group_cv is None:
+    if not cv_ok:
+        train_cv = None
+        train_cv_uses_groups = False
+    elif train_group_cv is None:
         train_cv = resolve_stratified_cv(y_train, args.cv_splits, args.random_state)
         train_cv_uses_groups = False
     else:
@@ -336,17 +348,22 @@ def main(argv=None):
         train_cv_uses_groups = True
 
     if use_group_split:
-        full_cv = full_group_cv
-        full_cv_uses_groups = True
+        full_cv = full_group_cv if cv_ok else None
+        full_cv_uses_groups = bool(full_cv)
     else:
-        full_cv = resolve_stratified_cv(y, args.cv_splits, args.random_state)
+        full_cv = resolve_stratified_cv(y, args.cv_splits, args.random_state) if cv_ok else None
         full_cv_uses_groups = False
 
     best_svm_c = args.svm_c
     best_svm_gamma = args.svm_gamma
     grid_results = None
 
-    if args.grid_search:
+    grid_search_enabled = args.grid_search
+    if grid_search_enabled and train_cv is None:
+        print("Warning: grid search disabled (training split lacks >=2 samples per class).")
+        grid_search_enabled = False
+
+    if grid_search_enabled:
         gamma_grid = parse_gamma_values(args.grid_gamma)
         param_grid = {
             "svc__C": args.grid_c,
@@ -390,30 +407,32 @@ def main(argv=None):
     y_pred = model.predict(X_test)
     train_accuracy = float(model.score(X_train, y_train))
 
-    cv_model = build_model(args.model, args, svm_c=best_svm_c, svm_gamma=best_svm_gamma)
-    if full_cv_uses_groups:
-        cv_scores = cross_validate(
-            cv_model,
-            X_flat,
-            y,
-            cv=full_cv,
-            scoring="accuracy",
-            return_train_score=False,
-            groups=groups,
-        )
-    else:
-        cv_scores = cross_validate(
-            cv_model,
-            X_flat,
-            y,
-            cv=full_cv,
-            scoring="accuracy",
-            return_train_score=False,
-        )
+    cv_scores = None
+    if full_cv is not None:
+        cv_model = build_model(args.model, args, svm_c=best_svm_c, svm_gamma=best_svm_gamma)
+        if full_cv_uses_groups:
+            cv_scores = cross_validate(
+                cv_model,
+                X_flat,
+                y,
+                cv=full_cv,
+                scoring="accuracy",
+                return_train_score=False,
+                groups=groups,
+            )
+        else:
+            cv_scores = cross_validate(
+                cv_model,
+                X_flat,
+                y,
+                cv=full_cv,
+                scoring="accuracy",
+                return_train_score=False,
+            )
 
     metrics = {
-        "cv_accuracy_mean": float(cv_scores["test_score"].mean()),
-        "cv_accuracy_std": float(cv_scores["test_score"].std()),
+        "cv_accuracy_mean": float(cv_scores["test_score"].mean()) if cv_scores is not None else None,
+        "cv_accuracy_std": float(cv_scores["test_score"].std()) if cv_scores is not None else None,
         "test_accuracy": float(accuracy_score(y_test, y_pred)),
         "train_accuracy": train_accuracy,
         "n_samples": int(X_flat.shape[0]),
@@ -422,7 +441,10 @@ def main(argv=None):
     if grid_results is not None:
         metrics["grid_search_best_score"] = grid_results["best_score"]
 
-    print(f"CV accuracy: {metrics['cv_accuracy_mean']:.3f} +/- {metrics['cv_accuracy_std']:.3f}")
+    if metrics["cv_accuracy_mean"] is None:
+        print("CV accuracy: n/a (insufficient class counts for CV)")
+    else:
+        print(f"CV accuracy: {metrics['cv_accuracy_mean']:.3f} +/- {metrics['cv_accuracy_std']:.3f}")
     print(f"Train accuracy: {metrics['train_accuracy']:.3f}")
     print(f"Test accuracy: {metrics['test_accuracy']:.3f}")
     print("\nReport:\n", classification_report(y_test, y_pred))
@@ -447,7 +469,7 @@ def main(argv=None):
             "evaluation_split": {
                 "group_split": bool(use_group_split),
                 "test_size": float(args.test_size),
-                "cv_splits": int(getattr(full_cv, "n_splits", args.cv_splits)),
+                "cv_splits": int(getattr(full_cv, "n_splits", 0)) if full_cv is not None else 0,
             },
             "fit_all_data": bool(args.fit_all),
         }

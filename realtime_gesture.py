@@ -109,6 +109,12 @@ def build_parser():
     parser.add_argument("--model", default="models/gesture_classifier.pkl")
     parser.add_argument("--window-size", type=int, default=None)
     parser.add_argument("--window-step", type=int, default=None)
+    parser.add_argument(
+        "--filter-warmup-samples",
+        type=int,
+        default=None,
+        help="Extra samples to include ahead of each window for filter warmup.",
+    )
     parser.add_argument("--smoothing", type=int, default=5)
     parser.add_argument("--min-confidence", type=float, default=0.7)
     parser.add_argument("--low-confidence-label", default="neutral")
@@ -140,6 +146,10 @@ def main(argv=None):
 
     window_size = args.window_size or int(meta.get("window_size_samples", 200))
     window_step = args.window_step or int(meta.get("window_step_samples", 100))
+    warmup_samples = window_size if args.filter_warmup_samples is None else int(args.filter_warmup_samples)
+    if warmup_samples < 0:
+        warmup_samples = 0
+    buffer_len = window_size + warmup_samples
     expected_channels = bundle.channel_count
 
     handler = _StreamingHandler()
@@ -227,7 +237,8 @@ def main(argv=None):
             else:
                 print("Warning: calibration skipped (no samples collected).")
 
-    sample_buffer = deque(maxlen=window_size)
+    sample_buffer = deque(maxlen=buffer_len)
+    warmup_complete = warmup_samples == 0
     pending_samples = 0
     pred_history = deque(maxlen=max(1, args.smoothing))
     last_output = None
@@ -274,14 +285,18 @@ def main(argv=None):
                         sample = sample[:model_channels]
                 sample_buffer.append(sample)
                 pending_samples += 1
+                if not warmup_complete and len(sample_buffer) >= buffer_len:
+                    warmup_complete = True
+                    pending_samples = window_step
 
-                while pending_samples >= window_step and len(sample_buffer) == window_size:
+                while warmup_complete and pending_samples >= window_step and len(sample_buffer) >= window_size:
                     if filter_obj is None:
                         pending_samples -= window_step
                         continue
 
-                    window = np.asarray(sample_buffer, dtype=float)
-                    filtered = apply_filters(filter_obj, window)
+                    raw = np.asarray(sample_buffer, dtype=float)
+                    filtered_full = apply_filters(filter_obj, raw)
+                    filtered = filtered_full[-window_size:]
                     if neutral_mean is not None and mvc_scale is not None:
                         filtered = (filtered - neutral_mean) / mvc_scale
                     # Match libemg.get_windows output: (n_windows, channels, window_size).

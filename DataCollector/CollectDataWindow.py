@@ -32,9 +32,22 @@ class TrialConfig:
     prep_duration: float = 3.0
     inter_gesture_rest_s: float = 0.0
     label_trim_s: float = 0.0
+    rest_label_trim_s: Optional[float] = None
     calibrate: bool = False
     calibration_neutral_s: float = 3.0
     calibration_mvc_s: float = 3.0
+
+
+def resolve_rest_label_trim(
+    label_trim_s: float,
+    rest_label_trim_s: Optional[float],
+    rest_duration_s: float,
+) -> float:
+    if rest_label_trim_s is not None:
+        return max(0.0, float(rest_label_trim_s))
+    if label_trim_s <= 0.0 or rest_duration_s <= 0.0:
+        return 0.0
+    return min(label_trim_s, rest_duration_s * 0.25)
 
 
 class CollectDataWindow(QWidget):
@@ -638,6 +651,7 @@ class CollectDataWindow(QWidget):
             prep_duration=5.0,
             inter_gesture_rest_s=1.0,
             label_trim_s=0.5,
+            rest_label_trim_s=None,
             calibrate=True,
             calibration_neutral_s=3.0,
             calibration_mvc_s=3.0,
@@ -673,6 +687,13 @@ class CollectDataWindow(QWidget):
         emg_idx = getattr(base, "emgChannelsIdx", [])
         self.protocol_abort = False
         self.protocol_running = True
+        rest_trim_s = None
+        if config.inter_gesture_rest_s > 0.0:
+            rest_trim_s = resolve_rest_label_trim(
+                config.label_trim_s,
+                config.rest_label_trim_s,
+                config.inter_gesture_rest_s,
+            )
 
         base.TrigBase.Start(self.CallbackConnector.streamYTData)
 
@@ -793,7 +814,7 @@ class CollectDataWindow(QWidget):
                             channel_count,
                             plotter,
                             emg_idx,
-                            label_trim_s=config.label_trim_s,
+                            label_trim_s=rest_trim_s or 0.0,
                             stop_flag=self.protocol_abort_requested,
                         )
                         all_ts.extend(seg_ts)
@@ -829,6 +850,7 @@ class CollectDataWindow(QWidget):
             "prep_duration_s": config.prep_duration,
             "inter_gesture_rest_s": config.inter_gesture_rest_s,
             "label_trim_s": config.label_trim_s,
+            "rest_label_trim_s": rest_trim_s,
             "ramp_style": "ramp contractions (longer window for non-neutral gestures)",
         }
         if config.calibrate:
