@@ -193,6 +193,27 @@ def run_protocol(config: TrialConfig, output_path: Path):
             calib_mvc_ts = seg_ts
             calib_mvc_x = seg_x
 
+            if config.inter_gesture_rest_s > 0.0:
+                rest_duration = config.inter_gesture_rest_s
+                print(f"Post-calibration rest: neutral for {rest_duration:.1f}s")
+                events.append(
+                    {
+                        "event": "neutral_buffer_start",
+                        "t_wall": time.time(),
+                        "after": "calibration_mvc",
+                    }
+                )
+                seg_ts, seg_x, seg_labels = collect_segment(
+                    handler.DataHandler,
+                    "neutral_buffer",
+                    rest_duration,
+                    channel_count,
+                    label_trim_s=rest_trim_s or 0.0,
+                )
+                all_ts.extend(seg_ts)
+                all_x.extend(seg_x)
+                all_labels.extend(seg_labels)
+
         for rep in range(config.repetitions):
             for idx, gesture in enumerate(config.gestures):
                 if idx + 1 < len(config.gestures):
@@ -235,7 +256,7 @@ def run_protocol(config: TrialConfig, output_path: Path):
                     )
                     seg_ts, seg_x, seg_labels = collect_segment(
                         handler.DataHandler,
-                        "neutral",
+                        "neutral_buffer",
                         rest_duration,
                         channel_count,
                         label_trim_s=rest_trim_s or 0.0,

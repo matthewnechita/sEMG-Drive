@@ -11,6 +11,24 @@ from libemg.feature_extractor import FeatureExtractor
 from filtering import define_filters, apply_filters
 from gesture_model import load_model_bundle, flatten_feature_dict
 
+try:
+    import rospy
+    from std_msgs.msg import String
+except Exception:
+    rospy = None
+    String = None
+
+_ROS_PUB = None
+
+
+def _init_ros_pub(topic: str = "/emg/gesture") -> None:
+    global _ROS_PUB
+    if rospy is None:
+        raise RuntimeError("rospy not available in this environment.")
+    if not rospy.core.is_initialized():
+        rospy.init_node("emg_gesture_publisher", anonymous=True, disable_signals=True)
+    _ROS_PUB = rospy.Publisher(topic, String, queue_size=10)
+
 
 class _StreamingHandler:
     def __init__(self):
@@ -47,7 +65,9 @@ def _majority_vote(values):
 
 
 def control_hook(gesture: str) -> None:
-    # Placeholder for CARLA/ROS control integration.
+    if _ROS_PUB is None:
+        return
+    _ROS_PUB.publish(String(data=str(gesture)))
     return
 
 
@@ -116,7 +136,9 @@ def build_parser():
         help="Extra samples to include ahead of each window for filter warmup.",
     )
     parser.add_argument("--smoothing", type=int, default=5)
-    parser.add_argument("--min-confidence", type=float, default=0.7)
+    # Confidence gating for predictions; set to 0 to disable.
+    parser.add_argument("--min-confidence", type=float, default=0.4)
+    # Label emitted when confidence is below the threshold.
     parser.add_argument("--low-confidence-label", default="neutral")
     parser.add_argument("--fs", type=float, default=None)
     parser.add_argument("--poll-sleep", type=float, default=0.001)
@@ -135,6 +157,11 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if rospy is not None:
+        try:
+            _init_ros_pub("/emg/gesture")
+        except Exception as exc:
+            print(f"Warning: ROS publisher disabled ({exc}).")
     bundle = load_model_bundle(args.model)
     meta = bundle.metadata
     if args.min_confidence > 0.0 and not hasattr(bundle.model, "predict_proba"):
@@ -321,6 +348,7 @@ def main(argv=None):
                     pred_history.append(pred)
                     label = _majority_vote(pred_history) if args.smoothing > 1 else pred
 
+                    # Confidence threshold applied here.
                     if confidence is not None and confidence < args.min_confidence:
                         label = args.low_confidence_label
 

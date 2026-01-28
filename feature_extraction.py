@@ -90,6 +90,9 @@ for fp in root.rglob("*_filtered.npz"):
         for s, e in zip(starts, ends):
             seg = y_arr[s:e]
             lbl, conf = majority_label(seg)
+            if lbl == "neutral_buffer":
+                lbl = None
+                conf = 0.0
             labels.append(lbl)
             confs.append(conf)
         window_labels = np.array(labels, dtype=object)

@@ -757,6 +757,37 @@ class CollectDataWindow(QWidget):
                 if self.protocol_abort:
                     events.append({"event": "session_abort", "t_wall": time.time()})
                     return
+                if config.inter_gesture_rest_s > 0.0:
+                    rest_duration = config.inter_gesture_rest_s
+                    self.update_instruction(
+                        "Post-calibration rest: neutral buffer",
+                        config.gestures[0] if config.gestures else None,
+                        config.repetitions * len(config.gestures),
+                        rest_duration,
+                    )
+                    events.append(
+                        {
+                            "event": "neutral_buffer_start",
+                            "t_wall": time.time(),
+                            "after": "calibration_mvc",
+                        }
+                    )
+                    seg_ts, seg_x, seg_labels = self.collect_segment_with_plot(
+                        self.CallbackConnector.DataHandler,
+                        "neutral_buffer",
+                        rest_duration,
+                        channel_count,
+                        plotter,
+                        emg_idx,
+                        label_trim_s=rest_trim_s or 0.0,
+                        stop_flag=self.protocol_abort_requested,
+                    )
+                    all_ts.extend(seg_ts)
+                    all_x.extend(seg_x)
+                    all_labels.extend(seg_labels)
+                    if self.protocol_abort:
+                        events.append({"event": "session_abort", "t_wall": time.time()})
+                        return
 
             for rep in range(config.repetitions):
                 for idx, gesture in enumerate(config.gestures):
@@ -809,7 +840,7 @@ class CollectDataWindow(QWidget):
                         )
                         seg_ts, seg_x, seg_labels = self.collect_segment_with_plot(
                             self.CallbackConnector.DataHandler,
-                            "neutral",
+                            "neutral_buffer",
                             rest_duration,
                             channel_count,
                             plotter,

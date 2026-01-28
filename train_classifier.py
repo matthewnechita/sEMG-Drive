@@ -119,6 +119,7 @@ def load_dataset(root, pattern, min_label_confidence=0.0, channel_mode="pad"):
             X = X[conf_mask]
 
         label_mask = labels != None  # noqa: E711
+        label_mask = label_mask & (labels != "neutral_buffer")
         X = X[label_mask]
         labels = labels[label_mask]
 
@@ -251,6 +252,7 @@ def build_parser():
         default="pad",
         help="How to handle channel count mismatches across feature files.",
     )
+    # Defaults used when grid search is off/disabled.
     parser.add_argument("--svm-c", type=float, default=100.0)
     parser.add_argument("--svm-gamma", default="scale")
     parser.add_argument(
@@ -265,12 +267,14 @@ def build_parser():
         default=True,
         help="Enable probability estimates (required for confidence gating in realtime).",
     )
+    # Toggle hyperparameter optimization; use --no-grid-search to disable.
     parser.add_argument(
-        "--grid-search",
+        "--no-grid-search",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Run grid search over SVM C/gamma before training.",
     )
+    # Search ranges for grid optimization.
     parser.add_argument(
         "--grid-c",
         nargs="+",
@@ -319,8 +323,8 @@ def main(argv=None):
             test_size=args.test_size,
             random_state=args.random_state,
         )
-    train_idx, test_idx = next(splitter.split(X_flat, y, groups))
-    print(f"Using group split across {np.unique(groups).size} sessions/files.")
+        train_idx, test_idx = next(splitter.split(X_flat, y, groups))
+        print(f"Using group split across {np.unique(groups).size} sessions/files.")
     else:
         train_idx, test_idx = train_test_split(
             indices,
@@ -358,7 +362,7 @@ def main(argv=None):
     best_svm_gamma = args.svm_gamma
     grid_results = None
 
-    grid_search_enabled = args.grid_search
+    grid_search_enabled = args.no_grid_search
     if grid_search_enabled and train_cv is None:
         print("Warning: grid search disabled (training split lacks >=2 samples per class).")
         grid_search_enabled = False
