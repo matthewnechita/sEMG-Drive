@@ -1,4 +1,5 @@
 import datetime as dt
+import time
 from pathlib import Path
 
 import numpy as np
@@ -199,7 +200,9 @@ def train_eval_split(
 
     best_state = None
     best_acc = -1.0
+    start_time = time.time()
     for epoch in range(1, epochs + 1):
+        epoch_start = time.time()
         model.train()
         train_correct = 0
         train_total = 0
@@ -236,6 +239,11 @@ def train_eval_split(
         print(
             f"Epoch {epoch:02d} | loss {avg_loss:.4f} | train {train_acc:.3f} | eval {eval_acc:.3f}"
         )
+        if epoch == 1:
+            epoch_time = time.time() - epoch_start
+            est_total = epoch_time * epochs
+            est_remaining = max(0.0, est_total - (time.time() - start_time))
+            print(f"Estimated remaining time (this phase): ~{est_remaining:.1f}s")
 
         if eval_acc > best_acc:
             best_acc = eval_acc
@@ -251,6 +259,10 @@ def main():
     torch.manual_seed(RANDOM_STATE)
 
     X, y, groups, channel_count = load_dataset()
+    print(
+        f"Loaded {X.shape[0]} windows, {channel_count} channels, "
+        f"{len(np.unique(y))} classes."
+    )
 
     labels = sorted({str(lbl) for lbl in np.unique(y)})
     label_to_index = {label: idx for idx, label in enumerate(labels)}
@@ -307,6 +319,10 @@ def main():
         split_mode = "stratified-random"
 
     print("\nFinal train/test split")
+    print(
+        f"Training CNN for {EPOCHS} epochs (batch {BATCH_SIZE}) "
+        f"on {len(train_idx)} windows; testing on {len(test_idx)} windows."
+    )
     model, mean, std, _ = train_eval_split(
         X[train_idx],
         y_idx[train_idx],
@@ -383,6 +399,8 @@ def main():
     }
 
     MODEL_OUT.parent.mkdir(parents=True, exist_ok=True)
+    if MODEL_OUT.exists():
+        print(f"Warning: overwriting existing model at {MODEL_OUT}")
     torch.save(bundle, MODEL_OUT)
     print(f"Saved model bundle to {MODEL_OUT}")
 
