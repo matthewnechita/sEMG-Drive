@@ -3,6 +3,7 @@ Controller class for the Data Collector GUI
 This is the controller for the GUI that lets you connect to a base, scan via rf for sensors, and stream data from them in real time.
 """
 
+import time
 from collections import deque
 
 from Plotter.GenericPlot import *
@@ -15,6 +16,10 @@ app.use_app('PySide6')
 
 
 class PlottingManagement():
+    PLOT_UPDATE_HZ = 30
+    PLOT_QUEUE_MAXLEN = 64
+    PLOT_IDLE_SLEEP_S = 0.002
+
     def __init__(self, collect_data_window, metrics, emgplot=None):
         self.base = TrignoBase(self)
         self.collect_data_window = collect_data_window
@@ -34,6 +39,7 @@ class PlottingManagement():
         """This is the data processing thread"""
         self.emg_queue = deque()
         while self.pauseFlag is True:
+            time.sleep(self.PLOT_IDLE_SLEEP_S)
             continue
         while self.pauseFlag is False:
             self.DataHandler.processData(self.emg_plot)
@@ -43,6 +49,7 @@ class PlottingManagement():
         """This is the data processing thread"""
         self.emg_queue = deque()
         while self.pauseFlag is True:
+            time.sleep(self.PLOT_IDLE_SLEEP_S)
             continue
         while self.pauseFlag is False:
             self.DataHandler.processYTData(self.emg_plot)
@@ -50,7 +57,13 @@ class PlottingManagement():
 
     def vispyPlot(self):
         """Plot Thread - Only Plotting EMG Channels"""
+        last_plot_time = 0.0
+        min_interval = 1.0 / max(1, self.PLOT_UPDATE_HZ)
         while self.pauseFlag is False:
+            now = time.perf_counter()
+            if now - last_plot_time < min_interval:
+                time.sleep(self.PLOT_IDLE_SLEEP_S)
+                continue
             if len(self.emg_plot) >= 2:
                 incData = self.emg_plot.popleft()  # Data at time T-1
                 try:
@@ -61,8 +74,11 @@ class PlottingManagement():
                     try:
                         self.EMGplot.plot_new_data(self.outData,
                                                    [self.emg_plot[0][i][0] for i in self.base.emgChannelsIdx])
+                        last_plot_time = now
                     except IndexError:
                         print("Index Error Occurred: vispyPlot()")
+            else:
+                time.sleep(self.PLOT_IDLE_SLEEP_S)
 
     def updatemetrics(self):
         self.metrics.framescollected.setText(str(self.DataHandler.packetCount))
@@ -73,7 +89,7 @@ class PlottingManagement():
 
     def threadManager(self, start_trigger, stop_trigger):
         """Handles the threads for the DataCollector gui"""
-        self.emg_plot = deque()
+        self.emg_plot = deque(maxlen=self.PLOT_QUEUE_MAXLEN)
 
         # Start standard data stream (only channel data, no time values)
         if not self.streamYTData:

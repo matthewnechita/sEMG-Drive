@@ -34,6 +34,7 @@ class TrignoBase():
         self.pairnumber = 0
         self.csv_writer = CsvWriter()
         self.emgChannelNames = []
+        self.plot_window_samples = 5000
 
     # -- AeroPy Methods --
     def PipelineState_Callback(self):
@@ -174,7 +175,9 @@ class TrignoBase():
 
 
                 if self.collection_data_handler.EMGplot:
-                    self.collection_data_handler.EMGplot.initiateCanvas(None, None, self.plotCount, 1, 20000)
+                    self.collection_data_handler.EMGplot.initiateCanvas(
+                        None, None, self.plotCount, 1, self.plot_window_samples
+                    )
                     try:
                         self.collection_data_handler.collect_data_window.update_channel_labels(self.emgChannelNames)
                     except Exception:

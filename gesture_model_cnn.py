@@ -81,9 +81,16 @@ def _resolve_architecture(bundle: dict, in_channels: int, num_classes: int):
     return channels, dropout, kernel_size
 
 
+def _torch_load_bundle(path: Path, device: str):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
 def load_cnn_bundle(path: str | Path, device: str = "cpu") -> CnnBundle:
     path = Path(path)
-    bundle = torch.load(path, map_location=device)
+    bundle = _torch_load_bundle(path, device)
     if not isinstance(bundle, dict):
         raise ValueError(f"{path} is not a valid CNN bundle.")
 

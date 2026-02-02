@@ -24,27 +24,29 @@ WINDOW_STEP = 100
 
 USE_CALIBRATION = True
 MVC_PERCENTILE = 95.0
+USE_MIN_LABEL_CONFIDENCE = True
+MIN_LABEL_CONFIDENCE = 0.8
 
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 
 BATCH_SIZE = 256
-EPOCHS = 30
-LR = 1e-3
-DROPOUT = 0.2
-KERNEL_SIZE = 7
+EPOCHS = 90
+LR = 1e-4
+DROPOUT = 0.4
+KERNEL_SIZE = 11
 
 USE_CLASS_WEIGHTS = True
 
-CV_ENABLED = True
-CV_FOLDS = 3
-CV_EPOCHS = 5
+CV_ENABLED = False
+CV_FOLDS = 6
+CV_EPOCHS = 90
 # ========================================
 
 
-def majority_label(segment):
+def majority_label_with_confidence(segment):
     if segment.size == 0:
-        return None
+        return None, 0.0
     flat = segment.reshape(-1)
     if flat.dtype == object:
         cleaned = []
@@ -61,13 +63,18 @@ def majority_label(segment):
             cleaned.append(x)
         flat = np.array(cleaned, dtype=object)
         if flat.size == 0:
-            return None
+            return None, 0.0
     if flat.dtype.kind in "fc":
         flat = flat[~np.isnan(flat)]
     if flat.size == 0:
-        return None
+        return None, 0.0
     values, counts = np.unique(flat, return_counts=True)
-    return values[counts.argmax()]
+    if counts.size == 0:
+        return None, 0.0
+    idx = counts.argmax()
+    total = counts.sum()
+    confidence = float(counts[idx] / total) if total > 0 else 0.0
+    return values[idx], confidence
 
 
 def compute_calibration(neutral_emg, mvc_emg, percentile):
@@ -106,8 +113,14 @@ def load_windows_from_file(path):
 
     window_labels = []
     for s, e in zip(starts, ends):
-        lbl = majority_label(labels[s:e])
+        lbl, confidence = majority_label_with_confidence(labels[s:e])
         if lbl == "neutral_buffer":
+            lbl = None
+        if (
+            USE_MIN_LABEL_CONFIDENCE
+            and lbl is not None
+            and confidence < MIN_LABEL_CONFIDENCE
+        ):
             lbl = None
         window_labels.append(lbl)
 
@@ -197,6 +210,14 @@ def train_eval_split(
 
     criterion = nn.CrossEntropyLoss(weight=class_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=5,
+        threshold=1e-4,
+        min_lr=1e-6,
+    )
 
     best_state = None
     best_acc = -1.0
@@ -224,11 +245,14 @@ def train_eval_split(
         model.eval()
         eval_correct = 0
         eval_total = 0
+        eval_loss = 0.0
         with torch.no_grad():
             for xb, yb in eval_loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
                 logits = model(xb)
+                loss = criterion(logits, yb)
+                eval_loss += loss.item() * xb.size(0)
                 preds = torch.argmax(logits, dim=1)
                 eval_correct += (preds == yb).sum().item()
                 eval_total += xb.size(0)
@@ -236,9 +260,17 @@ def train_eval_split(
         train_acc = train_correct / max(train_total, 1)
         eval_acc = eval_correct / max(eval_total, 1)
         avg_loss = train_loss / max(train_total, 1)
+        avg_eval_loss = eval_loss / max(eval_total, 1)
         print(
-            f"Epoch {epoch:02d} | loss {avg_loss:.4f} | train {train_acc:.3f} | eval {eval_acc:.3f}"
+            f"Epoch {epoch:02d} | loss {avg_loss:.4f} | "
+            f"eval_loss {avg_eval_loss:.4f} | train {train_acc:.3f} | "
+            f"eval {eval_acc:.3f}"
         )
+        prev_lr = optimizer.param_groups[0]["lr"]
+        scheduler.step(avg_eval_loss)
+        new_lr = optimizer.param_groups[0]["lr"]
+        if new_lr < prev_lr:
+            print(f"LR reduced: {prev_lr:.2e} -> {new_lr:.2e}")
         if epoch == 1:
             epoch_time = time.time() - epoch_start
             est_total = epoch_time * epochs
@@ -371,6 +403,10 @@ def main():
         "test_size": float(TEST_SIZE),
         "calibration_used": bool(USE_CALIBRATION),
         "calibration_mvc_percentile": float(MVC_PERCENTILE),
+        "label_confidence_filter": {
+            "enabled": bool(USE_MIN_LABEL_CONFIDENCE),
+            "min_label_confidence": float(MIN_LABEL_CONFIDENCE),
+        },
         "training": {
             "epochs": int(EPOCHS),
             "batch_size": int(BATCH_SIZE),
