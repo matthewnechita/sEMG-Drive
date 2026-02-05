@@ -10,6 +10,8 @@ from AeroPy.DataManager import DataKernel
 from filtering import define_filters, apply_filters
 from gesture_model_cnn import load_cnn_bundle
 
+import threading
+
 
 # ======== Config (edit as needed) ========
 WINDOW_SIZE = 200
@@ -19,6 +21,10 @@ FILTER_WARMUP = 200  # extra samples for filter warmup
 SMOOTHING = 5  # number of windows to average
 MIN_CONFIDENCE = 0.4
 LOW_CONFIDENCE_LABEL = "neutral"
+
+LATEST_LOCK = threading.lock()
+LATEST_GESTURE = LOW_CONFIDENCE_LABEL
+LATEST_TIMESTAMP = 0.0
 
 CALIBRATE = True
 CALIB_NEUTRAL_S = 3.0
@@ -56,9 +62,21 @@ def _estimate_fs(times):
 
 
 def control_hook(gesture: str) -> None:
-    # TODO: replace with control system integration
+    set_latest_gesture(gesture)
     return
 
+def set_latest_gesture(label: str) -> None:
+    global LATEST_GESTURE, LATEST_TIMESTAMP
+    with LATEST_LOCK:
+        LATEST_GESTURE = str(label)
+        LATEST_TIMESTAMP = time.time()
+
+def get_latest_gesture(defualt: str = LOW_CONFIDENCE_LABEL):
+    with LATEST_LOCK:
+        label = LATEST_GESTURE if LATEST_GESTURE is not None else default
+        ts = LATEST_TIMESTAMP
+        age = (time.time() - ts) if ts else float('inf')
+        return label, age
 
 def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_sleep):
     samples = []
