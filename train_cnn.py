@@ -31,14 +31,14 @@ TEST_SIZE = 0.2
 RANDOM_STATE = 42
 
 BATCH_SIZE = 256
-EPOCHS = 90
+EPOCHS = 70
 LR = 1e-4
 DROPOUT = 0.4
 KERNEL_SIZE = 11
 
 USE_CLASS_WEIGHTS = True
 
-CV_ENABLED = True
+CV_ENABLED = False
 CV_FOLDS = 6
 CV_EPOCHS = 90
 # ========================================

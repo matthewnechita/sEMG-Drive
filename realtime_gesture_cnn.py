@@ -22,7 +22,7 @@ SMOOTHING = 5  # number of windows to average
 MIN_CONFIDENCE = 0.4
 LOW_CONFIDENCE_LABEL = "neutral"
 
-LATEST_LOCK = threading.lock()
+LATEST_LOCK = threading.Lock()
 LATEST_GESTURE = LOW_CONFIDENCE_LABEL
 LATEST_TIMESTAMP = 0.0
 
@@ -71,7 +71,7 @@ def set_latest_gesture(label: str) -> None:
         LATEST_GESTURE = str(label)
         LATEST_TIMESTAMP = time.time()
 
-def get_latest_gesture(defualt: str = LOW_CONFIDENCE_LABEL):
+def get_latest_gesture(default: str = LOW_CONFIDENCE_LABEL):
     with LATEST_LOCK:
         label = LATEST_GESTURE if LATEST_GESTURE is not None else default
         ts = LATEST_TIMESTAMP
@@ -204,14 +204,14 @@ def main(argv=None):
     # === LATENCY MEASURE START ===
     # Comment out this whole block (and other LATENCY blocks below) after measuring.
     # Measures end-to-end latency from "data available in this process" to prediction time.
-    latency_enabled = True
-    latency_print_every = 20
-    latency_max_preds = 200
-    latency_ms = []
-    proc_ms = []
-    preds = 0
-    time_buffer = deque(maxlen=WINDOW_SIZE + FILTER_WARMUP)
-    # === LATENCY MEASURE END ===
+    # latency_enabled = True
+    # latency_print_every = 20
+    # latency_max_preds = 200
+    # latency_ms = []
+    # proc_ms = []
+    # preds = 0
+    # time_buffer = deque(maxlen=WINDOW_SIZE + FILTER_WARMUP)
+    # # === LATENCY MEASURE END ===
 
     try:
         while True:
@@ -256,20 +256,20 @@ def main(argv=None):
                     sample = sample[:model_channels]
                 sample_buffer.append(sample)
                 pending_samples += 1
-                # === LATENCY MEASURE START ===
-                if latency_enabled:
-                    time_buffer.append(batch_wall_time)
-                # === LATENCY MEASURE END ===
+    #             # === LATENCY MEASURE START ===
+    #             if latency_enabled:
+    #                 time_buffer.append(batch_wall_time)
+    #             # === LATENCY MEASURE END ===
 
                 while pending_samples >= WINDOW_STEP and len(sample_buffer) >= WINDOW_SIZE:
                     if filter_obj is None:
                         pending_samples -= WINDOW_STEP
                         continue
 
-                    # === LATENCY MEASURE START ===
-                    if latency_enabled:
-                        t0 = time.time()
-                    # === LATENCY MEASURE END ===
+    #                 # === LATENCY MEASURE START ===
+    #                 if latency_enabled:
+    #                     t0 = time.time()
+    #                 # === LATENCY MEASURE END ===
 
                     raw = np.asarray(sample_buffer, dtype=float)
                     filtered_full = apply_filters(filter_obj, raw)
@@ -294,25 +294,25 @@ def main(argv=None):
 
                     control_hook(label)
 
-                    # === LATENCY MEASURE START ===
-                    if latency_enabled:
-                        t1 = time.time()
-                        proc_ms.append((t1 - t0) * 1000.0)
-                        latest_ts = time_buffer[-1] if time_buffer else None
-                        if latest_ts is not None:
-                            latency_ms.append((t1 - latest_ts) * 1000.0)
-                        preds += 1
-                        if latency_print_every > 0 and preds % latency_print_every == 0:
-                            if latency_ms:
-                                print(
-                                    f"latency_ms={latency_ms[-1]:.1f} "
-                                    f"proc_ms={proc_ms[-1]:.1f}",
-                                    end="\r",
-                                    flush=True,
-                                )
-                        if latency_max_preds > 0 and preds >= latency_max_preds:
-                            raise KeyboardInterrupt
-                    # === LATENCY MEASURE END ===
+    #                 # === LATENCY MEASURE START ===
+    #                 if latency_enabled:
+    #                     t1 = time.time()
+    #                     proc_ms.append((t1 - t0) * 1000.0)
+    #                     latest_ts = time_buffer[-1] if time_buffer else None
+    #                     if latest_ts is not None:
+    #                         latency_ms.append((t1 - latest_ts) * 1000.0)
+    #                     preds += 1
+    #                     if latency_print_every > 0 and preds % latency_print_every == 0:
+    #                         if latency_ms:
+    #                             print(
+    #                                 f"latency_ms={latency_ms[-1]:.1f} "
+    #                                 f"proc_ms={proc_ms[-1]:.1f}",
+    #                                 end="\r",
+    #                                 flush=True,
+    #                             )
+    #                     if latency_max_preds > 0 and preds >= latency_max_preds:
+    #                         raise KeyboardInterrupt
+    #                 # === LATENCY MEASURE END ===
 
                     if label != last_output:
                         msg = f"Gesture: {label} (conf {confidence:.2f})"
@@ -329,29 +329,29 @@ def main(argv=None):
     finally:
         base.Stop_Callback()
         # === LATENCY MEASURE START ===
-        if latency_enabled and latency_ms:
-            lat = np.asarray(latency_ms, dtype=float)
-            proc = np.asarray(proc_ms, dtype=float) if proc_ms else None
-            print("\nLatency summary (ms):")
-            print(
-                f"count={lat.size} "
-                f"avg={lat.mean():.1f} "
-                f"median={np.median(lat):.1f} "
-                f"p90={np.percentile(lat, 90):.1f} "
-                f"p95={np.percentile(lat, 95):.1f} "
-                f"min={lat.min():.1f} "
-                f"max={lat.max():.1f}"
-            )
-            if proc is not None and proc.size:
-                print(
-                    "Processing-only summary (ms): "
-                    f"avg={proc.mean():.1f} "
-                    f"median={np.median(proc):.1f} "
-                    f"p90={np.percentile(proc, 90):.1f} "
-                    f"p95={np.percentile(proc, 95):.1f} "
-                    f"min={proc.min():.1f} "
-                    f"max={proc.max():.1f}"
-                )
+        # if latency_enabled and latency_ms:
+        #     lat = np.asarray(latency_ms, dtype=float)
+        #     proc = np.asarray(proc_ms, dtype=float) if proc_ms else None
+        #     print("\nLatency summary (ms):")
+        #     print(
+        #         f"count={lat.size} "
+        #         f"avg={lat.mean():.1f} "
+        #         f"median={np.median(lat):.1f} "
+        #         f"p90={np.percentile(lat, 90):.1f} "
+        #         f"p95={np.percentile(lat, 95):.1f} "
+        #         f"min={lat.min():.1f} "
+        #         f"max={lat.max():.1f}"
+        #     )
+        #     if proc is not None and proc.size:
+        #         print(
+        #             "Processing-only summary (ms): "
+        #             f"avg={proc.mean():.1f} "
+        #             f"median={np.median(proc):.1f} "
+        #             f"p90={np.percentile(proc, 90):.1f} "
+        #             f"p95={np.percentile(proc, 95):.1f} "
+        #             f"min={proc.min():.1f} "
+        #             f"max={proc.max():.1f}"
+        #         )
         # === LATENCY MEASURE END ===
 
 
