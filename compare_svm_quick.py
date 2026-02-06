@@ -11,7 +11,7 @@ from train_classifier import build_model, load_dataset
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Quickly compare a few SVM configs (no CV/grid search)."
+        description="Train a single SVM config (no CV/grid search)."
     )
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument("--pattern", default="*_features.npz")
@@ -24,18 +24,6 @@ def build_parser():
         help="How to handle channel count mismatches across feature files.",
     )
     parser.add_argument("--min-label-confidence", type=float, default=0.0)
-    parser.add_argument(
-        "--svm-c",
-        nargs="+",
-        type=float,
-        default=[1.0, 100.0],
-        help="C values to compare.",
-    )
-    parser.add_argument(
-        "--svm-gamma",
-        default="scale",
-        help="Gamma value for all comparisons (number or 'scale'/'auto').",
-    )
     parser.add_argument(
         "--class-weight",
         choices=["balanced", "none"],
@@ -96,31 +84,24 @@ def main():
     y_train = y[train_idx]
     y_test = y[test_idx]
 
-    results = []
-    for c_val in args.svm_c:
-        model = build_model(
-            "svm",
-            args,
-            svm_c=float(c_val),
-            svm_gamma=args.svm_gamma,
-        )
-        model.fit(X_train, y_train)
-        test_acc = float(model.score(X_test, y_test))
-        train_acc = float(model.score(X_train, y_train))
-        results.append((float(c_val), test_acc, train_acc))
-        print(f"C={float(c_val)} gamma={args.svm_gamma} test={test_acc:.3f} train={train_acc:.3f}")
-
-    results_sorted = sorted(
-        results, key=lambda r: (r[1], -r[2], -r[0]), reverse=True
+    svm_c = 1.0
+    svm_gamma = "scale"
+    model = build_model(
+        "svm",
+        args,
+        svm_c=svm_c,
+        svm_gamma=svm_gamma,
     )
-    best_c, best_test, best_train = results_sorted[0]
-    print(f"Best config: C={best_c} gamma={args.svm_gamma} (test={best_test:.3f})")
+    model.fit(X_train, y_train)
+    test_acc = float(model.score(X_test, y_test))
+    train_acc = float(model.score(X_train, y_train))
+    print(f"C={svm_c} gamma={svm_gamma} test={test_acc:.3f} train={train_acc:.3f}")
 
     final_model = build_model(
         "svm",
         args,
-        svm_c=best_c,
-        svm_gamma=args.svm_gamma,
+        svm_c=svm_c,
+        svm_gamma=svm_gamma,
     )
     final_model.fit(X_flat, y)
     meta.update(
@@ -128,14 +109,14 @@ def main():
             "created_at": dt.datetime.now().isoformat(),
             "model_type": "svm",
             "model_params": {
-                "svm_c": float(best_c),
-                "svm_gamma": args.svm_gamma,
+                "svm_c": float(svm_c),
+                "svm_gamma": svm_gamma,
                 "class_weight": args.class_weight,
                 "svm_probability": bool(args.svm_probability),
             },
             "metrics": {
-                "test_accuracy": float(best_test),
-                "train_accuracy": float(best_train),
+                "test_accuracy": float(test_acc),
+                "train_accuracy": float(train_acc),
                 "n_samples": int(X_flat.shape[0]),
                 "n_classes": int(len(np.unique(y))),
             },
@@ -145,14 +126,6 @@ def main():
                 "cv_splits": 0,
             },
             "fit_all_data": True,
-            "quick_compare": {
-                "c_values": [float(v) for v in args.svm_c],
-                "gamma": args.svm_gamma,
-                "results": [
-                    {"c": float(c), "test_accuracy": float(t), "train_accuracy": float(tr)}
-                    for c, t, tr in results
-                ],
-            },
         }
     )
     args.model_out.parent.mkdir(parents=True, exist_ok=True)

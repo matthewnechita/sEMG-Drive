@@ -38,7 +38,7 @@ KERNEL_SIZE = 11
 
 USE_CLASS_WEIGHTS = True
 
-CV_ENABLED = False
+CV_ENABLED = True
 CV_FOLDS = 6
 CV_EPOCHS = 90
 # ========================================
