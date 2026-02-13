@@ -11,6 +11,7 @@ from filtering import define_filters, apply_filters
 from gesture_model_cnn import load_cnn_bundle
 
 import threading
+import os
 
 
 # ======== Config (edit as needed) ========
@@ -127,7 +128,12 @@ def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Real-time CNN gesture inference.")
-    parser.add_argument("--model", default="models/gesture_cnn.pt")
+    
+    DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gesture_cnn.pt")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    print("[gesture] using model:", args.model)
+    print("[gesture] cwd:", os.getcwd())
+
     args = parser.parse_args(argv)
 
     bundle = load_cnn_bundle(args.model)
