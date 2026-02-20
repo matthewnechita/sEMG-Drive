@@ -17,7 +17,7 @@ from gesture_model_cnn import GestureCNN
 # ======== Config (edit as needed) ========
 DATA_ROOT = Path("data")
 PATTERN = "*_filtered.npz"
-MODEL_OUT = Path("models") / "gesture_cnn.pt"
+MODEL_OUT = Path("models") / "gesture_cnn.pt"   # only used when PER_SUBJECT_MODELS = False
 
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
@@ -37,6 +37,11 @@ DROPOUT = 0.4
 KERNEL_SIZE = 11
 
 USE_CLASS_WEIGHTS = True
+
+# Train one model per subject, saved as models/{subject}_gesture_cnn.pt.
+# Set False to train a single cross-subject model (harder to generalize;
+# use only when you have many subjects and want a single deployable model).
+PER_SUBJECT_MODELS = True
 
 CV_ENABLED = False
 CV_FOLDS = 6
@@ -86,6 +91,15 @@ def compute_calibration(neutral_emg, mvc_emg, percentile):
     mvc_scale = np.percentile(mvc, percentile, axis=0)
     mvc_scale = np.where(mvc_scale < 1e-6, 1.0, mvc_scale)
     return neutral_mean, mvc_scale
+
+
+def subject_from_path(path: Path) -> str:
+    """Extract subject ID from a filtered file path.
+
+    Expected layout: data/{subject}/filtered/{name}_filtered.npz
+    The subject directory is two levels above the file.
+    """
+    return path.parent.parent.name
 
 
 def load_windows_from_file(path):
@@ -142,6 +156,7 @@ def load_dataset():
     X_list = []
     y_list = []
     groups_list = []
+    subjects_list = []
     channel_counts = []
     for fp in files:
         result = load_windows_from_file(fp)
@@ -151,6 +166,7 @@ def load_dataset():
         X_list.append(windows)
         y_list.append(labels)
         groups_list.append(np.array([str(fp)] * len(labels), dtype=object))
+        subjects_list.append(np.array([subject_from_path(fp)] * len(labels), dtype=object))
         channel_counts.append(int(windows.shape[1]))
 
     if not X_list:
@@ -163,7 +179,8 @@ def load_dataset():
     X = np.vstack(X_list)
     y = np.concatenate(y_list)
     groups = np.concatenate(groups_list)
-    return X, y, groups, channel_counts[0]
+    subjects = np.concatenate(subjects_list)
+    return X, y, groups, subjects, channel_counts[0]
 
 
 def standardize_per_channel(X, mean, std):
@@ -286,54 +303,17 @@ def train_eval_split(
     return model, mean, std, best_acc
 
 
-def main():
-    np.random.seed(RANDOM_STATE)
-    torch.manual_seed(RANDOM_STATE)
-
-    X, y, groups, channel_count = load_dataset()
-    print(
-        f"Loaded {X.shape[0]} windows, {channel_count} channels, "
-        f"{len(np.unique(y))} classes."
-    )
-
-    labels = sorted({str(lbl) for lbl in np.unique(y)})
-    label_to_index = {label: idx for idx, label in enumerate(labels)}
-    index_to_label = {idx: label for label, idx in label_to_index.items()}
-    y_idx = np.array([label_to_index[str(lbl)] for lbl in y], dtype=np.int64)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    channels = [int(channel_count), 32, 64, 128]
-    num_classes = len(labels)
-
-    cv_scores = None
+def _train_and_save(
+    X, y_idx, groups, subjects,
+    channels, num_classes, device,
+    labels, label_to_index, index_to_label, channel_count,
+    model_out, subject_tag,
+):
+    """Split, train, evaluate, and save a model bundle for the given data slice."""
     unique_groups = np.unique(groups)
-    if CV_ENABLED and unique_groups.size >= 2:
-        from sklearn.model_selection import GroupKFold
+    print(f"{X.shape[0]} windows across {len(unique_groups)} session file(s).")
 
-        splits = min(CV_FOLDS, int(unique_groups.size))
-        if splits >= 2:
-            cv = GroupKFold(n_splits=splits)
-            cv_scores = []
-            for fold, (train_idx, val_idx) in enumerate(
-                cv.split(X, y_idx, groups), start=1
-            ):
-                print(f"\nCV fold {fold}/{splits}")
-                _, _, _, fold_acc = train_eval_split(
-                    X[train_idx],
-                    y_idx[train_idx],
-                    X[val_idx],
-                    y_idx[val_idx],
-                    channels,
-                    num_classes,
-                    CV_EPOCHS,
-                    device,
-                )
-                cv_scores.append(fold_acc)
-            cv_scores = np.asarray(cv_scores, dtype=float)
-            print(
-                f"\nCV accuracy: {cv_scores.mean():.3f} +/- {cv_scores.std():.3f}"
-            )
-
+    # Fix 5: log which files are in train vs test so results are reproducible
     if unique_groups.size >= 2:
         splitter = GroupShuffleSplit(
             n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE
@@ -350,9 +330,13 @@ def main():
         )
         split_mode = "stratified-random"
 
-    print("\nFinal train/test split")
+    train_files = sorted({str(g) for g in groups[train_idx]})
+    test_files = sorted({str(g) for g in groups[test_idx]})
+    print(f"Train ({len(train_files)} files): {[Path(f).name for f in train_files]}")
+    print(f"Test  ({len(test_files)} files):  {[Path(f).name for f in test_files]}")
+
     print(
-        f"Training CNN for {EPOCHS} epochs (batch {BATCH_SIZE}) "
+        f"\nTraining CNN for {EPOCHS} epochs (batch {BATCH_SIZE}) "
         f"on {len(train_idx)} windows; testing on {len(test_idx)} windows."
     )
     model, mean, std, _ = train_eval_split(
@@ -366,10 +350,9 @@ def main():
         device,
     )
 
+    # Final test evaluation
     model.eval()
-    X_test = standardize_per_channel(
-        X[test_idx], mean, std
-    ).astype(np.float32)
+    X_test = standardize_per_channel(X[test_idx], mean, std).astype(np.float32)
     test_ds = TensorDataset(
         torch.from_numpy(X_test), torch.from_numpy(y_idx[test_idx])
     )
@@ -379,22 +362,32 @@ def main():
     all_preds = []
     with torch.no_grad():
         for xb, _ in test_loader:
-            xb = xb.to(device)
-            logits = model(xb)
-            preds = torch.argmax(logits, dim=1).cpu().numpy()
-            all_preds.append(preds)
+            logits = model(xb.to(device))
+            all_preds.append(torch.argmax(logits, dim=1).cpu().numpy())
     y_pred = np.concatenate(all_preds)
     y_test = y_idx[test_idx]
+
     test_accuracy = float(accuracy_score(y_test, y_pred))
     report = classification_report(
         y_test, y_pred, target_names=[index_to_label[i] for i in range(len(labels))]
     )
-    print(f"Final test accuracy: {test_accuracy:.3f}")
+    print(f"\nFinal test accuracy: {test_accuracy:.3f}")
     print("\nReport:\n", report)
+
+    # Fix 3: per-subject accuracy breakdown (meaningful in global mode with multiple subjects)
+    test_subjects = subjects[test_idx]
+    unique_test_subjects = np.unique(test_subjects)
+    if len(unique_test_subjects) > 1:
+        print("Per-subject test accuracy:")
+        for subj in sorted(unique_test_subjects):
+            mask = test_subjects == subj
+            subj_acc = accuracy_score(y_test[mask], y_pred[mask])
+            print(f"  {subj}: {subj_acc:.3f}  ({mask.sum()} windows)")
 
     meta = {
         "created_at": dt.datetime.now().isoformat(),
         "model_type": "cnn",
+        "subject": subject_tag,
         "window_size_samples": WINDOW_SIZE,
         "window_step_samples": WINDOW_STEP,
         "channel_count": int(channel_count),
@@ -415,9 +408,9 @@ def main():
         },
         "metrics": {
             "test_accuracy": test_accuracy,
-            "cv_accuracy_mean": float(cv_scores.mean()) if cv_scores is not None else None,
-            "cv_accuracy_std": float(cv_scores.std()) if cv_scores is not None else None,
         },
+        "train_files": [Path(f).name for f in train_files],
+        "test_files": [Path(f).name for f in test_files],
     }
 
     bundle = {
@@ -434,11 +427,93 @@ def main():
         },
     }
 
-    MODEL_OUT.parent.mkdir(parents=True, exist_ok=True)
-    if MODEL_OUT.exists():
-        print(f"Warning: overwriting existing model at {MODEL_OUT}")
-    torch.save(bundle, MODEL_OUT)
-    print(f"Saved model bundle to {MODEL_OUT}")
+    model_out.parent.mkdir(parents=True, exist_ok=True)
+    if model_out.exists():
+        print(f"Warning: overwriting existing model at {model_out}")
+    torch.save(bundle, model_out)
+    print(f"Saved model bundle to {model_out}")
+
+
+def main():
+    np.random.seed(RANDOM_STATE)
+    torch.manual_seed(RANDOM_STATE)
+
+    X, y, groups, subjects, channel_count = load_dataset()
+    unique_subjects = sorted(np.unique(subjects))
+    print(
+        f"Loaded {X.shape[0]} windows, {channel_count} channels, "
+        f"{len(np.unique(y))} classes, {len(unique_subjects)} subject(s): "
+        f"{unique_subjects}"
+    )
+
+    # All per-subject models share the same global label contract so the
+    # realtime script can load any bundle and get consistent class indices.
+    labels = sorted({str(lbl) for lbl in np.unique(y)})
+    label_to_index = {label: idx for idx, label in enumerate(labels)}
+    index_to_label = {idx: label for label, idx in label_to_index.items()}
+    y_idx = np.array([label_to_index[str(lbl)] for lbl in y], dtype=np.int64)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    channels = [int(channel_count), 32, 64, 128]
+    num_classes = len(labels)
+
+    # Fix 4: per-subject models — one bundle per subject
+    if PER_SUBJECT_MODELS:
+        for subject in unique_subjects:
+            print(f"\n{'=' * 55}")
+            print(f"Training per-subject model: {subject}")
+            mask = subjects == subject
+            _train_and_save(
+                X[mask], y_idx[mask], groups[mask], subjects[mask],
+                channels, num_classes, device,
+                labels, label_to_index, index_to_label, channel_count,
+                model_out=Path("models") / f"{subject}_gesture_cnn.pt",
+                subject_tag=subject,
+            )
+        print(f"\n{'=' * 55}")
+        print("Per-subject training complete. To run realtime inference:")
+        for subject in unique_subjects:
+            print(f"  python realtime_gesture_cnn.py --model models/{subject}_gesture_cnn.pt")
+
+    else:
+        # Cross-subject global model (use when PER_SUBJECT_MODELS = False)
+        cv_scores = None
+        unique_file_groups = np.unique(groups)
+        if CV_ENABLED and unique_file_groups.size >= 2:
+            from sklearn.model_selection import GroupKFold
+
+            splits = min(CV_FOLDS, int(unique_file_groups.size))
+            if splits >= 2:
+                cv = GroupKFold(n_splits=splits)
+                cv_scores = []
+                for fold, (train_idx, val_idx) in enumerate(
+                    cv.split(X, y_idx, groups), start=1
+                ):
+                    print(f"\nCV fold {fold}/{splits}")
+                    _, _, _, fold_acc = train_eval_split(
+                        X[train_idx],
+                        y_idx[train_idx],
+                        X[val_idx],
+                        y_idx[val_idx],
+                        channels,
+                        num_classes,
+                        CV_EPOCHS,
+                        device,
+                    )
+                    cv_scores.append(fold_acc)
+                cv_scores = np.asarray(cv_scores, dtype=float)
+                print(
+                    f"\nCV accuracy: {cv_scores.mean():.3f} +/- {cv_scores.std():.3f}"
+                )
+
+        print("\nFinal global train/test split")
+        _train_and_save(
+            X, y_idx, groups, subjects,
+            channels, num_classes, device,
+            labels, label_to_index, index_to_label, channel_count,
+            model_out=MODEL_OUT,
+            subject_tag=None,
+        )
 
 
 if __name__ == "__main__":

@@ -19,8 +19,8 @@ WINDOW_SIZE = 200
 WINDOW_STEP = 100
 FILTER_WARMUP = 200  # extra samples for filter warmup
 
-SMOOTHING = 5  # number of windows to average
-MIN_CONFIDENCE = 0.4
+SMOOTHING = 11  # number of windows to average (~550ms at 2kHz/step-100)
+MIN_CONFIDENCE = 0.65  # for 6 classes, 40% was too low to gate uncertainty
 LOW_CONFIDENCE_LABEL = "neutral"
 
 LATEST_LOCK = threading.Lock()
