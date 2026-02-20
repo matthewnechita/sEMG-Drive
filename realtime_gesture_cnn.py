@@ -2,6 +2,9 @@ import argparse
 import time
 from collections import deque
 
+import os
+import threading
+
 import numpy as np
 
 from AeroPy.TrignoBase import TrignoBase
@@ -9,9 +12,6 @@ from AeroPy.DataManager import DataKernel
 
 from filtering import define_filters, apply_filters
 from gesture_model_cnn import load_cnn_bundle
-
-import threading
-import os
 
 
 # ======== Config (edit as needed) ========
@@ -62,6 +62,22 @@ def _estimate_fs(times):
     return 1.0 / float(np.median(diffs))
 
 
+def _parse_yt_frame(out):
+    """Unpack a GetYTData() frame into parallel lists of per-channel times and values."""
+    channel_times = []
+    channel_values = []
+    for channel in out:
+        if not channel:
+            continue
+        chan_array = np.asarray(channel[0], dtype=object)
+        if chan_array.size == 0:
+            continue
+        t_vals, v_vals = zip(*(_pair_time_value(s) for s in chan_array))
+        channel_times.append(list(t_vals))
+        channel_values.append(list(v_vals))
+    return channel_times, channel_values
+
+
 def control_hook(gesture: str) -> None:
     set_latest_gesture(gesture)
     return
@@ -90,17 +106,7 @@ def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_
             time.sleep(poll_sleep)
             continue
 
-        channel_times = []
-        channel_values = []
-        for channel in out:
-            if not channel:
-                continue
-            chan_array = np.asarray(channel[0], dtype=object)
-            if chan_array.size == 0:
-                continue
-            t_vals, v_vals = zip(*(_pair_time_value(s) for s in chan_array))
-            channel_times.append(list(t_vals))
-            channel_values.append(list(v_vals))
+        channel_times, channel_values = _parse_yt_frame(out)
 
         if len(channel_values) < stream_channels:
             continue
@@ -131,10 +137,10 @@ def main(argv=None):
     
     DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gesture_cnn.pt")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    print("[gesture] using model:", args.model)
-    print("[gesture] cwd:", os.getcwd())
 
     args = parser.parse_args(argv)
+    print("[gesture] using model:", args.model)
+    print("[gesture] cwd:", os.getcwd())
 
     bundle = load_cnn_bundle(args.model)
     model_channels = bundle.channel_count
@@ -226,17 +232,7 @@ def main(argv=None):
                 time.sleep(poll_sleep)
                 continue
 
-            channel_times = []
-            channel_values = []
-            for channel in out:
-                if not channel:
-                    continue
-                chan_array = np.asarray(channel[0], dtype=object)
-                if chan_array.size == 0:
-                    continue
-                times, values = zip(*(_pair_time_value(s) for s in chan_array))
-                channel_times.append(list(times))
-                channel_values.append(list(values))
+            channel_times, channel_values = _parse_yt_frame(out)
 
             if len(channel_values) < stream_channels:
                 continue
