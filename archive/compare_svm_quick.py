@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
-from train_classifier import build_model, load_dataset
+from archive.train_classifier import build_model, load_dataset
 
 
 def build_parser():

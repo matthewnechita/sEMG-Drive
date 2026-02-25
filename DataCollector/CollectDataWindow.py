@@ -34,8 +34,10 @@ class TrialConfig:
     label_trim_s: float = 0.0
     rest_label_trim_s: Optional[float] = None
     calibrate: bool = False
-    calibration_neutral_s: float = 3.0
-    calibration_mvc_s: float = 3.0
+    calibration_neutral_s: float = 5.0
+    calibration_mvc_s: float = 5.0
+    calibration_mvc_prep_s: float = 2.0  # countdown before MVC window starts
+    calibration_min_ratio: float = 2.0   # warn if median MVC/neutral ratio below this
 
 
 def resolve_rest_label_trim(
@@ -653,8 +655,10 @@ class CollectDataWindow(QWidget):
             label_trim_s=0.5,
             rest_label_trim_s=None,
             calibrate=True,
-            calibration_neutral_s=3.0,
-            calibration_mvc_s=3.0,
+            calibration_neutral_s=5.0,
+            calibration_mvc_s=5.0,
+            calibration_mvc_prep_s=2.0,
+            calibration_min_ratio=2.0,
         )
 
         base_dir = Path.cwd() / "data" / config.subject
@@ -736,9 +740,19 @@ class CollectDataWindow(QWidget):
                     events.append({"event": "session_abort", "t_wall": time.time()})
                     return
 
+                # Brief prep countdown so the subject has time to brace
+                if config.calibration_mvc_prep_s > 0 and not self.protocol_abort:
+                    self.update_instruction(
+                        "Prepare: SQUEEZE AS HARD AS POSSIBLE in...",
+                        "max contraction",
+                        config.repetitions * len(config.gestures),
+                        config.calibration_mvc_prep_s,
+                    )
+                    self.run_prep_buffer(config.calibration_mvc_prep_s)
+
                 events.append({"event": "calibration_mvc_start", "t_wall": time.time()})
                 self.update_instruction(
-                    f"Calibration: max contraction",
+                    "SQUEEZE AS HARD AS POSSIBLE — all arm/wrist muscles!",
                     config.gestures[0] if config.gestures else None,
                     config.repetitions * len(config.gestures),
                     config.calibration_mvc_s,
@@ -754,6 +768,52 @@ class CollectDataWindow(QWidget):
                 )
                 calib_mvc_ts = seg_ts
                 calib_mvc_x = seg_x
+
+                # Quality gate: warn if MVC/neutral ratio is too low
+                if calib_neutral_x and calib_mvc_x:
+                    neutral_arr = np.asarray(calib_neutral_x, dtype=float)
+                    mvc_arr = np.asarray(calib_mvc_x, dtype=float)
+                    neutral_rms = np.sqrt(np.mean(neutral_arr ** 2, axis=0))
+                    mvc_rms = np.sqrt(np.mean(mvc_arr ** 2, axis=0))
+                    ratio = np.where(neutral_rms < 1e-9, 1.0, mvc_rms / neutral_rms)
+                    median_ratio = float(np.median(ratio))
+                    n_weak = int(np.sum(ratio < config.calibration_min_ratio))
+                    quality_msg = (
+                        f"MVC quality: {median_ratio:.1f}x median "
+                        f"({n_weak}/{len(ratio)} channels below {config.calibration_min_ratio:.0f}x)"
+                    )
+                    events.append({
+                        "event": "calibration_quality",
+                        "t_wall": time.time(),
+                        "median_ratio": median_ratio,
+                        "n_weak_channels": n_weak,
+                    })
+                    if median_ratio < config.calibration_min_ratio:
+                        self.update_instruction(
+                            f"WARNING: Weak calibration ({median_ratio:.1f}x). Squeeze much harder next session.",
+                            config.gestures[0] if config.gestures else None,
+                            config.repetitions * len(config.gestures),
+                            0,
+                        )
+                        QMessageBox.warning(
+                            self,
+                            "Weak MVC Calibration",
+                            f"{quality_msg}\n\n"
+                            "Your max contraction was too close to neutral rest.\n"
+                            "This will degrade model accuracy.\n\n"
+                            "For the next session:\n"
+                            "  • Squeeze ALL arm and wrist muscles simultaneously\n"
+                            "  • Grip tight as if squeezing something with full force\n"
+                            "  • Sustain the effort for the full duration\n\n"
+                            "Data will still be saved, but calibration may be unreliable.",
+                        )
+                    else:
+                        self.update_instruction(
+                            f"Calibration OK ({median_ratio:.1f}x). Starting protocol...",
+                            config.gestures[0] if config.gestures else None,
+                            config.repetitions * len(config.gestures),
+                            0,
+                        )
                 if self.protocol_abort:
                     events.append({"event": "session_abort", "t_wall": time.time()})
                     return

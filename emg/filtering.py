@@ -1,6 +1,6 @@
 import numpy as np
 from pathlib import Path
-from libemg import filtering
+from scipy.signal import butter, sosfilt, sosfiltfilt
 
 
 # LOAD IN THE RAW EMG DATA
@@ -46,33 +46,71 @@ def load_emg_data(file_path):
     return emg, fs, extras
 
 
-# DEFINE THE FILTERS USING libEMG
+# DEFINE THE FILTERS
 def define_filters(fs):
     """
-    Create the filter object and install:
-    - Notch filter @ 60 Hz
-    - Bandpass filter @ 20-450 Hz
+    Returns a tuple of SOS filter arrays (sos_n60, sos_n120, sos_bp):
+    - Notch @ 60 Hz  (±1.5 Hz, power line fundamental)
+    - Notch @ 120 Hz (±1.5 Hz, 2nd power line harmonic)
+    - Bandpass 25–450 Hz, order 6
+
+    IMPORTANT: after changing any parameter here you must:
+      1. Delete all data/**/*_filtered.npz files
+      2. python emg/filtering.py          (re-filter raw data + calibration)
+      3. python tools/recalibrate.py --apply
+      4. Retrain both models
     """
-
-    fi = filtering.Filter(fs)
-
-    notch = {"name": "notch", "cutoff": 60, "bandwidth": 3}
-    bandpass = {"name": "bandpass", "cutoff": [20, 450], "order": 4}
-
-    fi.install_filters(notch)
-    fi.install_filters(bandpass)
-
-    return fi
+    sos_n60  = butter(2, [58.5,  61.5],  btype='bandstop', fs=fs, output='sos')
+    sos_n120 = butter(2, [118.5, 121.5], btype='bandstop', fs=fs, output='sos')
+    sos_bp   = butter(6, [25.0,  450.0], btype='bandpass', fs=fs, output='sos')
+    return (sos_n60, sos_n120, sos_bp)
 
 
-# APPLY THE FILTERS TO THE EMG DATA
-def apply_filters(fi, emg):
+# APPLY THE FILTERS TO THE EMG DATA (offline / bulk use)
+def apply_filters(filters, emg):
     """
-    This method applies the defined filters onto the raw EMG data
+    Zero-phase offline filtering for full session recordings. emg: (N, C).
+    Uses sosfiltfilt so boundary effects are negligible on long recordings.
+    Do NOT use this in the realtime loop — use apply_filters_stateful instead.
     """
-    filtered_data = fi.filter(emg)
-    rectified = np.abs(filtered_data)  # rectification
-    return np.array(rectified)
+    sos_n60, sos_n120, sos_bp = filters
+    out = sosfiltfilt(sos_n60,  emg, axis=0)
+    out = sosfiltfilt(sos_n120, out, axis=0)
+    out = sosfiltfilt(sos_bp,   out, axis=0)
+    # rectified = np.abs(out)  # rectification
+    return np.array(out, dtype=float)
+
+
+def make_filter_state(filters, num_channels):
+    """
+    Create zero initial conditions for stateful realtime filtering.
+    Call once after define_filters(), before the inference loop starts.
+    """
+    sos_n60, sos_n120, sos_bp = filters
+    return [
+        np.zeros((sos_n60.shape[0],  2, num_channels)),
+        np.zeros((sos_n120.shape[0], 2, num_channels)),
+        np.zeros((sos_bp.shape[0],   2, num_channels)),
+    ]
+
+
+def apply_filters_stateful(filters, samples, state):
+    """
+    Causal stateful filtering for the realtime inference loop.
+    samples: (N, C) array of new raw samples.
+    state:   list of zi arrays from make_filter_state() or a previous call.
+    Returns: (filtered_samples, new_state)
+      filtered_samples: (N, C) — feed directly into the prediction buffer.
+      new_state: updated zi arrays to pass into the next call.
+    Eliminates the train/test filter mismatch caused by applying filtfilt
+    to short rolling buffers in realtime vs. full sessions offline.
+    """
+    sos_n60, sos_n120, sos_bp = filters
+    zi_n60, zi_n120, zi_bp = state
+    out, zi_n60  = sosfilt(sos_n60,  samples, axis=0, zi=zi_n60)
+    out, zi_n120 = sosfilt(sos_n120, out,     axis=0, zi=zi_n120)
+    out, zi_bp   = sosfilt(sos_bp,   out,     axis=0, zi=zi_bp)
+    return np.array(out, dtype=float), [zi_n60, zi_n120, zi_bp]
 
 
 # SAVE THE FILTERED DATA INTO A .npz FILE
