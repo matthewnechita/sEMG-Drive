@@ -19,25 +19,38 @@ CNN contract
 - Input: filtered EMG windows (channels x time), no handcrafted features
 - Standardization: per-channel z-score (train-only stats saved in bundle)
 - Softmax used at inference; temporal smoothing only online
-- Bundle: model_state + mean/std + label map + metadata (models/gesture_cnn.pt)
+- Bundle: model_state + mean/std + label map + metadata
+- Per-subject bundle path: models/{subject}_gesture_cnn.pt
+- Global bundle path (PER_SUBJECT_MODELS=False): models/gesture_cnn.pt
+- All bundles share the same label contract (global label set across all data)
+
+Per-subject model workflow (default, PER_SUBJECT_MODELS = True in train_cnn.py)
+- EMG is highly person-specific; per-subject models consistently outperform cross-subject models.
+- train_cnn.py trains one model per subject found under data/ and saves each to models/{subject}_gesture_cnn.pt.
+- Training prints which session files went into train vs. test so results are reproducible.
+- Each run also prints per-subject accuracy breakdown when multiple subjects exist in the test split.
+- To switch back to a single cross-subject model, set PER_SUBJECT_MODELS = False in train_cnn.py.
 
 Common commands
-- Collect data:
-  python data_collection.py --subject S01 --session 01 --output-dir data/iggy
+- Collect data (GUI):
+  python DelsysPythonGUI.py  (enter subject ID + session # in the UI before running protocol)
 - Filter new raw files:
   python filtering.py
 - Extract features:
   python feature_extraction.py
 - Train/export model:
   python train_classifier.py --data-root data --model-out models/gesture_classifier.pkl
-- Train/export CNN:
+- Train/export per-subject CNN models (default):
   python train_cnn.py
+  → saves models/{subject}_gesture_cnn.pt for every subject found under data/
+- Train/export single global CNN model:
+  Set PER_SUBJECT_MODELS = False in train_cnn.py, then: python train_cnn.py
 - Quick compare (no CV/grid search; picks best C and saves model):
   python compare_svm_quick.py --svm-c 1 100 --svm-gamma scale --model-out models/gesture_classifier_new.pkl
 - Run live inference:
   python realtime_gesture.py --model models/gesture_classifier.pkl --show-confidence
-- Run live CNN inference:
-  python realtime_gesture_cnn.py --model models/gesture_cnn.pt
+- Run live CNN inference (per-subject — replace subject01 with actual subject ID):
+  python realtime_gesture_cnn.py --model models/subject01_gesture_cnn.pt
 
 Notes
 - data_collection.py now saves into a raw/ subfolder with _raw.npz suffix.
@@ -49,9 +62,10 @@ Notes
 - realtime_gesture_cnn.py loads CNN bundles with torch.load(weights_only=False) for PyTorch 2.6+ compatibility.
 - Data collection GUI plot throttling: plot updates ~30 Hz, plot queue maxlen 64, plot window 5,000 samples to reduce lag.
 - EMG drift over time can cause gesture flicker; collect longer sessions and keep placement consistent.
-- For realtime stability, use `--smoothing` and `--min-confidence` (e.g. `--smoothing 9 --min-confidence 0.7 --low-confidence-label neutral --show-confidence`).
+- Realtime defaults: SMOOTHING=11 (~550ms), MIN_CONFIDENCE=0.65 — tuned for 6-class stability.
 - Consider per-channel normalization (rolling mean/std) in both training and realtime if drift persists.
 - If realtime starts from a non-neutral pose and biases to one label, treat it as baseline/pose shift; mitigate via per-session calibration (neutral + MVC) with the same normalization in training + realtime, add an "other/rest" class, and/or rely on confidence gating to force neutral when uncertain.
+- Adding a new participant's data to a cross-subject model rarely improves test accuracy because: (a) the test metric is dominated by existing subjects, (b) inter-subject EMG patterns don't transfer without a larger model. Use PER_SUBJECT_MODELS = True instead.
 - Future control integration: `realtime_gesture.py` has a `control_hook` stub; plan to extend it to accept a continuous strength value (e.g., `control_hook(gesture, strength)`) for variable steering intensity once the control module is added.
 - Future change: shrink SVM grid search, report best C/gamma after tuning, and consider a dedicated optimization module.
 - One-off data cleanup scripts are deprecated: relabel_neutral_buffers_DEPRECATED..py, drop_first_gesture_run_DEPRECATED.py (kept for history only).

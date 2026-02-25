@@ -8,8 +8,8 @@ from AeroPy.TrignoBase import TrignoBase
 from AeroPy.DataManager import DataKernel
 from libemg.feature_extractor import FeatureExtractor
 
-from filtering import define_filters, apply_filters
-from gesture_model import load_model_bundle, flatten_feature_dict
+from emg.filtering import define_filters, apply_filters
+from archive.gesture_model import load_model_bundle, flatten_feature_dict
 
 try:
     import rospy
