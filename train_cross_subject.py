@@ -31,9 +31,10 @@ from emg.gesture_model_cnn import GestureCNNv2
 
 
 # ======== Config ========
-DATA_ROOT  = Path("data")
+ARM        = "right"           # ← set to "right" or "left" before running
+DATA_ROOT  = Path("data") / f"{ARM} arm"
+MODEL_OUT  = Path("models/cross_subject") / ARM / "gesture_cnn_v2.pt"
 PATTERN    = "*_filtered.npz"
-MODEL_OUT  = Path("models/cross_subject/gesture_cnn_v2.pt")
 
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
@@ -603,6 +604,13 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    if ARM not in ("right", "left"):
+        raise ValueError(f"ARM must be 'right' or 'left', got {ARM!r}")
+    confirm = input(f"Training {ARM} arm cross-subject model — continue? [y/N] ").strip().lower()
+    if confirm != "y":
+        print("Aborted.")
+        return
+
     np.random.seed(RANDOM_STATE)
     torch.manual_seed(RANDOM_STATE)
 

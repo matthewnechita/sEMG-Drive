@@ -35,7 +35,29 @@ CALIB_MVC_S = 5.0
 CALIB_MVC_PREP_S = 2.0    # countdown pause before MVC window
 MVC_PERCENTILE = 95.0
 MVC_MIN_RATIO = 2.0        # minimum acceptable median MVC/neutral ratio
-# ========================================
+
+# ======== Dual-arm config ========
+# Right arm channels come first in the Delsys stream (pair right arm sensors first).
+# Left arm channels follow immediately after. LEFT_ARM_CHANNELS is inferred from
+# the left arm bundle's channel_count at load time.
+RIGHT_ARM_CHANNELS = 17   # fixed: 6 right arm sensors confirmed in trained bundles
+# Fusion thresholds:
+#   AGREE_THRESHOLD  — minimum confidence to emit a gesture when BOTH arms agree
+#                      (lower than single-arm threshold because agreement strengthens prediction)
+#   SINGLE_THRESHOLD — minimum confidence to emit when only one arm is available/confident
+DUAL_ARM_AGREE_THRESHOLD  = 0.55
+DUAL_ARM_SINGLE_THRESHOLD = 0.65   # matches MIN_CONFIDENCE above
+# =================================
+
+# ======== Inference mode ========
+# Set MODE to control which arm(s) run inference:
+#   "right" — right arm only  (pair right arm sensors first in Delsys)
+#   "left"  — left arm only   (pair left arm sensors first in Delsys)
+#   "dual"  — both arms fused (pair right first, then left in Delsys)
+MODE        = "dual"
+MODEL_RIGHT = "models/cross_subject/right/gesture_cnn_v2.pt"
+MODEL_LEFT  = "models/cross_subject/left/gesture_cnn_v2.pt"
+# ================================
 
 
 class _StreamingHandler:
@@ -99,6 +121,29 @@ def get_latest_gesture(default: str = LOW_CONFIDENCE_LABEL):
         age = (time.time() - ts) if ts else float('inf')
         return label, age
 
+def fuse_predictions(label_r, conf_r, label_l, conf_l):
+    """Combine right and left arm predictions into one fused label.
+
+    If both arms agree on the same gesture, the prediction is reinforced and
+    a lower confidence threshold is used to emit it. If they disagree, each
+    arm is evaluated independently against the single-arm threshold.
+
+    Returns: (fused_label, fused_confidence)
+    """
+    if label_r == label_l:
+        # Both arms agree — strengthen the prediction
+        combined_conf = max(conf_r, conf_l)
+        if combined_conf >= DUAL_ARM_AGREE_THRESHOLD:
+            return label_r, combined_conf
+    # Arms disagree (or agree but below threshold) — use whichever clears single threshold
+    # Right arm takes priority in a tie.
+    if conf_r >= DUAL_ARM_SINGLE_THRESHOLD:
+        return label_r, conf_r
+    if conf_l >= DUAL_ARM_SINGLE_THRESHOLD:
+        return label_l, conf_l
+    return LOW_CONFIDENCE_LABEL, 0.0
+
+
 def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_sleep):
     samples = []
     times = []
@@ -137,19 +182,49 @@ def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_
 
 
 def main(argv=None):
+    if MODE not in ("right", "left", "dual"):
+        raise ValueError(f"MODE must be 'right', 'left', or 'dual', got {MODE!r}")
+
+    # Derive defaults from config; CLI args can still override.
+    # In "left" mode, the left model runs as single-arm (left sensors paired first).
+    _config_right = MODEL_LEFT if MODE == "left" else MODEL_RIGHT
+    _config_left  = MODEL_LEFT if MODE == "dual"  else None
+
     parser = argparse.ArgumentParser(description="Real-time CNN gesture inference.")
-    
-    DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "cross_subject", "gesture_cnn_v2.pt")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model",       default=_config_right,
+                        help="Right arm model (overrides MODEL_RIGHT / MODEL_LEFT config).")
+    parser.add_argument("--model-right", default=None,
+                        help="Right arm model alias; overrides --model if both given.")
+    parser.add_argument("--model-left",  default=_config_left,
+                        help="Left arm model. Set automatically from MODE=dual; overrides config.")
 
     args = parser.parse_args(argv)
-    print("[gesture] using model:", args.model)
+
+    # --model-right overrides --model so either flag works
+    model_right_path = args.model_right if args.model_right else args.model
+    model_left_path  = args.model_left   # None → single-arm mode
+
     print("[gesture] cwd:", os.getcwd())
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print('[gesture] device:', device)
-    bundle = load_cnn_bundle(args.model, device=device)
-    model_channels = bundle.channel_count
+
+    # Right arm bundle (always loaded)
+    print("[gesture] right arm model:", model_right_path)
+    bundle_right  = load_cnn_bundle(model_right_path, device=device)
+    model_channels = bundle_right.channel_count   # kept for single-arm compat
+
+    # Left arm bundle (dual-arm mode only)
+    dual_arm = model_left_path is not None
+    bundle_left   = None
+    left_channels = 0
+    if dual_arm:
+        print("[gesture] left arm model:", model_left_path)
+        bundle_left   = load_cnn_bundle(model_left_path, device=device)
+        left_channels = bundle_left.channel_count
+        print(f"[gesture] dual-arm mode | right={RIGHT_ARM_CHANNELS}ch left={left_channels}ch")
+    else:
+        print("[gesture] single-arm mode")
 
     handler = _StreamingHandler()
     base = TrignoBase(handler)
@@ -167,12 +242,22 @@ def main(argv=None):
         raise RuntimeError("Failed to configure Trigno pipeline.")
 
     stream_channels = len(base.channel_guids)
-    if stream_channels != model_channels:
-        print(
-            "Channel count mismatch "
-            f"(model expects {model_channels}, stream has {stream_channels}); "
-            "padding/trimming stream to match model."
-        )
+    if dual_arm:
+        expected_total = RIGHT_ARM_CHANNELS + left_channels
+        if stream_channels < expected_total:
+            raise RuntimeError(
+                f"Dual-arm requires {expected_total} stream channels "
+                f"({RIGHT_ARM_CHANNELS} right + {left_channels} left) "
+                f"but stream only has {stream_channels}. "
+                "Pair right arm sensors first, then left arm sensors, before scanning."
+            )
+    else:
+        if stream_channels != model_channels:
+            print(
+                "Channel count mismatch "
+                f"(model expects {model_channels}, stream has {stream_channels}); "
+                "padding/trimming stream to match model."
+            )
 
     base.TrigBase.Start(handler.streamYTData)
 
@@ -180,79 +265,141 @@ def main(argv=None):
     fs = None
     poll_sleep = 0.001
 
-    neutral_mean = None
-    mvc_scale = None
-    if CALIBRATE:
+    # Per-arm calibration values (single-arm uses only the _right variants)
+    neutral_mean       = None   # single-arm compat alias → points to neutral_mean_right
+    mvc_scale          = None   # single-arm compat alias → points to mvc_scale_right
+    neutral_mean_right = None
+    mvc_scale_right    = None
+    neutral_mean_left  = None
+    mvc_scale_left     = None
+
+    def _do_calibration(arm_label, arm_channels, collect_channels):
+        """Run one neutral+MVC calibration sequence for a single arm.
+        arm_label:      display name, e.g. 'right' or 'left'
+        arm_channels:   slice of the full stream belonging to this arm (int count)
+        collect_channels: total channels to collect from stream (None = all)
+        Returns: (neutral_mean, mvc_scale) arrays of shape (arm_channels,), or (None, None).
+        """
         calib_done = False
         while not calib_done:
-            print(f"\nCalibration: RELAX completely — arm still for {CALIB_NEUTRAL_S:.1f}s.")
-            neutral_samples, neutral_times = _collect_samples(
-                handler, CALIB_NEUTRAL_S, stream_channels, model_channels, poll_sleep
+            print(f"\nCalibration [{arm_label}]: RELAX {arm_label} arm completely "
+                  f"for {CALIB_NEUTRAL_S:.1f}s.")
+            n_samples, n_times = _collect_samples(
+                handler, CALIB_NEUTRAL_S, stream_channels, collect_channels, poll_sleep
             )
-            if fs is None and neutral_times.size:
-                fs = _estimate_fs(neutral_times)
+            nonlocal fs, filter_obj
+            if fs is None and n_times.size:
+                fs = _estimate_fs(n_times)
                 if fs is not None and filter_obj is None:
                     filter_obj = define_filters(fs)
                     print(f"Estimated fs: {fs:.2f} Hz")
 
             if filter_obj is None:
                 print("Warning: calibration skipped (no filter available).")
-                break
+                return None, None
 
             if CALIB_MVC_PREP_S > 0:
-                print(f"Prepare: SQUEEZE AS HARD AS POSSIBLE in {CALIB_MVC_PREP_S:.0f}s...")
+                print(f"Prepare: SQUEEZE {arm_label.upper()} ARM as hard as possible "
+                      f"in {CALIB_MVC_PREP_S:.0f}s...")
                 time.sleep(CALIB_MVC_PREP_S)
 
-            print(f"Calibration: SQUEEZE AS HARD AS POSSIBLE — all muscles — for {CALIB_MVC_S:.1f}s.")
-            mvc_samples, mvc_times = _collect_samples(
-                handler, CALIB_MVC_S, stream_channels, model_channels, poll_sleep
+            print(f"Calibration [{arm_label}]: SQUEEZE {arm_label.upper()} ARM "
+                  f"as hard as possible for {CALIB_MVC_S:.1f}s.")
+            m_samples, m_times = _collect_samples(
+                handler, CALIB_MVC_S, stream_channels, collect_channels, poll_sleep
             )
-            if fs is None and mvc_times.size:
-                fs = _estimate_fs(mvc_times)
+            if fs is None and m_times.size:
+                fs = _estimate_fs(m_times)
                 if fs is not None and filter_obj is None:
                     filter_obj = define_filters(fs)
                     print(f"Estimated fs: {fs:.2f} Hz")
 
-            if mvc_samples.size and neutral_samples.size:
-                neutral_f = apply_filters(filter_obj, neutral_samples)
-                mvc_f = apply_filters(filter_obj, mvc_samples)
+            if not (m_samples.size and n_samples.size):
+                calib_done = True
+                return None, None
 
-                # Quality check before committing calibration
-                neutral_rms = np.sqrt(np.mean(neutral_f ** 2, axis=0))
-                mvc_rms = np.sqrt(np.mean(mvc_f ** 2, axis=0))
-                ratio = np.where(neutral_rms < 1e-9, 1.0, mvc_rms / neutral_rms)
-                median_ratio = float(np.median(ratio))
-                n_weak = int(np.sum(ratio < MVC_MIN_RATIO))
+            # Slice to this arm's channels if collecting full stream
+            if collect_channels is None:
+                start = 0 if arm_label == "right" else RIGHT_ARM_CHANNELS
+                n_arr = n_samples[:, start:start + arm_channels]
+                m_arr = m_samples[:, start:start + arm_channels]
+            else:
+                n_arr = n_samples
+                m_arr = m_samples
+
+            neutral_f = apply_filters(filter_obj, n_arr)
+            mvc_f     = apply_filters(filter_obj, m_arr)
+
+            neutral_rms = np.sqrt(np.mean(neutral_f ** 2, axis=0))
+            mvc_rms     = np.sqrt(np.mean(mvc_f     ** 2, axis=0))
+            ratio       = np.where(neutral_rms < 1e-9, 1.0, mvc_rms / neutral_rms)
+            median_ratio = float(np.median(ratio))
+            n_weak       = int(np.sum(ratio < MVC_MIN_RATIO))
+            print(
+                f"MVC quality [{arm_label}]: {median_ratio:.1f}x median "
+                f"({n_weak}/{len(ratio)} channels below {MVC_MIN_RATIO:.0f}x)"
+            )
+
+            if median_ratio < MVC_MIN_RATIO:
                 print(
-                    f"MVC quality: {median_ratio:.1f}x median "
-                    f"({n_weak}/{len(ratio)} channels below {MVC_MIN_RATIO:.0f}x)"
+                    f"\n*** WARNING: Weak {arm_label} calibration ({median_ratio:.1f}x) ***\n"
+                    f"  Squeeze your {arm_label} arm/wrist muscles simultaneously with full force.\n"
                 )
+                retry = input("Retry calibration? [y/N]: ").strip().lower()
+                if retry == "y":
+                    continue
 
-                if median_ratio < MVC_MIN_RATIO:
-                    print(
-                        f"\n*** WARNING: Weak calibration ({median_ratio:.1f}x) ***\n"
-                        "  Your MVC was too close to neutral rest.\n"
-                        "  Squeeze ALL arm/wrist muscles simultaneously with full force.\n"
-                    )
-                    retry = input("Retry calibration? [y/N]: ").strip().lower()
-                    if retry == "y":
-                        continue
+            n_mean  = np.mean(neutral_f, axis=0)
+            m_scale = np.percentile(mvc_f, MVC_PERCENTILE, axis=0)
+            m_scale = np.where(m_scale < 1e-6, 1.0, m_scale)
+            if median_ratio < MVC_MIN_RATIO:
+                print(f"[{arm_label}] Calibration accepted with quality warning.")
+            else:
+                print(f"[{arm_label}] Calibration complete. (quality: {median_ratio:.1f}x)")
+            return n_mean, m_scale
 
-                neutral_mean = np.mean(neutral_f, axis=0)
-                mvc_scale = np.percentile(mvc_f, MVC_PERCENTILE, axis=0)
-                mvc_scale = np.where(mvc_scale < 1e-6, 1.0, mvc_scale)
-                if median_ratio < MVC_MIN_RATIO:
-                    print("Calibration accepted with quality warning. Accuracy may be reduced.")
-                else:
-                    print(f"Calibration complete. (quality: {median_ratio:.1f}x)")
-            calib_done = True
+        return None, None  # unreachable but keeps linter happy
+
+    if CALIBRATE:
+        if dual_arm:
+            # Dual-arm: calibrate each arm separately so MVC squeeze is arm-specific
+            neutral_mean_right, mvc_scale_right = _do_calibration(
+                "right", RIGHT_ARM_CHANNELS, collect_channels=None
+            )
+            neutral_mean_left, mvc_scale_left = _do_calibration(
+                "left", left_channels, collect_channels=None
+            )
+        else:
+            # Single-arm: original behaviour, collect only model_channels
+            neutral_mean_right, mvc_scale_right = _do_calibration(
+                "right", model_channels, collect_channels=model_channels
+            )
+
+        # Single-arm compat aliases
+        neutral_mean = neutral_mean_right
+        mvc_scale    = mvc_scale_right
 
     # sample_buffer = deque(maxlen=WINDOW_SIZE + FILTER_WARMUP)  # old: raw buffer + filtfilt on rolling window
-    filtered_buffer = deque(maxlen=WINDOW_SIZE)  # new: stores already-filtered samples
-    filter_state = None  # new: persistent sosfilt state — initialized on first batch
-    pending_samples = 0
-    pred_history = deque(maxlen=max(1, SMOOTHING))
-    last_output = None
+
+    # Right arm (always present)
+    filtered_buffer_right = deque(maxlen=WINDOW_SIZE)
+    filter_state_right    = None
+    pending_right         = 0
+    pred_history_right    = deque(maxlen=max(1, SMOOTHING))
+
+    # Left arm (dual-arm mode only)
+    filtered_buffer_left  = deque(maxlen=WINDOW_SIZE)
+    filter_state_left     = None
+    pending_left          = 0
+    pred_history_left     = deque(maxlen=max(1, SMOOTHING))
+
+    # Single-arm compat aliases (used in single-arm inference path below)
+    filtered_buffer = filtered_buffer_right
+    filter_state    = filter_state_right
+    pending_samples = pending_right
+    pred_history    = pred_history_right
+
+    last_output  = None
     last_msg_len = 0
     # === LATENCY MEASURE START ===
     # Comment out this whole block (and other LATENCY blocks below) after measuring.
@@ -291,61 +438,120 @@ def main(argv=None):
             # Capture when this batch of samples became available to this process.
             batch_wall_time = time.time()
 
-            # --- collect raw batch ---
+            # --- collect raw batch (all stream channels) ---
             sample_batch = []
             for idx in range(sample_count):
                 sample = [channel_values[ch][idx] for ch in range(stream_channels)]
-                if len(sample) < model_channels:
-                    sample.extend([0.0] * (model_channels - len(sample)))
-                elif len(sample) > model_channels:
-                    sample = sample[:model_channels]
                 # sample_buffer.append(sample)  # old: append to raw rolling buffer
                 sample_batch.append(sample)
 
+            if not sample_batch or filter_obj is None:
+                if sample_batch:
+                    pending_right += len(sample_batch)
+                    if dual_arm:
+                        pending_left += len(sample_batch)
+                continue
+
+            batch_arr = np.asarray(sample_batch, dtype=float)  # (N, stream_channels)
+
+            # --- split channels by arm ---
+            # In dual-arm, RIGHT_ARM_CHANNELS is the stream-layout offset.
+            # In single-arm, model_channels is the authoritative input width.
+            right_slice = RIGHT_ARM_CHANNELS if dual_arm else model_channels
+            batch_right = batch_arr[:, :right_slice]
+            if dual_arm:
+                batch_left = batch_arr[:, RIGHT_ARM_CHANNELS:RIGHT_ARM_CHANNELS + left_channels]
+
             # --- stateful causal filtering (new) ---
-            # Filters the whole batch at once, carrying state across calls.
-            # Eliminates the ~16-25% train/test mismatch from filtfilt on short buffers.
-            if sample_batch and filter_obj is not None:
-                if filter_state is None:
-                    filter_state = make_filter_state(filter_obj, model_channels)
-                batch_arr = np.asarray(sample_batch, dtype=float)
-                filtered_batch, filter_state = apply_filters_stateful(filter_obj, batch_arr, filter_state)
-                for s in filtered_batch:
-                    filtered_buffer.append(s)
-                    pending_samples += 1
-            elif sample_batch:
-                pending_samples += len(sample_batch)  # filter not ready yet, just count
+            # Each arm has its own filter state so they are fully independent.
+            # Eliminates ~16-25% train/test mismatch from filtfilt on short buffers.
+            if filter_state_right is None:
+                filter_state_right = make_filter_state(filter_obj, right_slice)
+            filtered_right, filter_state_right = apply_filters_stateful(
+                filter_obj, batch_right, filter_state_right
+            )
+            for s in filtered_right:
+                filtered_buffer_right.append(s)
+                pending_right += 1
 
-            while pending_samples >= WINDOW_STEP and len(filtered_buffer) == WINDOW_SIZE:
-                if filter_obj is None:
-                    pending_samples -= WINDOW_STEP
-                    continue
+            if dual_arm:
+                if filter_state_left is None:
+                    filter_state_left = make_filter_state(filter_obj, left_channels)
+                filtered_left, filter_state_left = apply_filters_stateful(
+                    filter_obj, batch_left, filter_state_left
+                )
+                for s in filtered_left:
+                    filtered_buffer_left.append(s)
+                    pending_left += 1
 
+            # --- inference: right arm ---
+            inference_ran = False
+            label_right = LOW_CONFIDENCE_LABEL
+            conf_right  = 0.0
+            while pending_right >= WINDOW_STEP and len(filtered_buffer_right) == WINDOW_SIZE:
                 # old approach (filtfilt on rolling raw buffer):
                 # raw = np.asarray(sample_buffer, dtype=float)
                 # filtered_full = apply_filters(filter_obj, raw)
                 # filtered = filtered_full[-WINDOW_SIZE:]
 
-                filtered = np.asarray(filtered_buffer, dtype=float)
-                if neutral_mean is not None and mvc_scale is not None:
-                    filtered = (filtered - neutral_mean) / mvc_scale
+                filtered = np.asarray(filtered_buffer_right, dtype=float)
+                if neutral_mean_right is not None and mvc_scale_right is not None:
+                    filtered = (filtered - neutral_mean_right) / mvc_scale_right
 
                 window = filtered.T[np.newaxis, :, :].astype(np.float32)
-                window = bundle.standardize(window)
-                probs = bundle.predict_proba(window)[0]
+                window = bundle_right.standardize(window)
+                probs  = bundle_right.predict_proba(window)[0]
 
-                pred_history.append(probs)
+                pred_history_right.append(probs)
                 if SMOOTHING > 1:
-                    probs = np.mean(np.stack(pred_history, axis=0), axis=0)
+                    probs = np.mean(np.stack(pred_history_right, axis=0), axis=0)
 
-                confidence = float(np.max(probs))
-                pred_idx = int(np.argmax(probs))
-                label = bundle.index_to_label[pred_idx]
+                conf_right  = float(np.max(probs))
+                pred_idx    = int(np.argmax(probs))
+                label_right = bundle_right.index_to_label[pred_idx]
+                if conf_right < MIN_CONFIDENCE:
+                    label_right = LOW_CONFIDENCE_LABEL
 
-                if confidence < MIN_CONFIDENCE:
-                    label = LOW_CONFIDENCE_LABEL
+                inference_ran = True
+                pending_right -= WINDOW_STEP
 
-                control_hook(label)
+            # --- inference: left arm (dual-arm mode only) ---
+            label_left = LOW_CONFIDENCE_LABEL
+            conf_left  = 0.0
+            if dual_arm:
+                while pending_left >= WINDOW_STEP and len(filtered_buffer_left) == WINDOW_SIZE:
+                    filtered = np.asarray(filtered_buffer_left, dtype=float)
+                    if neutral_mean_left is not None and mvc_scale_left is not None:
+                        filtered = (filtered - neutral_mean_left) / mvc_scale_left
+
+                    window = filtered.T[np.newaxis, :, :].astype(np.float32)
+                    window = bundle_left.standardize(window)
+                    probs  = bundle_left.predict_proba(window)[0]
+
+                    pred_history_left.append(probs)
+                    if SMOOTHING > 1:
+                        probs = np.mean(np.stack(pred_history_left, axis=0), axis=0)
+
+                    conf_left  = float(np.max(probs))
+                    pred_idx   = int(np.argmax(probs))
+                    label_left = bundle_left.index_to_label[pred_idx]
+                    if conf_left < MIN_CONFIDENCE:
+                        label_left = LOW_CONFIDENCE_LABEL
+
+                    inference_ran = True
+                    pending_left -= WINDOW_STEP
+
+            # --- fusion and output ---
+            if inference_ran:
+                if dual_arm:
+                    label, confidence = fuse_predictions(
+                        label_right, conf_right, label_left, conf_left
+                    )
+                else:
+                    label, confidence = label_right, conf_right
+
+                if label != LOW_CONFIDENCE_LABEL or last_output != LOW_CONFIDENCE_LABEL:
+                    control_hook(label)
 
     #             # === LATENCY MEASURE START ===
     #             if latency_enabled:
@@ -367,16 +573,14 @@ def main(argv=None):
     #                     raise KeyboardInterrupt
     #             # === LATENCY MEASURE END ===
 
-                if label != last_output:
-                    msg = f"Gesture: {label} (conf {confidence:.2f})"
-                    if len(msg) < last_msg_len:
-                        msg = msg.ljust(last_msg_len)
-                    else:
-                        last_msg_len = len(msg)
-                    print(msg, end="\r", flush=True)
-                    last_output = label
-
-                pending_samples -= WINDOW_STEP
+                    if label != last_output:
+                        msg = f"Gesture: {label} (conf {confidence:.2f})"
+                        if len(msg) < last_msg_len:
+                            msg = msg.ljust(last_msg_len)
+                        else:
+                            last_msg_len = len(msg)
+                        print(msg, end="\r", flush=True)
+                        last_output = label
     except KeyboardInterrupt:
         print("\nStopping stream...")
     finally:

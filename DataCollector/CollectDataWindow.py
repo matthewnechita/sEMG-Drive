@@ -29,6 +29,7 @@ class TrialConfig:
     repetitions: int
     subject: str
     session: str
+    arm: str = "right"
     prep_duration: float = 3.0
     inter_gesture_rest_s: float = 0.0
     label_trim_s: float = 0.0
@@ -219,6 +220,24 @@ class CollectDataWindow(QWidget):
         idLayout.addRow(sess_label, self.session_input)
         idWidget.setLayout(idLayout)
         buttonLayout.addWidget(idWidget)
+
+        # ---- Arm toggle (Right / Left)
+        armWidget = QWidget()
+        armLayout = QHBoxLayout()
+        armLayout.setContentsMargins(0, 0, 0, 0)
+        arm_label = QLabel("Arm:")
+        arm_label.setStyleSheet("color: white;")
+        armLayout.addWidget(arm_label)
+        self.arm_right_radio = QRadioButton("Right")
+        self.arm_right_radio.setStyleSheet("color: white;")
+        self.arm_right_radio.setChecked(True)
+        self.arm_left_radio = QRadioButton("Left")
+        self.arm_left_radio.setStyleSheet("color: white;")
+        armLayout.addWidget(self.arm_right_radio)
+        armLayout.addWidget(self.arm_left_radio)
+        armLayout.addStretch()
+        armWidget.setLayout(armLayout)
+        buttonLayout.addWidget(armWidget)
 
         # ---- Labeled Protocol (NPZ) Button
         self.recordnpz_button = QPushButton('Run Protocol + Save NPZ', self)
@@ -640,6 +659,7 @@ class CollectDataWindow(QWidget):
         # Subject/session inputs are provided inline (no popups)
         subject = self.subject_input.text().strip() or self.default_subject
         session = self.session_input.text().strip() or self.default_session
+        arm = "right" if self.arm_right_radio.isChecked() else "left"
 
         # Defaults can be tweaked here
         # (These could also be exposed via UI fields later)
@@ -650,6 +670,7 @@ class CollectDataWindow(QWidget):
             repetitions=5,
             subject=subject.strip(),
             session=session.strip(),
+            arm=arm,
             prep_duration=5.0,
             inter_gesture_rest_s=1.0,
             label_trim_s=0.5,
@@ -661,7 +682,7 @@ class CollectDataWindow(QWidget):
             calibration_min_ratio=2.0,
         )
 
-        base_dir = Path.cwd() / "data" / config.subject
+        base_dir = Path.cwd() / "data" / f"{config.arm} arm" / config.subject
         raw_dir = base_dir / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
         output_path = raw_dir / f"{config.subject}_session{config.session}_raw.npz"
@@ -931,6 +952,7 @@ class CollectDataWindow(QWidget):
 
         metadata = {
             "subject": config.subject,
+            "arm":     config.arm,
             "session": config.session,
             "gestures": config.gestures,
             "gesture_duration_s": config.gesture_duration,
