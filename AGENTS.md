@@ -55,3 +55,10 @@ Notes
 - Future control integration: `realtime_gesture.py` has a `control_hook` stub; plan to extend it to accept a continuous strength value (e.g., `control_hook(gesture, strength)`) for variable steering intensity once the control module is added.
 - Future change: shrink SVM grid search, report best C/gamma after tuning, and consider a dedicated optimization module.
 - One-off data cleanup scripts are deprecated: relabel_neutral_buffers_DEPRECATED..py, drop_first_gesture_run_DEPRECATED.py (kept for history only).
+- Dual-arm plan (Feb 13, 2026):
+  - Use two separate CNN models: one for right arm, one for left arm.
+  - Collect data per arm separately (no simultaneous collection).
+  - Keep channel count consistent within each arm's dataset/model; left can have fewer channels than right if fixed.
+  - Inference: compute left/right labels + confidences, then fuse post-hoc:
+    - If both arms agree with high confidence, collapse to one control label (strengthen).
+    - If they disagree, emit per-arm labels or pick higher-confidence label if above threshold; otherwise neutral.
