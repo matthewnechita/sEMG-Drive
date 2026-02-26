@@ -1,0 +1,48 @@
+# Conda environment for capstone-emg
+#
+# Create:  conda env create -f environment.yml
+# Activate: conda activate capstone-emg
+# Update:  conda env update -f environment.yml --prune
+#
+# Prerequisites (Windows, install before creating env):
+#   - .NET 6+ runtime: https://dotnet.microsoft.com/download
+#     Required by pythonnet to load the Delsys SDK (resources/DelsysAPI.dll)
+#
+# PyTorch (CPU-only by default):
+#   If you need CUDA support, after activating the env run:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   (replace cu121 with your CUDA version)
+
+name: capstone-emg
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - numpy>=1.24,<2        # <2 avoids numpy 2.x breaking changes with pythonnet
+                          # (Python 3.10 required — libemg uses X|Y union syntax throughout)
+  - scipy>=1.9
+  - scikit-learn>=1.1
+  - matplotlib>=3.5       # used internally by libemg
+
+  - pip
+  - pip:
+    # Delsys SDK bridge — pinned, do not upgrade without testing
+    - pythonnet==3.0.3
+
+    # GUI and plotting
+    - PySide6>=6.4
+    - vispy>=0.12
+    - PyOpenGL>=3.1        # vispy OpenGL backend on Windows
+
+    # EMG utilities (windowing, filtering, feature extraction)
+    - libemg>=1.0
+
+    # Deep learning (CPU build — see note above for CUDA)
+    - torch>=2.0
+    - torchvision>=0.15
+
+    # Visualisation
+    - plotly>=5.0

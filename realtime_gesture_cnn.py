@@ -2,25 +2,27 @@ import argparse
 import time
 from collections import deque
 
+import os
+import threading
+
 import numpy as np
+import torch
 
 from AeroPy.TrignoBase import TrignoBase
 from AeroPy.DataManager import DataKernel
 
-from filtering import define_filters, apply_filters
-from gesture_model_cnn import load_cnn_bundle
-
-import threading
-import os
+# from emg.filtering import define_filters, apply_filters
+from emg.filtering import define_filters, apply_filters, make_filter_state, apply_filters_stateful
+from emg.gesture_model_cnn import load_cnn_bundle
 
 
 # ======== Config (edit as needed) ========
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
-FILTER_WARMUP = 200  # extra samples for filter warmup
+# FILTER_WARMUP = 200  # commented out — replaced by stateful sosfilt (no warmup needed)
 
-SMOOTHING = 5  # number of windows to average
-MIN_CONFIDENCE = 0.4
+SMOOTHING = 11  # number of windows to average (~550ms at 2kHz/step-100)
+MIN_CONFIDENCE = 0.65  # for 6 classes, 40% was too low to gate uncertainty
 LOW_CONFIDENCE_LABEL = "neutral"
 
 LATEST_LOCK = threading.Lock()
@@ -28,9 +30,11 @@ LATEST_GESTURE = LOW_CONFIDENCE_LABEL
 LATEST_TIMESTAMP = 0.0
 
 CALIBRATE = True
-CALIB_NEUTRAL_S = 3.0
-CALIB_MVC_S = 3.0
+CALIB_NEUTRAL_S = 5.0
+CALIB_MVC_S = 5.0
+CALIB_MVC_PREP_S = 2.0    # countdown pause before MVC window
 MVC_PERCENTILE = 95.0
+MVC_MIN_RATIO = 2.0        # minimum acceptable median MVC/neutral ratio
 # ========================================
 
 
@@ -62,6 +66,22 @@ def _estimate_fs(times):
     return 1.0 / float(np.median(diffs))
 
 
+def _parse_yt_frame(out):
+    """Unpack a GetYTData() frame into parallel lists of per-channel times and values."""
+    channel_times = []
+    channel_values = []
+    for channel in out:
+        if not channel:
+            continue
+        chan_array = np.asarray(channel[0], dtype=object)
+        if chan_array.size == 0:
+            continue
+        t_vals, v_vals = zip(*(_pair_time_value(s) for s in chan_array))
+        channel_times.append(list(t_vals))
+        channel_values.append(list(v_vals))
+    return channel_times, channel_values
+
+
 def control_hook(gesture: str) -> None:
     set_latest_gesture(gesture)
     return
@@ -90,17 +110,7 @@ def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_
             time.sleep(poll_sleep)
             continue
 
-        channel_times = []
-        channel_values = []
-        for channel in out:
-            if not channel:
-                continue
-            chan_array = np.asarray(channel[0], dtype=object)
-            if chan_array.size == 0:
-                continue
-            t_vals, v_vals = zip(*(_pair_time_value(s) for s in chan_array))
-            channel_times.append(list(t_vals))
-            channel_values.append(list(v_vals))
+        channel_times, channel_values = _parse_yt_frame(out)
 
         if len(channel_values) < stream_channels:
             continue
@@ -129,14 +139,16 @@ def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Real-time CNN gesture inference.")
     
-    DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gesture_cnn.pt")
+    DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "cross_subject", "gesture_cnn_v2.pt")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+
+    args = parser.parse_args(argv)
     print("[gesture] using model:", args.model)
     print("[gesture] cwd:", os.getcwd())
 
-    args = parser.parse_args(argv)
-
-    bundle = load_cnn_bundle(args.model)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print('[gesture] device:', device)
+    bundle = load_cnn_bundle(args.model, device=device)
     model_channels = bundle.channel_count
 
     handler = _StreamingHandler()
@@ -171,20 +183,27 @@ def main(argv=None):
     neutral_mean = None
     mvc_scale = None
     if CALIBRATE:
-        print(f"Calibration: neutral rest for {CALIB_NEUTRAL_S:.1f}s.")
-        neutral_samples, neutral_times = _collect_samples(
-            handler, CALIB_NEUTRAL_S, stream_channels, model_channels, poll_sleep
-        )
-        if fs is None and neutral_times.size:
-            fs = _estimate_fs(neutral_times)
-            if fs is not None and filter_obj is None:
-                filter_obj = define_filters(fs)
-                print(f"Estimated fs: {fs:.2f} Hz")
+        calib_done = False
+        while not calib_done:
+            print(f"\nCalibration: RELAX completely — arm still for {CALIB_NEUTRAL_S:.1f}s.")
+            neutral_samples, neutral_times = _collect_samples(
+                handler, CALIB_NEUTRAL_S, stream_channels, model_channels, poll_sleep
+            )
+            if fs is None and neutral_times.size:
+                fs = _estimate_fs(neutral_times)
+                if fs is not None and filter_obj is None:
+                    filter_obj = define_filters(fs)
+                    print(f"Estimated fs: {fs:.2f} Hz")
 
-        if filter_obj is None:
-            print("Warning: calibration skipped (no filter available).")
-        else:
-            print(f"Calibration: max contraction for {CALIB_MVC_S:.1f}s.")
+            if filter_obj is None:
+                print("Warning: calibration skipped (no filter available).")
+                break
+
+            if CALIB_MVC_PREP_S > 0:
+                print(f"Prepare: SQUEEZE AS HARD AS POSSIBLE in {CALIB_MVC_PREP_S:.0f}s...")
+                time.sleep(CALIB_MVC_PREP_S)
+
+            print(f"Calibration: SQUEEZE AS HARD AS POSSIBLE — all muscles — for {CALIB_MVC_S:.1f}s.")
             mvc_samples, mvc_times = _collect_samples(
                 handler, CALIB_MVC_S, stream_channels, model_channels, poll_sleep
             )
@@ -197,12 +216,40 @@ def main(argv=None):
             if mvc_samples.size and neutral_samples.size:
                 neutral_f = apply_filters(filter_obj, neutral_samples)
                 mvc_f = apply_filters(filter_obj, mvc_samples)
+
+                # Quality check before committing calibration
+                neutral_rms = np.sqrt(np.mean(neutral_f ** 2, axis=0))
+                mvc_rms = np.sqrt(np.mean(mvc_f ** 2, axis=0))
+                ratio = np.where(neutral_rms < 1e-9, 1.0, mvc_rms / neutral_rms)
+                median_ratio = float(np.median(ratio))
+                n_weak = int(np.sum(ratio < MVC_MIN_RATIO))
+                print(
+                    f"MVC quality: {median_ratio:.1f}x median "
+                    f"({n_weak}/{len(ratio)} channels below {MVC_MIN_RATIO:.0f}x)"
+                )
+
+                if median_ratio < MVC_MIN_RATIO:
+                    print(
+                        f"\n*** WARNING: Weak calibration ({median_ratio:.1f}x) ***\n"
+                        "  Your MVC was too close to neutral rest.\n"
+                        "  Squeeze ALL arm/wrist muscles simultaneously with full force.\n"
+                    )
+                    retry = input("Retry calibration? [y/N]: ").strip().lower()
+                    if retry == "y":
+                        continue
+
                 neutral_mean = np.mean(neutral_f, axis=0)
                 mvc_scale = np.percentile(mvc_f, MVC_PERCENTILE, axis=0)
                 mvc_scale = np.where(mvc_scale < 1e-6, 1.0, mvc_scale)
-                print("Calibration complete.")
+                if median_ratio < MVC_MIN_RATIO:
+                    print("Calibration accepted with quality warning. Accuracy may be reduced.")
+                else:
+                    print(f"Calibration complete. (quality: {median_ratio:.1f}x)")
+            calib_done = True
 
-    sample_buffer = deque(maxlen=WINDOW_SIZE + FILTER_WARMUP)
+    # sample_buffer = deque(maxlen=WINDOW_SIZE + FILTER_WARMUP)  # old: raw buffer + filtfilt on rolling window
+    filtered_buffer = deque(maxlen=WINDOW_SIZE)  # new: stores already-filtered samples
+    filter_state = None  # new: persistent sosfilt state — initialized on first batch
     pending_samples = 0
     pred_history = deque(maxlen=max(1, SMOOTHING))
     last_output = None
@@ -226,17 +273,7 @@ def main(argv=None):
                 time.sleep(poll_sleep)
                 continue
 
-            channel_times = []
-            channel_values = []
-            for channel in out:
-                if not channel:
-                    continue
-                chan_array = np.asarray(channel[0], dtype=object)
-                if chan_array.size == 0:
-                    continue
-                times, values = zip(*(_pair_time_value(s) for s in chan_array))
-                channel_times.append(list(times))
-                channel_values.append(list(values))
+            channel_times, channel_values = _parse_yt_frame(out)
 
             if len(channel_values) < stream_channels:
                 continue
@@ -254,82 +291,92 @@ def main(argv=None):
             # Capture when this batch of samples became available to this process.
             batch_wall_time = time.time()
 
+            # --- collect raw batch ---
+            sample_batch = []
             for idx in range(sample_count):
                 sample = [channel_values[ch][idx] for ch in range(stream_channels)]
                 if len(sample) < model_channels:
                     sample.extend([0.0] * (model_channels - len(sample)))
                 elif len(sample) > model_channels:
                     sample = sample[:model_channels]
-                sample_buffer.append(sample)
-                pending_samples += 1
+                # sample_buffer.append(sample)  # old: append to raw rolling buffer
+                sample_batch.append(sample)
+
+            # --- stateful causal filtering (new) ---
+            # Filters the whole batch at once, carrying state across calls.
+            # Eliminates the ~16-25% train/test mismatch from filtfilt on short buffers.
+            if sample_batch and filter_obj is not None:
+                if filter_state is None:
+                    filter_state = make_filter_state(filter_obj, model_channels)
+                batch_arr = np.asarray(sample_batch, dtype=float)
+                filtered_batch, filter_state = apply_filters_stateful(filter_obj, batch_arr, filter_state)
+                for s in filtered_batch:
+                    filtered_buffer.append(s)
+                    pending_samples += 1
+            elif sample_batch:
+                pending_samples += len(sample_batch)  # filter not ready yet, just count
+
+            while pending_samples >= WINDOW_STEP and len(filtered_buffer) == WINDOW_SIZE:
+                if filter_obj is None:
+                    pending_samples -= WINDOW_STEP
+                    continue
+
+                # old approach (filtfilt on rolling raw buffer):
+                # raw = np.asarray(sample_buffer, dtype=float)
+                # filtered_full = apply_filters(filter_obj, raw)
+                # filtered = filtered_full[-WINDOW_SIZE:]
+
+                filtered = np.asarray(filtered_buffer, dtype=float)
+                if neutral_mean is not None and mvc_scale is not None:
+                    filtered = (filtered - neutral_mean) / mvc_scale
+
+                window = filtered.T[np.newaxis, :, :].astype(np.float32)
+                window = bundle.standardize(window)
+                probs = bundle.predict_proba(window)[0]
+
+                pred_history.append(probs)
+                if SMOOTHING > 1:
+                    probs = np.mean(np.stack(pred_history, axis=0), axis=0)
+
+                confidence = float(np.max(probs))
+                pred_idx = int(np.argmax(probs))
+                label = bundle.index_to_label[pred_idx]
+
+                if confidence < MIN_CONFIDENCE:
+                    label = LOW_CONFIDENCE_LABEL
+
+                control_hook(label)
+
     #             # === LATENCY MEASURE START ===
     #             if latency_enabled:
-    #                 time_buffer.append(batch_wall_time)
+    #                 t1 = time.time()
+    #                 proc_ms.append((t1 - t0) * 1000.0)
+    #                 latest_ts = time_buffer[-1] if time_buffer else None
+    #                 if latest_ts is not None:
+    #                     latency_ms.append((t1 - latest_ts) * 1000.0)
+    #                 preds += 1
+    #                 if latency_print_every > 0 and preds % latency_print_every == 0:
+    #                     if latency_ms:
+    #                         print(
+    #                             f"latency_ms={latency_ms[-1]:.1f} "
+    #                             f"proc_ms={proc_ms[-1]:.1f}",
+    #                             end="\r",
+    #                             flush=True,
+    #                         )
+    #                 if latency_max_preds > 0 and preds >= latency_max_preds:
+    #                     raise KeyboardInterrupt
     #             # === LATENCY MEASURE END ===
 
-                while pending_samples >= WINDOW_STEP and len(sample_buffer) >= WINDOW_SIZE:
-                    if filter_obj is None:
-                        pending_samples -= WINDOW_STEP
-                        continue
+                if label != last_output:
+                    msg = f"Gesture: {label} (conf {confidence:.2f})"
+                    if len(msg) < last_msg_len:
+                        msg = msg.ljust(last_msg_len)
+                    else:
+                        last_msg_len = len(msg)
+                    print(msg, end="\r", flush=True)
+                    last_output = label
 
-    #                 # === LATENCY MEASURE START ===
-    #                 if latency_enabled:
-    #                     t0 = time.time()
-    #                 # === LATENCY MEASURE END ===
-
-                    raw = np.asarray(sample_buffer, dtype=float)
-                    filtered_full = apply_filters(filter_obj, raw)
-                    filtered = filtered_full[-WINDOW_SIZE:]
-                    if neutral_mean is not None and mvc_scale is not None:
-                        filtered = (filtered - neutral_mean) / mvc_scale
-
-                    window = filtered.T[np.newaxis, :, :].astype(np.float32)
-                    window = bundle.standardize(window)
-                    probs = bundle.predict_proba(window)[0]
-
-                    pred_history.append(probs)
-                    if SMOOTHING > 1:
-                        probs = np.mean(np.stack(pred_history, axis=0), axis=0)
-
-                    confidence = float(np.max(probs))
-                    pred_idx = int(np.argmax(probs))
-                    label = bundle.index_to_label[pred_idx]
-
-                    if confidence < MIN_CONFIDENCE:
-                        label = LOW_CONFIDENCE_LABEL
-
-                    control_hook(label)
-
-    #                 # === LATENCY MEASURE START ===
-    #                 if latency_enabled:
-    #                     t1 = time.time()
-    #                     proc_ms.append((t1 - t0) * 1000.0)
-    #                     latest_ts = time_buffer[-1] if time_buffer else None
-    #                     if latest_ts is not None:
-    #                         latency_ms.append((t1 - latest_ts) * 1000.0)
-    #                     preds += 1
-    #                     if latency_print_every > 0 and preds % latency_print_every == 0:
-    #                         if latency_ms:
-    #                             print(
-    #                                 f"latency_ms={latency_ms[-1]:.1f} "
-    #                                 f"proc_ms={proc_ms[-1]:.1f}",
-    #                                 end="\r",
-    #                                 flush=True,
-    #                             )
-    #                     if latency_max_preds > 0 and preds >= latency_max_preds:
-    #                         raise KeyboardInterrupt
-    #                 # === LATENCY MEASURE END ===
-
-                    if label != last_output:
-                        msg = f"Gesture: {label} (conf {confidence:.2f})"
-                        if len(msg) < last_msg_len:
-                            msg = msg.ljust(last_msg_len)
-                        else:
-                            last_msg_len = len(msg)
-                        print(msg, end="\r", flush=True)
-                        last_output = label
-
-                    pending_samples -= WINDOW_STEP
+                pending_samples -= WINDOW_STEP
     except KeyboardInterrupt:
         print("\nStopping stream...")
     finally:
