@@ -1,0 +1,1 @@
+When trying the mvc calibration in data collection, no matter how hard I flexed and contracted my muscles, I couldn't even get close to 2x median, the best I got was 1.1x, 9/17 channels were under the 2x minimum calibration ratio

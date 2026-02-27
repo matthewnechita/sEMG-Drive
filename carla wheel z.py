@@ -30,6 +30,11 @@ import glob
 import os
 import sys
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+SRC_DIR = os.path.join(PROJECT_ROOT, 'src')
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
         sys.version_info.major,
@@ -100,7 +105,7 @@ except ImportError:
 try:
     import realtime_gesture_cnn as realtime_gesture
 except Exception:
-    realtime_gesture_cnn = None
+    realtime_gesture = None
 import threading
 import time
 try:
@@ -430,9 +435,6 @@ class DualControl(object):
         
         steer = self._gesture_to_steer.get(label, 0.0)
         self._control.steer = float(steer)
-
-        if self._control.throttle == 0.0 and self._control.brake == 0.0:
-            self._control.throttle = float(self._gesture_throttle_when_idle)
 
     @staticmethod
     def _is_quit_shortcut(key):

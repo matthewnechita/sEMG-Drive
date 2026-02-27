@@ -22,7 +22,7 @@ WINDOW_STEP = 100
 # FILTER_WARMUP = 200  # commented out — replaced by stateful sosfilt (no warmup needed)
 
 SMOOTHING = 11  # number of windows to average (~550ms at 2kHz/step-100)
-MIN_CONFIDENCE = 0.65  # for 6 classes, 40% was too low to gate uncertainty
+MIN_CONFIDENCE = 0.40  # for 6 classes, 40% was too low to gate uncertainty
 LOW_CONFIDENCE_LABEL = "neutral"
 
 LATEST_LOCK = threading.Lock()
@@ -46,7 +46,7 @@ RIGHT_ARM_CHANNELS = 17   # fixed: 6 right arm sensors confirmed in trained bund
 #                      (lower than single-arm threshold because agreement strengthens prediction)
 #   SINGLE_THRESHOLD — minimum confidence to emit when only one arm is available/confident
 DUAL_ARM_AGREE_THRESHOLD  = 0.55
-DUAL_ARM_SINGLE_THRESHOLD = 0.65   # matches MIN_CONFIDENCE above
+DUAL_ARM_SINGLE_THRESHOLD = 0.40   # matches MIN_CONFIDENCE above
 # =================================
 
 # ======== Inference mode ========
@@ -54,7 +54,7 @@ DUAL_ARM_SINGLE_THRESHOLD = 0.65   # matches MIN_CONFIDENCE above
 #   "right" — right arm only  (pair right arm sensors first in Delsys)
 #   "left"  — left arm only   (pair left arm sensors first in Delsys)
 #   "dual"  — both arms fused (pair right first, then left in Delsys)
-MODE        = "dual"
+MODE        = "right"
 MODEL_RIGHT = "models/cross_subject/right/gesture_cnn_v2.pt"
 MODEL_LEFT  = "models/cross_subject/left/gesture_cnn_v2.pt"
 # ================================
