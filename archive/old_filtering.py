@@ -1,6 +1,7 @@
 import numpy as np
 from pathlib import Path
 from scipy.signal import butter, sosfilt, sosfiltfilt
+from libemg import filtering as libemg_filter
 
 
 # LOAD IN THE RAW EMG DATA
@@ -54,7 +55,7 @@ def define_filters(fs):
     - Bandpass filter @ 20-450 Hz
     """
 
-    fi = filtering.Filter(fs)
+    fi = libemg_filter.Filter(fs)
 
     notch = {"name": "notch", "cutoff": 60, "bandwidth": 3}
     bandpass = {"name": "bandpass", "cutoff": [20, 450], "order": 4}

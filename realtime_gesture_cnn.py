@@ -11,15 +11,16 @@ import torch
 from AeroPy.TrignoBase import TrignoBase
 from AeroPy.DataManager import DataKernel
 
-# from emg.filtering import define_filters, apply_filters
-from emg.filtering import define_filters, apply_filters, make_filter_state, apply_filters_stateful
+# Old libEMG filtering (re-enabled). Commenting out the SciPy SOS filtering.
+# from emg.filtering import define_filters, apply_filters, make_filter_state, apply_filters_stateful
+from libemg import filtering as libemg_filter
 from emg.gesture_model_cnn import load_cnn_bundle
 
 
 # ======== Config (edit as needed) ========
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
-# FILTER_WARMUP = 200  # commented out — replaced by stateful sosfilt (no warmup needed)
+FILTER_WARMUP = 200  # extra samples to stabilize old libEMG filtering on rolling buffers
 
 SMOOTHING = 11  # number of windows to average (~550ms at 2kHz/step-100)
 MIN_CONFIDENCE = 0.40  # for 6 classes, 40% was too low to gate uncertainty
@@ -69,6 +70,25 @@ class _StreamingHandler:
 
     def threadManager(self, start_trigger: bool, stop_trigger: bool) -> None:
         return
+
+
+def define_filters(fs):
+    """
+    Old libEMG filtering stack:
+    - Notch @ 60 Hz (bandwidth 3)
+    - Bandpass 20-450 Hz (order 4)
+    """
+    fi = libemg_filter.Filter(fs)
+    notch = {"name": "notch", "cutoff": 60, "bandwidth": 3}
+    bandpass = {"name": "bandpass", "cutoff": [20, 450], "order": 4}
+    fi.install_filters(notch)
+    fi.install_filters(bandpass)
+    return fi
+
+
+def apply_filters(fi, emg):
+    filtered_data = fi.filter(emg)
+    return np.array(filtered_data, dtype=float)
 
 
 def _pair_time_value(sample):
@@ -379,25 +399,19 @@ def main(argv=None):
         neutral_mean = neutral_mean_right
         mvc_scale    = mvc_scale_right
 
-    # sample_buffer = deque(maxlen=WINDOW_SIZE + FILTER_WARMUP)  # old: raw buffer + filtfilt on rolling window
+    buffer_len = WINDOW_SIZE + FILTER_WARMUP
 
     # Right arm (always present)
-    filtered_buffer_right = deque(maxlen=WINDOW_SIZE)
-    filter_state_right    = None
-    pending_right         = 0
-    pred_history_right    = deque(maxlen=max(1, SMOOTHING))
+    raw_buffer_right   = deque(maxlen=buffer_len)
+    warmup_right       = FILTER_WARMUP == 0
+    pending_right      = 0
+    pred_history_right = deque(maxlen=max(1, SMOOTHING))
 
     # Left arm (dual-arm mode only)
-    filtered_buffer_left  = deque(maxlen=WINDOW_SIZE)
-    filter_state_left     = None
-    pending_left          = 0
-    pred_history_left     = deque(maxlen=max(1, SMOOTHING))
-
-    # Single-arm compat aliases (used in single-arm inference path below)
-    filtered_buffer = filtered_buffer_right
-    filter_state    = filter_state_right
-    pending_samples = pending_right
-    pred_history    = pred_history_right
+    raw_buffer_left    = deque(maxlen=buffer_len)
+    warmup_left        = FILTER_WARMUP == 0
+    pending_left       = 0
+    pred_history_left  = deque(maxlen=max(1, SMOOTHING))
 
     last_output  = None
     last_msg_len = 0
@@ -445,11 +459,7 @@ def main(argv=None):
                 # sample_buffer.append(sample)  # old: append to raw rolling buffer
                 sample_batch.append(sample)
 
-            if not sample_batch or filter_obj is None:
-                if sample_batch:
-                    pending_right += len(sample_batch)
-                    if dual_arm:
-                        pending_left += len(sample_batch)
+            if not sample_batch:
                 continue
 
             batch_arr = np.asarray(sample_batch, dtype=float)  # (N, stream_channels)
@@ -462,39 +472,36 @@ def main(argv=None):
             if dual_arm:
                 batch_left = batch_arr[:, RIGHT_ARM_CHANNELS:RIGHT_ARM_CHANNELS + left_channels]
 
-            # --- stateful causal filtering (new) ---
-            # Each arm has its own filter state so they are fully independent.
-            # Eliminates ~16-25% train/test mismatch from filtfilt on short buffers.
-            if filter_state_right is None:
-                filter_state_right = make_filter_state(filter_obj, right_slice)
-            filtered_right, filter_state_right = apply_filters_stateful(
-                filter_obj, batch_right, filter_state_right
-            )
-            for s in filtered_right:
-                filtered_buffer_right.append(s)
+            # --- old approach: raw rolling buffers + libEMG filtering ---
+            for s in batch_right:
+                raw_buffer_right.append(s)
                 pending_right += 1
+            if not warmup_right and len(raw_buffer_right) >= buffer_len:
+                warmup_right = True
+                pending_right = WINDOW_STEP
 
             if dual_arm:
-                if filter_state_left is None:
-                    filter_state_left = make_filter_state(filter_obj, left_channels)
-                filtered_left, filter_state_left = apply_filters_stateful(
-                    filter_obj, batch_left, filter_state_left
-                )
-                for s in filtered_left:
-                    filtered_buffer_left.append(s)
+                for s in batch_left:
+                    raw_buffer_left.append(s)
                     pending_left += 1
+                if not warmup_left and len(raw_buffer_left) >= buffer_len:
+                    warmup_left = True
+                    pending_left = WINDOW_STEP
+
+            if filter_obj is None:
+                pending_right = min(pending_right, WINDOW_STEP)
+                if dual_arm:
+                    pending_left = min(pending_left, WINDOW_STEP)
+                continue
 
             # --- inference: right arm ---
             inference_ran = False
             label_right = LOW_CONFIDENCE_LABEL
             conf_right  = 0.0
-            while pending_right >= WINDOW_STEP and len(filtered_buffer_right) == WINDOW_SIZE:
-                # old approach (filtfilt on rolling raw buffer):
-                # raw = np.asarray(sample_buffer, dtype=float)
-                # filtered_full = apply_filters(filter_obj, raw)
-                # filtered = filtered_full[-WINDOW_SIZE:]
-
-                filtered = np.asarray(filtered_buffer_right, dtype=float)
+            while warmup_right and pending_right >= WINDOW_STEP and len(raw_buffer_right) >= WINDOW_SIZE:
+                raw = np.asarray(raw_buffer_right, dtype=float)
+                filtered_full = apply_filters(filter_obj, raw)
+                filtered = filtered_full[-WINDOW_SIZE:]
                 if neutral_mean_right is not None and mvc_scale_right is not None:
                     filtered = (filtered - neutral_mean_right) / mvc_scale_right
 
@@ -519,8 +526,10 @@ def main(argv=None):
             label_left = LOW_CONFIDENCE_LABEL
             conf_left  = 0.0
             if dual_arm:
-                while pending_left >= WINDOW_STEP and len(filtered_buffer_left) == WINDOW_SIZE:
-                    filtered = np.asarray(filtered_buffer_left, dtype=float)
+                while warmup_left and pending_left >= WINDOW_STEP and len(raw_buffer_left) >= WINDOW_SIZE:
+                    raw = np.asarray(raw_buffer_left, dtype=float)
+                    filtered_full = apply_filters(filter_obj, raw)
+                    filtered = filtered_full[-WINDOW_SIZE:]
                     if neutral_mean_left is not None and mvc_scale_left is not None:
                         filtered = (filtered - neutral_mean_left) / mvc_scale_left
 
