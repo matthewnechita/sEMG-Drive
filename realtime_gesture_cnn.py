@@ -291,6 +291,21 @@ def main(argv=None):
         raise RuntimeError("Failed to configure Trigno pipeline.")
 
     stream_channels = len(base.channel_guids)
+
+    # For single-arm left mode: auto-detect channel offset so the system works
+    # whether only left arm sensors are connected (left_arm_start=0) or all
+    # sensors are connected from a prior dual-arm session (left_arm_start=17).
+    left_arm_start = 0
+    if not dual_arm and MODE == "left":
+        if stream_channels >= RIGHT_ARM_CHANNELS + model_channels:
+            left_arm_start = RIGHT_ARM_CHANNELS
+            print(
+                f"[gesture] all sensors connected; left-arm inference using "
+                f"channels {left_arm_start}–{left_arm_start + model_channels - 1}"
+            )
+        else:
+            print(f"[gesture] left-arm sensors only; using channels 0–{model_channels - 1}")
+
     if dual_arm:
         expected_total = RIGHT_ARM_CHANNELS + left_channels
         if stream_channels < expected_total:
@@ -301,11 +316,12 @@ def main(argv=None):
                 "Pair right arm sensors first, then left arm sensors, before scanning."
             )
     else:
-        if stream_channels != model_channels:
+        required = left_arm_start + model_channels
+        if stream_channels < required:
             print(
-                "Channel count mismatch "
-                f"(model expects {model_channels}, stream has {stream_channels}); "
-                "padding/trimming stream to match model."
+                f"Channel count mismatch: need {required} channels "
+                f"(model expects {model_channels} at offset {left_arm_start}), "
+                f"stream has {stream_channels}; padding/trimming."
             )
 
     base.TrigBase.Start(handler.streamYTData)
@@ -322,7 +338,7 @@ def main(argv=None):
     neutral_mean_left  = None
     mvc_scale_left     = None
 
-    def _do_calibration(arm_label, arm_channels, collect_channels):
+    def _do_calibration(arm_label, arm_channels, collect_channels, channel_start=0):
         """Run one neutral+MVC calibration sequence for a single arm.
         arm_label:      display name, e.g. 'right' or 'left'
         arm_channels:   slice of the full stream belonging to this arm (int count)
@@ -369,9 +385,8 @@ def main(argv=None):
 
             # Slice to this arm's channels if collecting full stream
             if collect_channels is None:
-                start = 0 if arm_label == "right" else RIGHT_ARM_CHANNELS
-                n_arr = n_samples[:, start:start + arm_channels]
-                m_arr = m_samples[:, start:start + arm_channels]
+                n_arr = n_samples[:, channel_start:channel_start + arm_channels]
+                m_arr = m_samples[:, channel_start:channel_start + arm_channels]
             else:
                 n_arr = n_samples
                 m_arr = m_samples
@@ -415,15 +430,17 @@ def main(argv=None):
         if dual_arm:
             # Dual-arm: calibrate each arm separately so MVC squeeze is arm-specific
             neutral_mean_right, mvc_scale_right = _do_calibration(
-                "right", RIGHT_ARM_CHANNELS, collect_channels=None
+                "right", RIGHT_ARM_CHANNELS, collect_channels=None, channel_start=0
             )
             neutral_mean_left, mvc_scale_left = _do_calibration(
-                "left", left_channels, collect_channels=None
+                "left", left_channels, collect_channels=None, channel_start=RIGHT_ARM_CHANNELS
             )
         else:
-            # Single-arm: original behaviour, collect only model_channels
+            # Single-arm: if left_arm_start > 0 (all sensors connected in left mode),
+            # collect all channels then slice; otherwise collect only model_channels.
+            calib_collect = None if left_arm_start > 0 else model_channels
             neutral_mean_right, mvc_scale_right = _do_calibration(
-                "right", model_channels, collect_channels=model_channels
+                MODE, model_channels, collect_channels=calib_collect, channel_start=left_arm_start
             )
 
         # Single-arm compat aliases
@@ -457,7 +474,7 @@ def main(argv=None):
                 continue
 
             # Right arm
-            r_raw = samples[:, :RIGHT_ARM_CHANNELS] if dual_arm else samples[:, :model_channels]
+            r_raw = samples[:, :RIGHT_ARM_CHANNELS] if dual_arm else samples[:, left_arm_start:left_arm_start + model_channels]
             r_filt = apply_filters(filter_obj, r_raw)
             if neutral_mean_right is not None and mvc_scale_right is not None:
                 r_filt = (r_filt - neutral_mean_right) / mvc_scale_right
@@ -561,12 +578,11 @@ def main(argv=None):
             batch_arr = np.asarray(sample_batch, dtype=float)  # (N, stream_channels)
 
             # --- split channels by arm ---
-            # In dual-arm, RIGHT_ARM_CHANNELS is the stream-layout offset.
-            # In single-arm, model_channels is the authoritative input width.
-            right_slice = RIGHT_ARM_CHANNELS if dual_arm else model_channels
-            batch_right = batch_arr[:, :right_slice]
             if dual_arm:
+                batch_right = batch_arr[:, :RIGHT_ARM_CHANNELS]
                 batch_left = batch_arr[:, RIGHT_ARM_CHANNELS:RIGHT_ARM_CHANNELS + left_channels]
+            else:
+                batch_right = batch_arr[:, left_arm_start:left_arm_start + model_channels]
 
             # --- old approach: raw rolling buffers + libEMG filtering ---
             for s in batch_right:
