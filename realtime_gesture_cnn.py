@@ -14,7 +14,7 @@ from AeroPy.DataManager import DataKernel
 # Old libEMG filtering (re-enabled). Commenting out the SciPy SOS filtering.
 # from emg.filtering import define_filters, apply_filters, make_filter_state, apply_filters_stateful
 from libemg import filtering as libemg_filter
-from emg.gesture_model_cnn import load_cnn_bundle
+from emg.gesture_model_cnn import load_cnn_bundle, quick_finetune
 
 
 # ======== Config (edit as needed) ========
@@ -23,7 +23,7 @@ WINDOW_STEP = 100
 FILTER_WARMUP = 200  # extra samples to stabilize old libEMG filtering on rolling buffers
 
 SMOOTHING = 11  # number of windows to average (~550ms at 2kHz/step-100)
-MIN_CONFIDENCE = 0.40  # for 6 classes, 40% was too low to gate uncertainty
+MIN_CONFIDENCE = 0.65  # for 6 classes, 40% was too low to gate uncertainty
 LOW_CONFIDENCE_LABEL = "neutral"
 
 LATEST_LOCK = threading.Lock()
@@ -39,16 +39,36 @@ MVC_MIN_RATIO = 2.0        # minimum acceptable median MVC/neutral ratio
 
 # ======== Dual-arm config ========
 # Right arm channels come first in the Delsys stream (pair right arm sensors first).
-# Left arm channels follow immediately after. LEFT_ARM_CHANNELS is inferred from
-# the left arm bundle's channel_count at load time.
-RIGHT_ARM_CHANNELS = 17   # fixed: 6 right arm sensors confirmed in trained bundles
+# Left arm channels follow immediately after; inferred from bundle_left.channel_count at load time.
+RIGHT_ARM_CHANNELS = 17   # fixed: 6 right arm sensors → 17 channels
+# Left arm uses 5 sensors → 16 channels (one fewer sensor than right arm)
 # Fusion thresholds:
 #   AGREE_THRESHOLD  — minimum confidence to emit a gesture when BOTH arms agree
 #                      (lower than single-arm threshold because agreement strengthens prediction)
 #   SINGLE_THRESHOLD — minimum confidence to emit when only one arm is available/confident
 DUAL_ARM_AGREE_THRESHOLD  = 0.55
-DUAL_ARM_SINGLE_THRESHOLD = 0.40   # matches MIN_CONFIDENCE above
+DUAL_ARM_SINGLE_THRESHOLD = 0.65   # matches MIN_CONFIDENCE above
 # =================================
+
+# ======== Per-gesture calibration ========
+# Collect a short sample of each gesture before inference to fine-tune
+# the model's classification head for this specific subject.
+# Requires CALIBRATE = True (needs filter_obj and MVC normalization).
+GESTURE_CALIB        = True
+GESTURE_CALIB_S      = 3.0   # seconds of EMG to collect per gesture
+GESTURE_CALIB_PREP_S = 2.0   # countdown pause before each gesture
+
+GESTURE_LABELS = ["neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"]
+
+GESTURE_INSTRUCTIONS = {
+    "neutral":      "relax completely (rest position)",
+    "left_turn":    "perform LEFT TURN gesture",
+    "right_turn":   "perform RIGHT TURN gesture",
+    "signal_left":  "perform SIGNAL LEFT gesture",
+    "signal_right": "perform SIGNAL RIGHT gesture",
+    "horn":         "perform HORN gesture",
+}
+# ==========================================
 
 # ======== Inference mode ========
 # Set MODE to control which arm(s) run inference:
@@ -74,21 +94,30 @@ class _StreamingHandler:
 
 def define_filters(fs):
     """
-    Old libEMG filtering stack:
-    - Notch @ 60 Hz (bandwidth 3)
-    - Bandpass 20-450 Hz (order 4)
+    libEMG filtering stack (must match emg/filtering.py exactly):
+    - Notch @ 60 Hz  (bandwidth 3) — power line fundamental
+    - Notch @ 120 Hz (bandwidth 3) — 2nd power line harmonic
+    - Bandpass 20-450 Hz (order 6)
     """
     fi = libemg_filter.Filter(fs)
-    notch = {"name": "notch", "cutoff": 60, "bandwidth": 3}
-    bandpass = {"name": "bandpass", "cutoff": [20, 450], "order": 4}
-    fi.install_filters(notch)
-    fi.install_filters(bandpass)
+    fi.install_filters({"name": "notch",    "cutoff": 60,        "bandwidth": 3})
+    fi.install_filters({"name": "notch",    "cutoff": 120,       "bandwidth": 3})
+    fi.install_filters({"name": "bandpass", "cutoff": [20, 450], "order": 6})
     return fi
 
 
 def apply_filters(fi, emg):
     filtered_data = fi.filter(emg)
     return np.array(filtered_data, dtype=float)
+
+
+def _make_windows(emg, window_size=WINDOW_SIZE, step=WINDOW_STEP):
+    """Slide a window over emg (N_samples, C) → ndarray (N_windows, C, window_size)."""
+    n = len(emg)
+    starts = list(range(0, n - window_size + 1, step))
+    if not starts:
+        return np.empty((0, emg.shape[1], window_size), dtype=np.float32)
+    return np.stack([emg[s:s + window_size].T for s in starts]).astype(np.float32)
 
 
 def _pair_time_value(sample):
@@ -398,6 +427,71 @@ def main(argv=None):
         # Single-arm compat aliases
         neutral_mean = neutral_mean_right
         mvc_scale    = mvc_scale_right
+
+    if CALIBRATE and GESTURE_CALIB and filter_obj is not None:
+        print("\n=== Per-gesture calibration ===")
+        print(f"Perform each gesture for {GESTURE_CALIB_S:.0f}s when prompted.\n")
+
+        label_to_idx_r = {v: k for k, v in bundle_right.index_to_label.items()}
+        label_to_idx_l = {v: k for k, v in bundle_left.index_to_label.items()} if dual_arm else {}
+
+        wins_r, labs_r = [], []
+        wins_l, labs_l = [], []
+
+        for gesture in GESTURE_LABELS:
+            if gesture not in label_to_idx_r:
+                continue
+            instr = GESTURE_INSTRUCTIONS.get(gesture, gesture)
+            if GESTURE_CALIB_PREP_S > 0:
+                print(f"Next: {instr}  —  get ready ({GESTURE_CALIB_PREP_S:.0f}s)...")
+                time.sleep(GESTURE_CALIB_PREP_S)
+            print(f"GO: {instr}")
+
+            samples, _ = _collect_samples(
+                handler, GESTURE_CALIB_S, stream_channels, None, poll_sleep
+            )
+            if samples.size == 0:
+                print(f"  Warning: no samples for '{gesture}', skipping.")
+                continue
+
+            # Right arm
+            r_raw = samples[:, :RIGHT_ARM_CHANNELS] if dual_arm else samples[:, :model_channels]
+            r_filt = apply_filters(filter_obj, r_raw)
+            if neutral_mean_right is not None and mvc_scale_right is not None:
+                r_filt = (r_filt - neutral_mean_right) / mvc_scale_right
+            w_r = _make_windows(r_filt)
+            if len(w_r):
+                wins_r.append(w_r)
+                labs_r.extend([label_to_idx_r[gesture]] * len(w_r))
+                print(f"  Right: {len(w_r)} windows collected")
+
+            # Left arm (dual-arm only)
+            if dual_arm and gesture in label_to_idx_l:
+                l_raw = samples[:, RIGHT_ARM_CHANNELS:RIGHT_ARM_CHANNELS + left_channels]
+                l_filt = apply_filters(filter_obj, l_raw)
+                if neutral_mean_left is not None and mvc_scale_left is not None:
+                    l_filt = (l_filt - neutral_mean_left) / mvc_scale_left
+                w_l = _make_windows(l_filt)
+                if len(w_l):
+                    wins_l.append(w_l)
+                    labs_l.extend([label_to_idx_l[gesture]] * len(w_l))
+                    print(f"  Left:  {len(w_l)} windows collected")
+
+        if wins_r:
+            X_r = np.concatenate(wins_r, axis=0)
+            y_r = np.array(labs_r, dtype=np.int64)
+            print(f"\nFine-tuning right arm model ({len(y_r)} windows)...")
+            quick_finetune(bundle_right, X_r, y_r, device=device)
+            print("  Right arm model updated.")
+
+        if dual_arm and wins_l:
+            X_l = np.concatenate(wins_l, axis=0)
+            y_l = np.array(labs_l, dtype=np.int64)
+            print(f"Fine-tuning left arm model ({len(y_l)} windows)...")
+            quick_finetune(bundle_left, X_l, y_l, device=device)
+            print("  Left arm model updated.")
+
+        print("\n=== Gesture calibration complete. Starting inference... ===\n")
 
     buffer_len = WINDOW_SIZE + FILTER_WARMUP
 
