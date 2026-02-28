@@ -32,9 +32,19 @@ NEUTRAL_LABELS = {"neutral", "neutral_buffer"}
 ACTIVE_LABELS  = {"horn", "left_turn", "right_turn", "signal_left", "signal_right"}
 
 
+def _as_2d_channels(arr, name: str) -> np.ndarray:
+    """Return array as shape (N, C), preserving channel axis semantics."""
+    out = np.asarray(arr, dtype=float)
+    if out.ndim == 1:
+        return out[np.newaxis, :]
+    if out.ndim == 2:
+        return out
+    raise ValueError(f"{name} must be 1D or 2D, got shape {out.shape}")
+
+
 def _mvc_ratio(neutral_emg, mvc_emg):
-    neutral = np.asarray(neutral_emg, dtype=float)
-    mvc     = np.asarray(mvc_emg, dtype=float)
+    neutral = _as_2d_channels(neutral_emg, "neutral_emg")
+    mvc     = _as_2d_channels(mvc_emg, "mvc_emg")
     n_rms   = np.sqrt(np.mean(neutral ** 2, axis=0))
     m_rms   = np.sqrt(np.mean(mvc ** 2, axis=0))
     ratio   = np.where(n_rms < 1e-9, 1.0, m_rms / n_rms)
@@ -114,7 +124,18 @@ def process_file(fp: Path, threshold: float, apply: bool, restore: bool):
         print(f"    -> cannot recalibrate: {err}")
         return
 
-    new_ratio        = _mvc_ratio(new_neutral[np.newaxis], new_scale[np.newaxis])
+    # Store calibration summaries as single-row arrays so downstream code
+    # (which averages over axis=0) still treats channels correctly.
+    new_neutral = _as_2d_channels(new_neutral, "new_neutral")
+    new_scale   = _as_2d_channels(new_scale, "new_scale")
+    if new_neutral.shape[1] != new_scale.shape[1]:
+        print(
+            "    -> cannot recalibrate: channel mismatch "
+            f"(neutral={new_neutral.shape[1]}, mvc={new_scale.shape[1]})"
+        )
+        return
+
+    new_ratio        = _mvc_ratio(new_neutral, new_scale)
     new_median_ratio = float(np.median(new_ratio))
     print(
         f"    -> data-driven recalibration: ratio={new_median_ratio:.2f}x "
@@ -128,7 +149,7 @@ def process_file(fp: Path, threshold: float, apply: bool, restore: bool):
             new_data["calib_neutral_emg_original"] = np.asarray(neutral_emg)
             new_data["calib_mvc_emg_original"]     = np.asarray(mvc_emg)
         new_data[neutral_key] = new_neutral
-        new_data[mvc_key]     = new_scale[np.newaxis]  # keep (1, channels) shape for compat
+        new_data[mvc_key]     = new_scale
         np.savez_compressed(fp, **new_data)
         print(f"    -> WRITTEN to {fp.name}")
     else:

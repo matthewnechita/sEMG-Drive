@@ -397,14 +397,16 @@ def main(argv=None):
                 retry = input("Retry calibration? [y/N]: ").strip().lower()
                 if retry == "y":
                     continue
+                print(
+                    f"[{arm_label}] Calibration quality below threshold; "
+                    "MVC normalization disabled for this arm to match training policy."
+                )
+                return None, None
 
             n_mean  = np.mean(neutral_f, axis=0)
             m_scale = np.percentile(mvc_f, MVC_PERCENTILE, axis=0)
             m_scale = np.where(m_scale < 1e-6, 1.0, m_scale)
-            if median_ratio < MVC_MIN_RATIO:
-                print(f"[{arm_label}] Calibration accepted with quality warning.")
-            else:
-                print(f"[{arm_label}] Calibration complete. (quality: {median_ratio:.1f}x)")
+            print(f"[{arm_label}] Calibration complete. (quality: {median_ratio:.1f}x)")
             return n_mean, m_scale
 
         return None, None  # unreachable but keeps linter happy
@@ -592,7 +594,7 @@ def main(argv=None):
             inference_ran = False
             label_right = LOW_CONFIDENCE_LABEL
             conf_right  = 0.0
-            while warmup_right and pending_right >= WINDOW_STEP and len(raw_buffer_right) >= WINDOW_SIZE:
+            if warmup_right and pending_right >= WINDOW_STEP and len(raw_buffer_right) >= WINDOW_SIZE:
                 raw = np.asarray(raw_buffer_right, dtype=float)
                 filtered_full = apply_filters(filter_obj, raw)
                 filtered = filtered_full[-WINDOW_SIZE:]
@@ -614,13 +616,15 @@ def main(argv=None):
                     label_right = LOW_CONFIDENCE_LABEL
 
                 inference_ran = True
-                pending_right -= WINDOW_STEP
+                # We intentionally keep only the newest inference point and
+                # drop backlog to avoid re-scoring the same latest window.
+                pending_right = 0
 
             # --- inference: left arm (dual-arm mode only) ---
             label_left = LOW_CONFIDENCE_LABEL
             conf_left  = 0.0
             if dual_arm:
-                while warmup_left and pending_left >= WINDOW_STEP and len(raw_buffer_left) >= WINDOW_SIZE:
+                if warmup_left and pending_left >= WINDOW_STEP and len(raw_buffer_left) >= WINDOW_SIZE:
                     raw = np.asarray(raw_buffer_left, dtype=float)
                     filtered_full = apply_filters(filter_obj, raw)
                     filtered = filtered_full[-WINDOW_SIZE:]
@@ -642,7 +646,8 @@ def main(argv=None):
                         label_left = LOW_CONFIDENCE_LABEL
 
                     inference_ran = True
-                    pending_left -= WINDOW_STEP
+                    # Same backlog policy as right arm: latest window only.
+                    pending_left = 0
 
             # --- fusion and output ---
             if inference_ran:
