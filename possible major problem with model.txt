@@ -211,3 +211,16 @@
   Better temporal smoothing
 
   so how do you fix this in hte code?
+
+  just tell me the best option for fixing real quick
+
+
+• Best quick fix: add a neutral override margin in realtime (no retrain needed).
+
+  Use this rule after probs are smoothed:
+
+  - If top class is neutral, but best non-neutral class is within a small gap (e.g. 0.10–0.15) and is above
+    MIN_CONFIDENCE, emit the non-neutral class instead.
+  - Also reduce SMOOTHING from 11 to about 5 for faster transitions.
+
+  This directly targets your current failure mode: neutral acting as a fallback sink.
