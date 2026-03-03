@@ -33,7 +33,7 @@ from emg.gesture_model_cnn import GestureCNNv2
 # ======== Config ========
 ARM        = "right"           # ← set to "right" or "left" before running
 DATA_ROOT  = Path("data") / f"{ARM} arm"
-MODEL_OUT  = Path("models/cross_subject") / ARM / "gesture_cnn_v2.pt"
+MODEL_OUT  = Path("models/cross_subject") / ARM / "gesture_cnn_v2_exclude_gestures.pt"
 PATTERN    = "*_filtered.npz"
 
 WINDOW_SIZE = 200
@@ -52,7 +52,7 @@ BATCH_SIZE   = 512
 # GestureCNNv2 at 503K params on ~122K training windows = ~4 params/sample.
 # More epochs than per-subject: larger model + larger dataset benefits from
 # longer training. Convergence argument, not wall-clock.
-EPOCHS  = 100
+EPOCHS  = 78
 LR      = 1e-4
 DROPOUT = 0.3
 
@@ -69,6 +69,12 @@ AUG_PROB  = 0.5
 # subject05: all 4 sessions have mvc_ratio <= 1.8x (MVC barely > neutral).
 # This corrupts the MVC normalisation; recollect before re-including.
 EXCLUDED_SUBJECTS: list[str] = []
+
+# Optional gesture filtering (code-only; no CLI flags).
+# Set INCLUDED_GESTURES to a subset to train only those labels.
+# Example:
+# INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"} example
+INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn"} # set to = None to include all gestures
 
 # LOSO evaluation must be run before deploying the cross-subject model.
 # This measures true cross-subject accuracy (model vs subjects it never trained on).
@@ -167,6 +173,15 @@ def subject_from_path(path: Path) -> str:
     return path.parent.parent.name
 
 
+def _keep_gesture_label(label) -> bool:
+    if label is None:
+        return False
+    label = str(label)
+    if INCLUDED_GESTURES is not None and label not in INCLUDED_GESTURES:
+        return False
+    return True
+
+
 def load_windows_from_file(path):
     data = np.load(path, allow_pickle=True)
     if "emg" not in data.files or "y" not in data.files:
@@ -197,6 +212,8 @@ def load_windows_from_file(path):
             lbl = None
         if USE_MIN_LABEL_CONFIDENCE and lbl is not None and confidence < MIN_LABEL_CONFIDENCE:
             lbl = None
+        if lbl is not None and not _keep_gesture_label(lbl):
+            lbl = None
         window_labels.append(lbl)
 
     window_labels = np.asarray(window_labels, dtype=object)
@@ -213,6 +230,9 @@ def load_dataset():
     files = sorted(DATA_ROOT.rglob(PATTERN))
     if not files:
         raise FileNotFoundError(f"No filtered files found under {DATA_ROOT}")
+
+    if INCLUDED_GESTURES is not None:
+        print(f"Including gestures only: {sorted(INCLUDED_GESTURES)}")
 
     if EXCLUDED_SUBJECTS:
         files = [f for f in files if subject_from_path(f) not in EXCLUDED_SUBJECTS]
@@ -568,6 +588,7 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
             "stream": "cross_subject",
             "subject": None,
             "excluded_subjects": list(EXCLUDED_SUBJECTS),
+            "included_gestures": sorted(INCLUDED_GESTURES) if INCLUDED_GESTURES is not None else None,
             "window_size_samples": WINDOW_SIZE,
             "window_step_samples": WINDOW_STEP,
             "channel_count": int(channel_count),
@@ -623,6 +644,10 @@ def main():
     )
 
     labels         = sorted({str(lbl) for lbl in np.unique(y)})
+    if INCLUDED_GESTURES is not None:
+        missing = sorted(set(INCLUDED_GESTURES) - set(labels))
+        if missing:
+            print(f"WARNING: requested INCLUDED_GESTURES not found in dataset: {missing}")
     label_to_index = {label: idx for idx, label in enumerate(labels)}
     index_to_label = {idx: label for label, idx in label_to_index.items()}
     y_idx          = np.array([label_to_index[str(lbl)] for lbl in y], dtype=np.int64)

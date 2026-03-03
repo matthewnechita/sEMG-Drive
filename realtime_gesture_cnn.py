@@ -58,6 +58,11 @@ GESTURE_CALIB        = False  # opt-in: bad/misaligned live labels can hurt the 
 GESTURE_CALIB_S      = 3.0   # seconds of EMG to collect per gesture
 GESTURE_CALIB_PREP_S = 2.0   # countdown pause before each gesture
 
+# Optional runtime gesture filtering (code-only; no CLI flags).
+# Example (3-class mode):
+# INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"} example
+INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"} # set = None to include all gestures
+
 GESTURE_LABELS = ["neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"]
 
 GESTURE_INSTRUCTIONS = {
@@ -193,6 +198,50 @@ def fuse_predictions(label_r, conf_r, label_l, conf_l):
     return LOW_CONFIDENCE_LABEL, 0.0
 
 
+def _canonical_label_map(index_to_label):
+    """Normalise bundle label maps to {int_index: str_label}."""
+    canonical = {}
+    for idx, label in index_to_label.items():
+        canonical[int(idx)] = str(label)
+    return canonical
+
+
+def _resolve_allowed_labels(index_to_label, arm_name):
+    """Resolve the active label subset for one arm."""
+    model_labels = {str(label) for label in index_to_label.values()}
+
+    if INCLUDED_GESTURES is None:
+        allowed_labels = set(model_labels)
+    else:
+        requested = {str(label) for label in INCLUDED_GESTURES}
+        missing = sorted(requested - model_labels)
+        if missing:
+            print(f"[gesture:{arm_name}] INCLUDED_GESTURES missing from model and ignored: {missing}")
+        allowed_labels = requested & model_labels
+
+    if not allowed_labels:
+        raise ValueError(f"No labels left for {arm_name} arm after applying INCLUDED_GESTURES.")
+
+    allowed_indices = {idx for idx, label in index_to_label.items() if label in allowed_labels}
+    print(f"[gesture:{arm_name}] active labels: {sorted(allowed_labels)}")
+    return allowed_labels, allowed_indices
+
+
+def _restrict_probs(probs, allowed_indices):
+    """Zero out disallowed classes, then renormalize over allowed classes."""
+    if len(allowed_indices) >= len(probs):
+        return probs
+    filtered = np.array(probs, dtype=float, copy=True)
+    mask = np.zeros_like(filtered, dtype=bool)
+    idx = np.array(sorted(allowed_indices), dtype=int)
+    mask[idx] = True
+    filtered[~mask] = 0.0
+    total = float(filtered.sum())
+    if total > 0.0:
+        filtered /= total
+    return filtered
+
+
 def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_sleep):
     samples = []
     times = []
@@ -303,15 +352,26 @@ def main(argv=None):
     print("[gesture] right arm model:", model_right_path)
     bundle_right  = load_cnn_bundle(model_right_path, device=device)
     model_channels = bundle_right.channel_count   # kept for single-arm compat
+    index_to_label_right = _canonical_label_map(bundle_right.index_to_label)
+    allowed_labels_right, allowed_indices_right = _resolve_allowed_labels(
+        index_to_label_right, "right"
+    )
 
     # Left arm bundle (dual-arm mode only)
     dual_arm = model_left_path is not None
     bundle_left   = None
     left_channels = 0
+    index_to_label_left = {}
+    allowed_labels_left = set()
+    allowed_indices_left = set()
     if dual_arm:
         print("[gesture] left arm model:", model_left_path)
         bundle_left   = load_cnn_bundle(model_left_path, device=device)
         left_channels = bundle_left.channel_count
+        index_to_label_left = _canonical_label_map(bundle_left.index_to_label)
+        allowed_labels_left, allowed_indices_left = _resolve_allowed_labels(
+            index_to_label_left, "left"
+        )
         print(f"[gesture] dual-arm mode | right={RIGHT_ARM_CHANNELS}ch left={left_channels}ch")
     else:
         print("[gesture] single-arm mode")
@@ -498,14 +558,24 @@ def main(argv=None):
         print("\n=== Per-gesture calibration ===")
         print(f"Perform each gesture for {GESTURE_CALIB_S:.0f}s when prompted.\n")
 
-        label_to_idx_r = {v: k for k, v in bundle_right.index_to_label.items()}
-        label_to_idx_l = {v: k for k, v in bundle_left.index_to_label.items()} if dual_arm else {}
+        label_to_idx_r = {label: idx for idx, label in index_to_label_right.items()}
+        label_to_idx_l = {label: idx for idx, label in index_to_label_left.items()} if dual_arm else {}
 
         wins_r, labs_r = [], []
         wins_l, labs_l = [], []
 
+        gestures_for_calibration = []
         for gesture in GESTURE_LABELS:
-            if gesture not in label_to_idx_r:
+            if gesture in allowed_labels_right:
+                gestures_for_calibration.append(gesture)
+                continue
+            if dual_arm and gesture in allowed_labels_left:
+                gestures_for_calibration.append(gesture)
+
+        if not gestures_for_calibration:
+            print("No gesture labels available for calibration after filter settings.")
+        for gesture in gestures_for_calibration:
+            if gesture not in label_to_idx_r and (not dual_arm or gesture not in label_to_idx_l):
                 continue
             instr = GESTURE_INSTRUCTIONS.get(gesture, gesture)
             if GESTURE_CALIB_PREP_S > 0:
@@ -536,13 +606,13 @@ def main(argv=None):
                 )
                 r_filt = (r_filt - neutral_mean_right) / mvc_scale_right
             w_r = _make_windows(r_filt)
-            if len(w_r):
+            if len(w_r) and gesture in label_to_idx_r and gesture in allowed_labels_right:
                 wins_r.append(w_r)
                 labs_r.extend([label_to_idx_r[gesture]] * len(w_r))
                 print(f"  Right: {len(w_r)} windows collected")
 
             # Left arm (dual-arm only)
-            if dual_arm and gesture in label_to_idx_l:
+            if dual_arm and gesture in label_to_idx_l and gesture in allowed_labels_left:
                 l_raw = _slice_channels(samples, RIGHT_ARM_CHANNELS, left_channels)
                 l_filt = apply_filters(filter_obj, l_raw)
                 if neutral_mean_left is not None and mvc_scale_left is not None:
@@ -683,6 +753,7 @@ def main(argv=None):
                 window = filtered.T[np.newaxis, :, :].astype(np.float32)
                 window = bundle_right.standardize(window)
                 probs  = bundle_right.predict_proba(window)[0]
+                probs  = _restrict_probs(probs, allowed_indices_right)
 
                 pred_history_right.append(probs)
                 if SMOOTHING > 1:
@@ -690,7 +761,7 @@ def main(argv=None):
 
                 conf_right  = float(np.max(probs))
                 pred_idx    = int(np.argmax(probs))
-                label_right = bundle_right.index_to_label[pred_idx]
+                label_right = index_to_label_right.get(pred_idx, LOW_CONFIDENCE_LABEL)
                 if conf_right < MIN_CONFIDENCE:
                     label_right = LOW_CONFIDENCE_LABEL
 
@@ -716,6 +787,7 @@ def main(argv=None):
                     window = filtered.T[np.newaxis, :, :].astype(np.float32)
                     window = bundle_left.standardize(window)
                     probs  = bundle_left.predict_proba(window)[0]
+                    probs  = _restrict_probs(probs, allowed_indices_left)
 
                     pred_history_left.append(probs)
                     if SMOOTHING > 1:
@@ -723,7 +795,7 @@ def main(argv=None):
 
                     conf_left  = float(np.max(probs))
                     pred_idx   = int(np.argmax(probs))
-                    label_left = bundle_left.index_to_label[pred_idx]
+                    label_left = index_to_label_left.get(pred_idx, LOW_CONFIDENCE_LABEL)
                     if conf_left < MIN_CONFIDENCE:
                         label_left = LOW_CONFIDENCE_LABEL
 
