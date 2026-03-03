@@ -67,9 +67,9 @@ GESTURE_CALIB_S      = 5.0   # seconds of EMG to collect per gesture
 GESTURE_CALIB_PREP_S = 2.0   # countdown pause before each gesture
 
 # Optional runtime gesture filtering (code-only; no CLI flags).
-# Example (3-class mode):co0iuu6
-# INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"} example
-INCLUDED_GESTURES = None # set = None to include all gestures
+# Example (3-class mode):
+# INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"}
+INCLUDED_GESTURES = None  # set to None to include all gestures from the model
 
 GESTURE_LABELS = ["neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"]
 
@@ -85,14 +85,13 @@ GESTURE_INSTRUCTIONS = {
 
 # ======== Inference mode ========
 # Set MODE to control which arm(s) run inference:
-#   "right" — right arm only  (pair right arm sensors first in Delsys)
-#   "left"  — left arm only   (pair left arm sensors first in Delsys)
-#   "dual"  — both arms fused (pair right first, then left in Delsys)
+#   "right" - right arm only  (pair right arm sensors first in Delsys)
+#   "left"  - left arm only   (pair left arm sensors first in Delsys)
+#   "dual"  - both arms fused (pair right first, then left in Delsys)
 MODE        = "right"
 MODEL_RIGHT = "models/cross_subject/right/gesture_cnn_v2.pt"
 MODEL_LEFT  = "models/cross_subject/left/gesture_cnn_v2.pt"
 # ================================
-
 
 class _StreamingHandler:
     def __init__(self):
