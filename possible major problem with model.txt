@@ -224,3 +224,32 @@
   - Also reduce SMOOTHING from 11 to about 5 for faster transitions.
 
   This directly targets your current failure mode: neutral acting as a fallback sink.
+
+   can you do an analysis of what would be the best overall and long term fix that would resolve this problem ideally
+  completely and also ideally also resolve it if I reintroduced the other gestures?
+
+
+• Best overall long-term fix is: switch to a two-stage realtime pipeline on top of timestamp-aligned data.
+
+  1. Fix the data foundation first (highest priority)
+     Resample all channels by timestamp to one common rate (e.g., 2000 Hz) in both training and realtime.
+     If train and realtime are not time-aligned the same way, neutral overprediction will keep happening.
+  2. Use a 2-stage model instead of one flat 6-class model
+     Stage A: neutral vs active (binary).
+     Stage B: classify only active gestures (left_turn/right_turn/...).
+     This prevents neutral from absorbing everything and scales much better when you re-add all gestures.
+  3. Handle transition windows explicitly
+     Keep low-confidence transition windows out of gesture training (or label as unknown/transition reject).
+     Most neutral bias comes from ambiguous boundary windows.
+  4. Replace single global confidence gate with temporal hysteresis
+     Enter gesture with higher threshold, exit with lower threshold (state machine), instead of pure moving average +
+     one threshold.
+     This reduces flicker and neutral fallback.
+  5. Tune for recall targets, not just accuracy
+     Select models by macro recall / per-class recall floors (especially left/right), not only total accuracy.
+  6. Use class-sensitive loss for long-term stability
+     Weighted focal/cost-sensitive loss so missed turns are penalized more than extra neutral predictions.
+
+  If you want one “big” fix that most directly solves your current issue and still works when all gestures return: (1)
+  timestamp resampling consistency + (2) two-stage neutral/active architecture + hysteresis decoder.
+  That is the highest-leverage path.
