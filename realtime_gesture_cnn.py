@@ -28,10 +28,10 @@ REALTIME_RESAMPLE = True
 REALTIME_TARGET_FS_HZ = 2000.0
 
 SMOOTHING = 7   # modestly stronger temporal stability to reduce left/right flicker
-MIN_CONFIDENCE = 0.35  # slightly looser gate to reduce neutral fallback on turns
+MIN_CONFIDENCE = 0.55  # slightly looser gate to reduce neutral fallback on turns
 LOW_CONFIDENCE_LABEL = "neutral"
 ENABLE_NEUTRAL_OVERRIDE = True
-NEUTRAL_OVERRIDE_MARGIN = 0.15
+NEUTRAL_OVERRIDE_MARGIN = 0.25
 NEUTRAL_OVERRIDE_MIN_CONFIDENCE = MIN_CONFIDENCE
 
 LATEST_LOCK = threading.Lock()
@@ -69,7 +69,7 @@ GESTURE_CALIB_PREP_S = 2.0   # countdown pause before each gesture
 # Optional runtime gesture filtering (code-only; no CLI flags).
 # Example (3-class mode):
 # INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"}
-INCLUDED_GESTURES = None  # set to None to include all gestures from the model
+INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn", "signal_left", "signal_right"}  # set to None to include all gestures from the model
 
 GESTURE_LABELS = ["neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"]
 
