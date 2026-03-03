@@ -22,8 +22,8 @@ WINDOW_SIZE = 200
 WINDOW_STEP = 100
 FILTER_WARMUP = 200  # extra samples to stabilize old libEMG filtering on rolling buffers
 
-SMOOTHING = 11  # number of windows to average (~550ms at 2kHz/step-100)
-MIN_CONFIDENCE = 0.65  # for 6 classes, 40% was too low to gate uncertainty
+SMOOTHING = 11  # tuned for 6-class stability (~500 ms at ~2.2 kHz with step=100)
+MIN_CONFIDENCE = 0.40  # confidence gate tuned for lower false positives
 LOW_CONFIDENCE_LABEL = "neutral"
 
 LATEST_LOCK = threading.Lock()
@@ -47,14 +47,14 @@ RIGHT_ARM_CHANNELS = 17   # fixed: 6 right arm sensors → 17 channels
 #                      (lower than single-arm threshold because agreement strengthens prediction)
 #   SINGLE_THRESHOLD — minimum confidence to emit when only one arm is available/confident
 DUAL_ARM_AGREE_THRESHOLD  = 0.55
-DUAL_ARM_SINGLE_THRESHOLD = 0.65   # matches MIN_CONFIDENCE above
+DUAL_ARM_SINGLE_THRESHOLD = MIN_CONFIDENCE
 # =================================
 
 # ======== Per-gesture calibration ========
 # Collect a short sample of each gesture before inference to fine-tune
 # the model's classification head for this specific subject.
 # Requires CALIBRATE = True (needs filter_obj and MVC normalization).
-GESTURE_CALIB        = True
+GESTURE_CALIB        = False  # opt-in: bad/misaligned live labels can hurt the head
 GESTURE_CALIB_S      = 3.0   # seconds of EMG to collect per gesture
 GESTURE_CALIB_PREP_S = 2.0   # countdown pause before each gesture
 
@@ -230,6 +230,47 @@ def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_
     return np.asarray(samples, dtype=float), np.asarray(times, dtype=float)
 
 
+def _align_calibration_vectors(neutral_mean, mvc_scale, target_channels, arm_label):
+    """Trim/pad calibration vectors to match current filtered channel count."""
+    if neutral_mean is not None:
+        neutral_mean = np.asarray(neutral_mean, dtype=float).reshape(-1)
+    if mvc_scale is not None:
+        mvc_scale = np.asarray(mvc_scale, dtype=float).reshape(-1)
+
+    if neutral_mean is not None and neutral_mean.size != target_channels:
+        old = neutral_mean.size
+        if old > target_channels:
+            neutral_mean = neutral_mean[:target_channels]
+        else:
+            neutral_mean = np.pad(neutral_mean, (0, target_channels - old), mode="constant", constant_values=0.0)
+        print(f"[calib:{arm_label}] adjusted neutral_mean channels {old} -> {target_channels}")
+
+    if mvc_scale is not None and mvc_scale.size != target_channels:
+        old = mvc_scale.size
+        if old > target_channels:
+            mvc_scale = mvc_scale[:target_channels]
+        else:
+            mvc_scale = np.pad(mvc_scale, (0, target_channels - old), mode="constant", constant_values=1.0)
+        print(f"[calib:{arm_label}] adjusted mvc_scale channels {old} -> {target_channels}")
+
+    return neutral_mean, mvc_scale
+
+
+def _slice_channels(batch_arr, start, target_channels):
+    """Return a fixed-width channel slice using zero-pad for missing channels."""
+    out = batch_arr[:, start:start + target_channels]
+    if out.shape[1] < target_channels:
+        out = np.pad(
+            out,
+            ((0, 0), (0, target_channels - out.shape[1])),
+            mode="constant",
+            constant_values=0.0,
+        )
+    elif out.shape[1] > target_channels:
+        out = out[:, :target_channels]
+    return out
+
+
 def main(argv=None):
     if MODE not in ("right", "left", "dual"):
         raise ValueError(f"MODE must be 'right', 'left', or 'dual', got {MODE!r}")
@@ -318,10 +359,15 @@ def main(argv=None):
     else:
         required = left_arm_start + model_channels
         if stream_channels < required:
-            print(
-                f"Channel count mismatch: need {required} channels "
+            raise RuntimeError(
+                f"Channel count mismatch: need at least {required} stream channels "
                 f"(model expects {model_channels} at offset {left_arm_start}), "
-                f"stream has {stream_channels}; padding/trimming."
+                f"but stream has {stream_channels}. Fix sensor pairing/mode before inference."
+            )
+        if stream_channels != required:
+            print(
+                f"Stream has {stream_channels} channels; using slice "
+                f"[{left_arm_start}:{left_arm_start + model_channels}] for model input."
             )
 
     base.TrigBase.Start(handler.streamYTData)
@@ -385,18 +431,19 @@ def main(argv=None):
 
             # Slice to this arm's channels if collecting full stream
             if collect_channels is None:
-                n_arr = n_samples[:, channel_start:channel_start + arm_channels]
-                m_arr = m_samples[:, channel_start:channel_start + arm_channels]
+                n_arr = _slice_channels(n_samples, channel_start, arm_channels)
+                m_arr = _slice_channels(m_samples, channel_start, arm_channels)
             else:
-                n_arr = n_samples
-                m_arr = m_samples
+                n_arr = _slice_channels(n_samples, 0, arm_channels)
+                m_arr = _slice_channels(m_samples, 0, arm_channels)
 
             neutral_f = apply_filters(filter_obj, n_arr)
             mvc_f     = apply_filters(filter_obj, m_arr)
 
             neutral_rms = np.sqrt(np.mean(neutral_f ** 2, axis=0))
             mvc_rms     = np.sqrt(np.mean(mvc_f     ** 2, axis=0))
-            ratio       = np.where(neutral_rms < 1e-9, 1.0, mvc_rms / neutral_rms)
+            ratio = np.ones_like(mvc_rms, dtype=float)
+            np.divide(mvc_rms, neutral_rms, out=ratio, where=neutral_rms >= 1e-9)
             median_ratio = float(np.median(ratio))
             n_weak       = int(np.sum(ratio < MVC_MIN_RATIO))
             print(
@@ -466,17 +513,27 @@ def main(argv=None):
                 time.sleep(GESTURE_CALIB_PREP_S)
             print(f"GO: {instr}")
 
+            gesture_collect_channels = None
+            if not dual_arm and left_arm_start == 0:
+                # Single-arm right mode: keep calibration collection aligned with model input width.
+                gesture_collect_channels = model_channels
             samples, _ = _collect_samples(
-                handler, GESTURE_CALIB_S, stream_channels, None, poll_sleep
+                handler, GESTURE_CALIB_S, stream_channels, gesture_collect_channels, poll_sleep
             )
             if samples.size == 0:
                 print(f"  Warning: no samples for '{gesture}', skipping.")
                 continue
 
             # Right arm
-            r_raw = samples[:, :RIGHT_ARM_CHANNELS] if dual_arm else samples[:, left_arm_start:left_arm_start + model_channels]
+            if dual_arm:
+                r_raw = _slice_channels(samples, 0, RIGHT_ARM_CHANNELS)
+            else:
+                r_raw = _slice_channels(samples, left_arm_start, model_channels)
             r_filt = apply_filters(filter_obj, r_raw)
             if neutral_mean_right is not None and mvc_scale_right is not None:
+                neutral_mean_right, mvc_scale_right = _align_calibration_vectors(
+                    neutral_mean_right, mvc_scale_right, r_filt.shape[1], "right"
+                )
                 r_filt = (r_filt - neutral_mean_right) / mvc_scale_right
             w_r = _make_windows(r_filt)
             if len(w_r):
@@ -486,9 +543,12 @@ def main(argv=None):
 
             # Left arm (dual-arm only)
             if dual_arm and gesture in label_to_idx_l:
-                l_raw = samples[:, RIGHT_ARM_CHANNELS:RIGHT_ARM_CHANNELS + left_channels]
+                l_raw = _slice_channels(samples, RIGHT_ARM_CHANNELS, left_channels)
                 l_filt = apply_filters(filter_obj, l_raw)
                 if neutral_mean_left is not None and mvc_scale_left is not None:
+                    neutral_mean_left, mvc_scale_left = _align_calibration_vectors(
+                        neutral_mean_left, mvc_scale_left, l_filt.shape[1], "left"
+                    )
                     l_filt = (l_filt - neutral_mean_left) / mvc_scale_left
                 w_l = _make_windows(l_filt)
                 if len(w_l):
@@ -579,10 +639,10 @@ def main(argv=None):
 
             # --- split channels by arm ---
             if dual_arm:
-                batch_right = batch_arr[:, :RIGHT_ARM_CHANNELS]
-                batch_left = batch_arr[:, RIGHT_ARM_CHANNELS:RIGHT_ARM_CHANNELS + left_channels]
+                batch_right = _slice_channels(batch_arr, 0, RIGHT_ARM_CHANNELS)
+                batch_left = _slice_channels(batch_arr, RIGHT_ARM_CHANNELS, left_channels)
             else:
-                batch_right = batch_arr[:, left_arm_start:left_arm_start + model_channels]
+                batch_right = _slice_channels(batch_arr, left_arm_start, model_channels)
 
             # --- old approach: raw rolling buffers + libEMG filtering ---
             for s in batch_right:
@@ -615,6 +675,9 @@ def main(argv=None):
                 filtered_full = apply_filters(filter_obj, raw)
                 filtered = filtered_full[-WINDOW_SIZE:]
                 if neutral_mean_right is not None and mvc_scale_right is not None:
+                    neutral_mean_right, mvc_scale_right = _align_calibration_vectors(
+                        neutral_mean_right, mvc_scale_right, filtered.shape[1], "right"
+                    )
                     filtered = (filtered - neutral_mean_right) / mvc_scale_right
 
                 window = filtered.T[np.newaxis, :, :].astype(np.float32)
@@ -645,6 +708,9 @@ def main(argv=None):
                     filtered_full = apply_filters(filter_obj, raw)
                     filtered = filtered_full[-WINDOW_SIZE:]
                     if neutral_mean_left is not None and mvc_scale_left is not None:
+                        neutral_mean_left, mvc_scale_left = _align_calibration_vectors(
+                            neutral_mean_left, mvc_scale_left, filtered.shape[1], "left"
+                        )
                         filtered = (filtered - neutral_mean_left) / mvc_scale_left
 
                     window = filtered.T[np.newaxis, :, :].astype(np.float32)
