@@ -22,9 +22,17 @@ WINDOW_SIZE = 200
 WINDOW_STEP = 100
 FILTER_WARMUP = 200  # extra samples to stabilize old libEMG filtering on rolling buffers
 
-SMOOTHING = 11  # tuned for 6-class stability (~500 ms at ~2.2 kHz with step=100)
-MIN_CONFIDENCE = 0.40  # confidence gate tuned for lower false positives
+REALTIME_RESAMPLE = True
+# Keep this aligned with your training data preprocessing.
+# Set to None to use model metadata when available.
+REALTIME_TARGET_FS_HZ = 2000.0
+
+SMOOTHING = 7   # modestly stronger temporal stability to reduce left/right flicker
+MIN_CONFIDENCE = 0.35  # slightly looser gate to reduce neutral fallback on turns
 LOW_CONFIDENCE_LABEL = "neutral"
+ENABLE_NEUTRAL_OVERRIDE = True
+NEUTRAL_OVERRIDE_MARGIN = 0.15
+NEUTRAL_OVERRIDE_MIN_CONFIDENCE = MIN_CONFIDENCE
 
 LATEST_LOCK = threading.Lock()
 LATEST_GESTURE = LOW_CONFIDENCE_LABEL
@@ -54,14 +62,14 @@ DUAL_ARM_SINGLE_THRESHOLD = MIN_CONFIDENCE
 # Collect a short sample of each gesture before inference to fine-tune
 # the model's classification head for this specific subject.
 # Requires CALIBRATE = True (needs filter_obj and MVC normalization).
-GESTURE_CALIB        = False  # opt-in: bad/misaligned live labels can hurt the head
-GESTURE_CALIB_S      = 3.0   # seconds of EMG to collect per gesture
+GESTURE_CALIB        = True  # opt-in: bad/misaligned live labels can hurt the head
+GESTURE_CALIB_S      = 5.0   # seconds of EMG to collect per gesture
 GESTURE_CALIB_PREP_S = 2.0   # countdown pause before each gesture
 
 # Optional runtime gesture filtering (code-only; no CLI flags).
-# Example (3-class mode):
+# Example (3-class mode):co0iuu6
 # INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"} example
-INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"} # set = None to include all gestures
+INCLUDED_GESTURES = None # set = None to include all gestures
 
 GESTURE_LABELS = ["neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"]
 
@@ -143,20 +151,146 @@ def _estimate_fs(times):
 
 
 def _parse_yt_frame(out):
-    """Unpack a GetYTData() frame into parallel lists of per-channel times and values."""
+    """Unpack a GetYTData() frame into per-channel times and values.
+
+    Preserves channel positions (empty channels become empty lists).
+    """
     channel_times = []
     channel_values = []
     for channel in out:
         if not channel:
+            channel_times.append([])
+            channel_values.append([])
             continue
         chan_array = np.asarray(channel[0], dtype=object)
         if chan_array.size == 0:
+            channel_times.append([])
+            channel_values.append([])
             continue
         t_vals, v_vals = zip(*(_pair_time_value(s) for s in chan_array))
         channel_times.append(list(t_vals))
         channel_values.append(list(v_vals))
     return channel_times, channel_values
 
+
+def _resolve_target_fs_hz_from_bundle(bundle):
+    metadata = bundle.metadata if isinstance(bundle.metadata, dict) else {}
+    resampling_meta = metadata.get("resampling")
+    candidates = [
+        metadata.get("target_fs_hz"),
+        metadata.get("sampling_rate_hz"),
+        metadata.get("fs"),
+    ]
+    if isinstance(resampling_meta, dict):
+        candidates.append(resampling_meta.get("target_fs_hz"))
+
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            fs_hz = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(fs_hz) and fs_hz > 0:
+            return fs_hz
+    return None
+
+
+class _RealtimeTimestampResampler:
+    """Timestamp-align all channels to a common fixed-rate grid."""
+
+    def __init__(self, channel_count, target_fs_hz, max_buffer_s=2.0):
+        if target_fs_hz <= 0:
+            raise ValueError("target_fs_hz must be > 0.")
+        self.channel_count = int(channel_count)
+        self.target_fs_hz = float(target_fs_hz)
+        self.step_s = 1.0 / self.target_fs_hz
+        self.max_buffer_s = float(max_buffer_s)
+        self._next_t = None
+        self._time_buf = [deque() for _ in range(self.channel_count)]
+        self._value_buf = [deque() for _ in range(self.channel_count)]
+
+    def _append_channel_samples(self, ch_idx, times, values):
+        if times is None or values is None:
+            return
+        t_arr = np.asarray(times, dtype=float).reshape(-1)
+        v_arr = np.asarray(values, dtype=float).reshape(-1)
+        n = min(t_arr.size, v_arr.size)
+        if n <= 0:
+            return
+        t_arr = t_arr[:n]
+        v_arr = v_arr[:n]
+
+        mask = np.isfinite(t_arr) & np.isfinite(v_arr)
+        if not np.any(mask):
+            return
+        t_arr = t_arr[mask]
+        v_arr = v_arr[mask]
+        if t_arr.size == 0:
+            return
+
+        order = np.argsort(t_arr, kind="mergesort")
+        t_arr = t_arr[order]
+        v_arr = v_arr[order]
+
+        t_buf = self._time_buf[ch_idx]
+        v_buf = self._value_buf[ch_idx]
+        last_t = t_buf[-1] if t_buf else None
+
+        for t_val, v_val in zip(t_arr, v_arr):
+            if last_t is not None and t_val <= last_t:
+                continue
+            t_buf.append(float(t_val))
+            v_buf.append(float(v_val))
+            last_t = float(t_val)
+
+    def push(self, channel_times, channel_values):
+        if channel_times is None or channel_values is None:
+            return np.empty((0, self.channel_count), dtype=float), np.empty((0,), dtype=float)
+
+        n_seen = min(len(channel_times), len(channel_values), self.channel_count)
+        for ch_idx in range(n_seen):
+            self._append_channel_samples(ch_idx, channel_times[ch_idx], channel_values[ch_idx])
+
+        if any(len(tb) < 2 for tb in self._time_buf):
+            return np.empty((0, self.channel_count), dtype=float), np.empty((0,), dtype=float)
+
+        overlap_start = max(tb[0] for tb in self._time_buf)
+        overlap_end = min(tb[-1] for tb in self._time_buf)
+        if self._next_t is None:
+            self._next_t = float(overlap_start)
+
+        if overlap_end < self._next_t:
+            return np.empty((0, self.channel_count), dtype=float), np.empty((0,), dtype=float)
+
+        n_out = int(np.floor((overlap_end - self._next_t) * self.target_fs_hz)) + 1
+        if n_out <= 0:
+            return np.empty((0, self.channel_count), dtype=float), np.empty((0,), dtype=float)
+
+        t_grid = self._next_t + (np.arange(n_out, dtype=float) / self.target_fs_hz)
+        out = np.empty((n_out, self.channel_count), dtype=float)
+        for ch_idx in range(self.channel_count):
+            t_vec = np.asarray(self._time_buf[ch_idx], dtype=float)
+            v_vec = np.asarray(self._value_buf[ch_idx], dtype=float)
+            out[:, ch_idx] = np.interp(t_grid, t_vec, v_vec)
+
+        self._next_t = float(t_grid[-1] + self.step_s)
+
+        # Keep one point before next_t for interpolation continuity.
+        for ch_idx in range(self.channel_count):
+            t_buf = self._time_buf[ch_idx]
+            v_buf = self._value_buf[ch_idx]
+            while len(t_buf) >= 2 and t_buf[1] <= self._next_t:
+                t_buf.popleft()
+                v_buf.popleft()
+
+            # Optional memory cap for long runs.
+            cutoff = self._next_t - self.max_buffer_s
+            while len(t_buf) >= 2 and t_buf[1] < cutoff:
+                t_buf.popleft()
+                v_buf.popleft()
+
+        return out, t_grid
 
 def control_hook(gesture: str) -> None:
     set_latest_gesture(gesture)
@@ -240,6 +374,46 @@ def _restrict_probs(probs, allowed_indices):
     if total > 0.0:
         filtered /= total
     return filtered
+
+
+def _decode_prediction(probs, index_to_label):
+    """Decode probs with optional neutral override, then confidence gate."""
+    probs = np.asarray(probs, dtype=float).reshape(-1)
+    if probs.size == 0:
+        return LOW_CONFIDENCE_LABEL, 0.0, -1
+
+    pred_idx = int(np.argmax(probs))
+    pred_label = index_to_label.get(pred_idx, LOW_CONFIDENCE_LABEL)
+    pred_conf = float(probs[pred_idx])
+
+    if ENABLE_NEUTRAL_OVERRIDE and pred_label == LOW_CONFIDENCE_LABEL:
+        best_nonneutral_idx = None
+        best_nonneutral_prob = -1.0
+        for idx, label in index_to_label.items():
+            idx = int(idx)
+            if label == LOW_CONFIDENCE_LABEL:
+                continue
+            if idx < 0 or idx >= probs.size:
+                continue
+            p = float(probs[idx])
+            if p > best_nonneutral_prob:
+                best_nonneutral_prob = p
+                best_nonneutral_idx = idx
+
+        if best_nonneutral_idx is not None:
+            gap = pred_conf - best_nonneutral_prob
+            if (
+                gap <= float(NEUTRAL_OVERRIDE_MARGIN)
+                and best_nonneutral_prob >= float(NEUTRAL_OVERRIDE_MIN_CONFIDENCE)
+            ):
+                pred_idx = best_nonneutral_idx
+                pred_label = index_to_label.get(pred_idx, LOW_CONFIDENCE_LABEL)
+                pred_conf = best_nonneutral_prob
+
+    if pred_conf < float(MIN_CONFIDENCE):
+        pred_label = LOW_CONFIDENCE_LABEL
+
+    return pred_label, pred_conf, pred_idx
 
 
 def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_sleep):
@@ -376,6 +550,36 @@ def main(argv=None):
     else:
         print("[gesture] single-arm mode")
 
+    bundle_fs_right = _resolve_target_fs_hz_from_bundle(bundle_right)
+    bundle_fs_left = _resolve_target_fs_hz_from_bundle(bundle_left) if dual_arm else None
+    bundle_target_fs = bundle_fs_right if bundle_fs_right is not None else bundle_fs_left
+    if dual_arm and bundle_fs_right is not None and bundle_fs_left is not None:
+        if abs(bundle_fs_right - bundle_fs_left) > 1e-6:
+            raise RuntimeError(
+                f"Right/left bundle target fs mismatch: {bundle_fs_right:.3f} vs "
+                f"{bundle_fs_left:.3f} Hz. Re-export bundles with matching preprocessing."
+            )
+
+    runtime_target_fs = (
+        float(REALTIME_TARGET_FS_HZ)
+        if REALTIME_TARGET_FS_HZ is not None
+        else bundle_target_fs
+    )
+    use_timestamp_resampling = bool(
+        REALTIME_RESAMPLE and runtime_target_fs is not None and runtime_target_fs > 0
+    )
+    if REALTIME_RESAMPLE and runtime_target_fs is None:
+        print(
+            "[gesture] realtime resampling requested but no target fs available "
+            "(set REALTIME_TARGET_FS_HZ or store target_fs_hz in bundle metadata)."
+        )
+    elif use_timestamp_resampling and bundle_target_fs is not None:
+        if abs(runtime_target_fs - bundle_target_fs) > 1e-6:
+            print(
+                "[gesture] WARNING: realtime target fs differs from bundle metadata "
+                f"({runtime_target_fs:.3f} vs {bundle_target_fs:.3f} Hz)."
+            )
+
     handler = _StreamingHandler()
     base = TrignoBase(handler)
     handler.DataHandler = DataKernel(base)
@@ -432,8 +636,14 @@ def main(argv=None):
 
     base.TrigBase.Start(handler.streamYTData)
 
-    filter_obj = None
-    fs = None
+    fs = float(runtime_target_fs) if use_timestamp_resampling else None
+    filter_obj = define_filters(fs) if fs is not None else None
+    resampler = _RealtimeTimestampResampler(stream_channels, fs) if fs is not None else None
+    if use_timestamp_resampling:
+        print(f"[gesture] realtime timestamp resampling enabled at {fs:.2f} Hz")
+    else:
+        print("[gesture] realtime timestamp resampling disabled (legacy index alignment).")
+
     poll_sleep = 0.001
 
     # Per-arm calibration values (single-arm uses only the _right variants)
@@ -682,30 +892,38 @@ def main(argv=None):
             if len(channel_values) < stream_channels:
                 continue
 
-            sample_count = min(len(c) for c in channel_values)
-            if sample_count == 0:
-                continue
-
-            if fs is None and channel_times:
-                fs = _estimate_fs(channel_times[0])
-                if fs is not None and filter_obj is None:
-                    filter_obj = define_filters(fs)
-                    print(f"Estimated fs: {fs:.2f} Hz")
-
             # Capture when this batch of samples became available to this process.
             batch_wall_time = time.time()
 
-            # --- collect raw batch (all stream channels) ---
-            sample_batch = []
-            for idx in range(sample_count):
-                sample = [channel_values[ch][idx] for ch in range(stream_channels)]
-                # sample_buffer.append(sample)  # old: append to raw rolling buffer
-                sample_batch.append(sample)
+            if use_timestamp_resampling:
+                batch_arr, _ = resampler.push(channel_times, channel_values)
+                if batch_arr.size == 0:
+                    continue
+            else:
+                sample_count = min(len(c) for c in channel_values)
+                if sample_count == 0:
+                    continue
 
-            if not sample_batch:
-                continue
+                if fs is None and channel_times:
+                    for times in channel_times:
+                        if not times:
+                            continue
+                        fs = _estimate_fs(times)
+                        if fs is not None and filter_obj is None:
+                            filter_obj = define_filters(fs)
+                            print(f"Estimated fs: {fs:.2f} Hz")
+                            break
 
-            batch_arr = np.asarray(sample_batch, dtype=float)  # (N, stream_channels)
+                # --- legacy collect path: index-aligned rows ---
+                sample_batch = []
+                for idx in range(sample_count):
+                    sample = [channel_values[ch][idx] for ch in range(stream_channels)]
+                    sample_batch.append(sample)
+
+                if not sample_batch:
+                    continue
+
+                batch_arr = np.asarray(sample_batch, dtype=float)  # (N, stream_channels)
 
             # --- split channels by arm ---
             if dual_arm:
@@ -759,11 +977,7 @@ def main(argv=None):
                 if SMOOTHING > 1:
                     probs = np.mean(np.stack(pred_history_right, axis=0), axis=0)
 
-                conf_right  = float(np.max(probs))
-                pred_idx    = int(np.argmax(probs))
-                label_right = index_to_label_right.get(pred_idx, LOW_CONFIDENCE_LABEL)
-                if conf_right < MIN_CONFIDENCE:
-                    label_right = LOW_CONFIDENCE_LABEL
+                label_right, conf_right, _ = _decode_prediction(probs, index_to_label_right)
 
                 inference_ran = True
                 # We intentionally keep only the newest inference point and
@@ -793,11 +1007,7 @@ def main(argv=None):
                     if SMOOTHING > 1:
                         probs = np.mean(np.stack(pred_history_left, axis=0), axis=0)
 
-                    conf_left  = float(np.max(probs))
-                    pred_idx   = int(np.argmax(probs))
-                    label_left = index_to_label_left.get(pred_idx, LOW_CONFIDENCE_LABEL)
-                    if conf_left < MIN_CONFIDENCE:
-                        label_left = LOW_CONFIDENCE_LABEL
+                    label_left, conf_left, _ = _decode_prediction(probs, index_to_label_left)
 
                     inference_ran = True
                     # Same backlog policy as right arm: latest window only.
