@@ -33,6 +33,12 @@ LOW_CONFIDENCE_LABEL = "neutral"
 ENABLE_NEUTRAL_OVERRIDE = True
 NEUTRAL_OVERRIDE_MARGIN = 0.25
 NEUTRAL_OVERRIDE_MIN_CONFIDENCE = MIN_CONFIDENCE
+# Hysteresis is an optional post-decoder state machine.
+# Disable quickly by setting ENABLE_HYSTERESIS = False.
+ENABLE_HYSTERESIS = True
+HYSTERESIS_ENTER_THRESHOLD = 0.68   # neutral -> gesture
+HYSTERESIS_EXIT_THRESHOLD = 0.48    # gesture -> neutral (lower than enter)
+HYSTERESIS_SWITCH_THRESHOLD = 0.72  # gesture A -> gesture B
 
 LATEST_LOCK = threading.Lock()
 LATEST_GESTURE = LOW_CONFIDENCE_LABEL
@@ -415,6 +421,70 @@ def _decode_prediction(probs, index_to_label):
     return pred_label, pred_conf, pred_idx
 
 
+def _prob_for_label(probs, label_to_index, label):
+    idx = label_to_index.get(str(label))
+    if idx is None:
+        return 0.0
+    idx = int(idx)
+    if idx < 0 or idx >= probs.size:
+        return 0.0
+    return float(probs[idx])
+
+
+def _apply_hysteresis(decoded_label, decoded_conf, probs, index_to_label, state):
+    """Apply enter/exit hysteresis to the decoded label stream."""
+    if not ENABLE_HYSTERESIS:
+        state["label"] = str(decoded_label)
+        return str(decoded_label), float(decoded_conf)
+
+    probs = np.asarray(probs, dtype=float).reshape(-1)
+    if probs.size == 0:
+        state["label"] = LOW_CONFIDENCE_LABEL
+        return LOW_CONFIDENCE_LABEL, 0.0
+
+    label_to_index = {str(lbl): int(idx) for idx, lbl in index_to_label.items()}
+    neutral_label = str(LOW_CONFIDENCE_LABEL)
+    decoded_label = str(decoded_label)
+    current_label = str(state.get("label", neutral_label))
+
+    if current_label not in label_to_index and current_label != neutral_label:
+        current_label = neutral_label
+
+    current_prob = _prob_for_label(probs, label_to_index, current_label)
+    neutral_prob = _prob_for_label(probs, label_to_index, neutral_label)
+    decoded_prob = _prob_for_label(probs, label_to_index, decoded_label)
+    decoded_conf = max(float(decoded_conf), decoded_prob)
+
+    # Neutral -> gesture requires stronger confidence.
+    if current_label == neutral_label:
+        if decoded_label != neutral_label and decoded_conf >= float(HYSTERESIS_ENTER_THRESHOLD):
+            state["label"] = decoded_label
+            return decoded_label, decoded_conf
+        state["label"] = neutral_label
+        return neutral_label, neutral_prob
+
+    # Gesture A -> gesture B requires very strong evidence.
+    if (
+        decoded_label not in (neutral_label, current_label)
+        and decoded_conf >= float(HYSTERESIS_SWITCH_THRESHOLD)
+    ):
+        state["label"] = decoded_label
+        return decoded_label, decoded_conf
+
+    # Stay in current gesture while confidence remains above exit threshold.
+    if current_prob >= float(HYSTERESIS_EXIT_THRESHOLD):
+        state["label"] = current_label
+        return current_label, current_prob
+
+    # Current gesture dropped: either enter a new strong gesture or fall back to neutral.
+    if decoded_label != neutral_label and decoded_conf >= float(HYSTERESIS_ENTER_THRESHOLD):
+        state["label"] = decoded_label
+        return decoded_label, decoded_conf
+
+    state["label"] = neutral_label
+    return neutral_label, neutral_prob
+
+
 def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_sleep):
     samples = []
     times = []
@@ -632,6 +702,15 @@ def main(argv=None):
                 f"Stream has {stream_channels} channels; using slice "
                 f"[{left_arm_start}:{left_arm_start + model_channels}] for model input."
             )
+    if ENABLE_HYSTERESIS:
+        print(
+            "[gesture] hysteresis: ON "
+            f"(enter={HYSTERESIS_ENTER_THRESHOLD:.2f}, "
+            f"exit={HYSTERESIS_EXIT_THRESHOLD:.2f}, "
+            f"switch={HYSTERESIS_SWITCH_THRESHOLD:.2f})"
+        )
+    else:
+        print("[gesture] hysteresis: OFF")
 
     base.TrigBase.Start(handler.streamYTData)
 
@@ -858,12 +937,14 @@ def main(argv=None):
     warmup_right       = FILTER_WARMUP == 0
     pending_right      = 0
     pred_history_right = deque(maxlen=max(1, SMOOTHING))
+    hysteresis_state_right = {"label": LOW_CONFIDENCE_LABEL}
 
     # Left arm (dual-arm mode only)
     raw_buffer_left    = deque(maxlen=buffer_len)
     warmup_left        = FILTER_WARMUP == 0
     pending_left       = 0
     pred_history_left  = deque(maxlen=max(1, SMOOTHING))
+    hysteresis_state_left = {"label": LOW_CONFIDENCE_LABEL}
 
     last_output  = None
     last_msg_len = 0
@@ -977,6 +1058,9 @@ def main(argv=None):
                     probs = np.mean(np.stack(pred_history_right, axis=0), axis=0)
 
                 label_right, conf_right, _ = _decode_prediction(probs, index_to_label_right)
+                label_right, conf_right = _apply_hysteresis(
+                    label_right, conf_right, probs, index_to_label_right, hysteresis_state_right
+                )
 
                 inference_ran = True
                 # We intentionally keep only the newest inference point and
@@ -1007,6 +1091,9 @@ def main(argv=None):
                         probs = np.mean(np.stack(pred_history_left, axis=0), axis=0)
 
                     label_left, conf_left, _ = _decode_prediction(probs, index_to_label_left)
+                    label_left, conf_left = _apply_hysteresis(
+                        label_left, conf_left, probs, index_to_label_left, hysteresis_state_left
+                    )
 
                     inference_ran = True
                     # Same backlog policy as right arm: latest window only.

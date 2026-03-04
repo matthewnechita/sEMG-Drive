@@ -38,7 +38,7 @@ from emg.gesture_model_cnn import GestureCNNv2
 # ======== Config ========
 ARM        = "right"           # ← set to "right" or "left" before running
 DATA_ROOT  = Path("data") / f"{ARM} arm"
-MODEL_OUT  = Path("models/cross_subject") / ARM / "gesture_cnn_v2_exclude_gestures.pt"
+MODEL_OUT  = Path("models/cross_subject") / ARM / "gesture_cnn_v3_m4_excl05_mlc090.pt"
 PATTERN    = "*_filtered.npz"
 
 WINDOW_SIZE = 200
@@ -47,7 +47,7 @@ WINDOW_STEP = 100
 USE_CALIBRATION          = True
 MVC_PERCENTILE           = 95.0
 USE_MIN_LABEL_CONFIDENCE = True
-MIN_LABEL_CONFIDENCE     = 0.8
+MIN_LABEL_CONFIDENCE     = 0.9
 
 TEST_SIZE    = 0.2
 RANDOM_STATE = 42
@@ -57,9 +57,10 @@ BATCH_SIZE   = 512
 # GestureCNNv2 at 503K params on ~122K training windows = ~4 params/sample.
 # More epochs than per-subject: larger model + larger dataset benefits from
 # longer training. Convergence argument, not wall-clock.
-EPOCHS  = 85
+EPOCHS  = 65
 LR      = 1e-4
 DROPOUT = 0.3
+LABEL_SMOOTHING = 0.0
 
 USE_CLASS_WEIGHTS    = True
 USE_BALANCED_SAMPLING = True   # up-weights under-represented subjects
@@ -73,13 +74,13 @@ AUG_PROB  = 0.5
 # Subjects with failed MVC calibration or other DQ issues.
 # subject05: all 4 sessions have mvc_ratio <= 1.8x (MVC barely > neutral).
 # This corrupts the MVC normalisation; recollect before re-including.
-EXCLUDED_SUBJECTS: list[str] = []
+EXCLUDED_SUBJECTS: list[str] = ["subject05"]
 
 # Optional gesture filtering (code-only; no CLI flags).
 # Set INCLUDED_GESTURES to a subset to train only those labels.
 # Example:
 # INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"} example
-INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn"} # set to = None to include all gestures
+INCLUDED_GESTURES: set[str] | None = None # set to = None to include all gestures
 
 # LOSO evaluation must be run before deploying the cross-subject model.
 # This measures true cross-subject accuracy (model vs subjects it never trained on).
@@ -512,7 +513,7 @@ def train_eval_split(X_train, y_train, X_eval, y_eval,
         w = class_counts.sum() / np.maximum(class_counts, 1)
         class_weight = torch.tensor(w / w.mean(), dtype=torch.float32, device=device)
 
-    criterion = nn.CrossEntropyLoss(weight=class_weight)
+    criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=float(LABEL_SMOOTHING))
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     # patience=5: cross-subject dataset is large; loss moves slowly
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -778,6 +779,7 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
                 "amp_range": list(AMP_RANGE),
                 "use_augmentation": bool(USE_AUGMENTATION),
                 "use_balanced_sampling": bool(USE_BALANCED_SAMPLING),
+                "label_smoothing": float(LABEL_SMOOTHING),
                 "use_mixup": False,
             },
             "metrics": {
