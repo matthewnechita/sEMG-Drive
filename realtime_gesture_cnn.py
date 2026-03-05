@@ -1,4 +1,5 @@
 import argparse
+import re
 import time
 from collections import deque
 
@@ -27,18 +28,24 @@ REALTIME_RESAMPLE = True
 # Set to None to use model metadata when available.
 REALTIME_TARGET_FS_HZ = 2000.0
 
-SMOOTHING = 7   # modestly stronger temporal stability to reduce left/right flicker
-MIN_CONFIDENCE = 0.55  # slightly looser gate to reduce neutral fallback on turns
+SMOOTHING = 5   # balance stability without excessive response lag
+MIN_CONFIDENCE = 0.45  # reduce neutral fallback when Stage B is moderately confident
 LOW_CONFIDENCE_LABEL = "neutral"
 ENABLE_NEUTRAL_OVERRIDE = True
-NEUTRAL_OVERRIDE_MARGIN = 0.25
-NEUTRAL_OVERRIDE_MIN_CONFIDENCE = MIN_CONFIDENCE
+NEUTRAL_OVERRIDE_MARGIN = 0.15
+NEUTRAL_OVERRIDE_MIN_CONFIDENCE = 0.60
+# If left_turn is close to signal_left, promote left_turn to counter
+# the observed left-turn under-detection bias in live use.
+ENABLE_LEFT_TURN_PROMOTION = True
+LEFT_TURN_PROMOTION_MARGIN = 0.05
+LEFT_TURN_PROMOTION_MIN_CONFIDENCE = 0.35
 # Hysteresis is an optional post-decoder state machine.
 # Disable quickly by setting ENABLE_HYSTERESIS = False.
 ENABLE_HYSTERESIS = True
-HYSTERESIS_ENTER_THRESHOLD = 0.68   # neutral -> gesture
-HYSTERESIS_EXIT_THRESHOLD = 0.48    # gesture -> neutral (lower than enter)
-HYSTERESIS_SWITCH_THRESHOLD = 0.72  # gesture A -> gesture B
+HYSTERESIS_ENTER_THRESHOLD = 0.60   # neutral -> gesture
+HYSTERESIS_EXIT_THRESHOLD = 0.38    # gesture -> neutral (lower than enter)
+HYSTERESIS_SWITCH_THRESHOLD = 0.70  # gesture A -> gesture B
+HYSTERESIS_SWITCH_MARGIN = 0.08     # require decoded gesture to beat current by this margin
 
 LATEST_LOCK = threading.Lock()
 LATEST_GESTURE = LOW_CONFIDENCE_LABEL
@@ -49,12 +56,18 @@ CALIB_NEUTRAL_S = 5.0
 CALIB_MVC_S = 5.0
 CALIB_MVC_PREP_S = 2.0    # countdown pause before MVC window
 MVC_PERCENTILE = 95.0
-MVC_MIN_RATIO = 2.0        # minimum acceptable median MVC/neutral ratio
+# Keep this aligned with train_cross_subject.py (MVC_QUALITY_MIN_RATIO).
+MVC_MIN_RATIO = 1.5        # minimum acceptable median MVC/neutral ratio
 
 # ======== Dual-arm config ========
 # Right arm channels come first in the Delsys stream (pair right arm sensors first).
 # Left arm channels follow immediately after; inferred from bundle_left.channel_count at load time.
 RIGHT_ARM_CHANNELS = 17   # fixed: 6 right arm sensors → 17 channels
+# Optional explicit arm mapping by sensor pair number from scan output.
+# Example: RIGHT_ARM_PAIR_NUMBERS = {1,2,3,4,5,6}
+RIGHT_ARM_PAIR_NUMBERS = None
+LEFT_ARM_PAIR_NUMBERS = None
+AUTO_DUAL_ARM_CHANNEL_MAPPING = True
 # Left arm uses 5 sensors → 16 channels (one fewer sensor than right arm)
 # Fusion thresholds:
 #   AGREE_THRESHOLD  — minimum confidence to emit a gesture when BOTH arms agree
@@ -68,14 +81,14 @@ DUAL_ARM_SINGLE_THRESHOLD = MIN_CONFIDENCE
 # Collect a short sample of each gesture before inference to fine-tune
 # the model's classification head for this specific subject.
 # Requires CALIBRATE = True (needs filter_obj and MVC normalization).
-GESTURE_CALIB        = True  # opt-in: bad/misaligned live labels can hurt the head
+GESTURE_CALIB        = True  # adapt Stage B head to current user/session
 GESTURE_CALIB_S      = 5.0   # seconds of EMG to collect per gesture
 GESTURE_CALIB_PREP_S = 2.0   # countdown pause before each gesture
 
 # Optional runtime gesture filtering (code-only; no CLI flags).
 # Example (3-class mode):
 # INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"}
-INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn", "signal_left", "signal_right"}  # set to None to include all gestures from the model
+INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"}
 
 GESTURE_LABELS = ["neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"]
 
@@ -94,10 +107,21 @@ GESTURE_INSTRUCTIONS = {
 #   "right" - right arm only  (pair right arm sensors first in Delsys)
 #   "left"  - left arm only   (pair left arm sensors first in Delsys)
 #   "dual"  - both arms fused (pair right first, then left in Delsys)
-MODE        = "right"
-MODEL_RIGHT = "models/cross_subject/right/gesture_cnn_v2.pt"
-MODEL_LEFT  = "models/cross_subject/left/gesture_cnn_v2.pt"
+MODE        = "dual"
+MODEL_RIGHT = "models/cross_subject/right/gesture_cnn_v3_m2_excl05_label_smoothing005.pt"
+MODEL_LEFT  = "models/cross_subject/left/gesture_cnn_v3_left_m1_single_stage_dual_ready.pt"
 # ================================
+
+# ======== Two-stage inference (single-arm only) ========
+# Stage A: neutral vs active
+# Stage B: active gesture classifier
+USE_TWO_STAGE = False
+MODEL_STAGE_A = "models/cross_subject/right/gesture_cnn_v3_m5_excl05_mlc075_dropout025_label_smoothing005_stage_a_neutral_active.pt"
+MODEL_STAGE_B = "models/cross_subject/right/gesture_cnn_v3_m5_excl05_mlc075_dropout025_label_smoothing005_stage_b_active_gestures.pt"
+TWO_STAGE_ACTIVE_ENTER_THRESHOLD = 0.40
+TWO_STAGE_ACTIVE_EXIT_THRESHOLD = 0.25
+TWO_STAGE_ACTIVE_EXIT_HOLD_STEPS = 4  # require N consecutive low-active frames before neutral gate closes
+# =======================================================
 
 class _StreamingHandler:
     def __init__(self):
@@ -323,17 +347,39 @@ def fuse_predictions(label_r, conf_r, label_l, conf_l):
 
     Returns: (fused_label, fused_confidence)
     """
+    label_r = str(label_r)
+    label_l = str(label_l)
+    neutral = str(LOW_CONFIDENCE_LABEL)
+
     if label_r == label_l:
         # Both arms agree — strengthen the prediction
         combined_conf = max(conf_r, conf_l)
         if combined_conf >= DUAL_ARM_AGREE_THRESHOLD:
             return label_r, combined_conf
-    # Arms disagree (or agree but below threshold) — use whichever clears single threshold
-    # Right arm takes priority in a tie.
-    if conf_r >= DUAL_ARM_SINGLE_THRESHOLD:
-        return label_r, conf_r
-    if conf_l >= DUAL_ARM_SINGLE_THRESHOLD:
+
+    # Arms disagree (or agree but below threshold):
+    # Prefer non-neutral labels over neutral fallback when confidence is sufficient.
+    r_ok = conf_r >= DUAL_ARM_SINGLE_THRESHOLD
+    l_ok = conf_l >= DUAL_ARM_SINGLE_THRESHOLD
+
+    r_active = r_ok and label_r != neutral
+    l_active = l_ok and label_l != neutral
+
+    if r_active and l_active:
+        if conf_r >= conf_l:
+            return label_r, conf_r
         return label_l, conf_l
+    if r_active:
+        return label_r, conf_r
+    if l_active:
+        return label_l, conf_l
+
+    # If neither arm has a confident active label, fall back to confident neutral.
+    if r_ok and label_r == neutral:
+        return label_r, conf_r
+    if l_ok and label_l == neutral:
+        return label_l, conf_l
+
     return LOW_CONFIDENCE_LABEL, 0.0
 
 
@@ -415,6 +461,27 @@ def _decode_prediction(probs, index_to_label):
                 pred_label = index_to_label.get(pred_idx, LOW_CONFIDENCE_LABEL)
                 pred_conf = best_nonneutral_prob
 
+    if ENABLE_LEFT_TURN_PROMOTION:
+        label_to_idx = {str(lbl): int(idx) for idx, lbl in index_to_label.items()}
+        idx_left_turn = label_to_idx.get("left_turn")
+        idx_signal_left = label_to_idx.get("signal_left")
+        if (
+            idx_left_turn is not None
+            and idx_signal_left is not None
+            and 0 <= idx_left_turn < probs.size
+            and 0 <= idx_signal_left < probs.size
+        ):
+            p_left_turn = float(probs[idx_left_turn])
+            p_signal_left = float(probs[idx_signal_left])
+            if (
+                pred_label == "signal_left"
+                and p_left_turn >= (p_signal_left - float(LEFT_TURN_PROMOTION_MARGIN))
+                and p_left_turn >= float(LEFT_TURN_PROMOTION_MIN_CONFIDENCE)
+            ):
+                pred_idx = int(idx_left_turn)
+                pred_label = "left_turn"
+                pred_conf = p_left_turn
+
     if pred_conf < float(MIN_CONFIDENCE):
         pred_label = LOW_CONFIDENCE_LABEL
 
@@ -429,6 +496,45 @@ def _prob_for_label(probs, label_to_index, label):
     if idx < 0 or idx >= probs.size:
         return 0.0
     return float(probs[idx])
+
+
+def _resolve_two_stage_indices(index_to_label, arm_name):
+    neutral_idx = None
+    active_idx = None
+    for idx, label in index_to_label.items():
+        lbl = str(label).strip().lower()
+        if lbl == str(LOW_CONFIDENCE_LABEL).lower():
+            neutral_idx = int(idx)
+        elif lbl == "active":
+            active_idx = int(idx)
+    if neutral_idx is None or active_idx is None:
+        raise ValueError(
+            f"Two-stage Stage A ({arm_name}) must contain labels "
+            f"'{LOW_CONFIDENCE_LABEL}' and 'active'. Got: {sorted(index_to_label.values())}"
+        )
+    return neutral_idx, active_idx
+
+
+def _two_stage_active_gate(active_prob, state):
+    is_active = bool(state.get("active", False))
+    low_count = int(state.get("low_count", 0))
+    if is_active:
+        if active_prob <= float(TWO_STAGE_ACTIVE_EXIT_THRESHOLD):
+            low_count += 1
+            if low_count >= int(TWO_STAGE_ACTIVE_EXIT_HOLD_STEPS):
+                is_active = False
+                low_count = 0
+        else:
+            low_count = 0
+    else:
+        if active_prob >= float(TWO_STAGE_ACTIVE_ENTER_THRESHOLD):
+            is_active = True
+            low_count = 0
+        else:
+            low_count = 0
+    state["active"] = is_active
+    state["low_count"] = low_count
+    return is_active
 
 
 def _apply_hysteresis(decoded_label, decoded_conf, probs, index_to_label, state):
@@ -467,6 +573,7 @@ def _apply_hysteresis(decoded_label, decoded_conf, probs, index_to_label, state)
     if (
         decoded_label not in (neutral_label, current_label)
         and decoded_conf >= float(HYSTERESIS_SWITCH_THRESHOLD)
+        and decoded_conf >= (current_prob + float(HYSTERESIS_SWITCH_MARGIN))
     ):
         state["label"] = decoded_label
         return decoded_label, decoded_conf
@@ -563,14 +670,132 @@ def _slice_channels(batch_arr, start, target_channels):
     return out
 
 
+def _slice_channels_by_indices(batch_arr, indices, target_channels):
+    """Select arbitrary channel indices and keep output width fixed."""
+    arr = np.asarray(batch_arr, dtype=float)
+    idx = np.asarray(indices, dtype=int).reshape(-1)
+    idx = idx[(idx >= 0) & (idx < arr.shape[1])]
+    out = arr[:, idx] if idx.size else np.empty((arr.shape[0], 0), dtype=float)
+    if out.shape[1] < target_channels:
+        out = np.pad(
+            out,
+            ((0, 0), (0, target_channels - out.shape[1])),
+            mode="constant",
+            constant_values=0.0,
+        )
+    elif out.shape[1] > target_channels:
+        out = out[:, :target_channels]
+    return out
+
+
+def _parse_pair_number(channel_label):
+    text = str(channel_label).strip()
+    m = re.match(r"^\((\d+)\)", text)
+    return int(m.group(1)) if m else None
+
+
+def _build_pair_groups(channel_labels):
+    """Return ordered pair groups: key -> list[channel_idx]."""
+    groups = {}
+    for idx, label in enumerate(channel_labels):
+        pair = _parse_pair_number(label)
+        key = f"pair:{pair}" if pair is not None else f"ch:{idx}"
+        groups.setdefault(key, []).append(idx)
+    return groups
+
+
+def _derive_dual_indices_from_pairs(
+    channel_labels,
+    right_channels,
+    left_channels,
+    right_ratio_full,
+    left_ratio_full,
+):
+    """Infer per-arm channel indices using pair-level calibration asymmetry."""
+    groups = _build_pair_groups(channel_labels)
+    diff = np.asarray(right_ratio_full, dtype=float) - np.asarray(left_ratio_full, dtype=float)
+    items = []
+    for key, idxs in groups.items():
+        idx_arr = np.asarray(idxs, dtype=int)
+        score = float(np.sum(diff[idx_arr]))
+        items.append((key, idx_arr, idx_arr.size, score))
+
+    # If explicit pair-number sets are provided, use them.
+    if RIGHT_ARM_PAIR_NUMBERS or LEFT_ARM_PAIR_NUMBERS:
+        right_pairs = {int(p) for p in (RIGHT_ARM_PAIR_NUMBERS or set())}
+        left_pairs = {int(p) for p in (LEFT_ARM_PAIR_NUMBERS or set())}
+        right_idx = []
+        left_idx = []
+        for _, idx_arr, _, _ in items:
+            pair = _parse_pair_number(channel_labels[int(idx_arr[0])])
+            if pair in right_pairs:
+                right_idx.extend(idx_arr.tolist())
+            elif pair in left_pairs:
+                left_idx.extend(idx_arr.tolist())
+        right_idx = np.asarray(sorted(right_idx), dtype=int)
+        left_idx = np.asarray(sorted(left_idx), dtype=int)
+        if right_idx.size == right_channels and left_idx.size == left_channels:
+            return right_idx, left_idx
+        print(
+            "[gesture] explicit RIGHT/LEFT pair mapping count mismatch; "
+            "falling back to auto mapping."
+        )
+
+    # Auto mapping: choose pair groups for right arm that maximize (right-left) score
+    # with exact right channel count, then assign remaining channels to left.
+    n = len(items)
+    best_mask = None
+    best_score = None
+    for mask in range(1 << n):
+        count = 0
+        score = 0.0
+        for i in range(n):
+            if (mask >> i) & 1:
+                count += items[i][2]
+                score += items[i][3]
+        if count != right_channels:
+            continue
+        if best_score is None or score > best_score:
+            best_score = score
+            best_mask = mask
+
+    if best_mask is None:
+        raise RuntimeError(
+            "Unable to infer dual-arm channel mapping from calibration data "
+            f"(need exact {right_channels}/{left_channels} channel split)."
+        )
+
+    right_idx = []
+    left_idx = []
+    for i, (_, idx_arr, _, _) in enumerate(items):
+        if (best_mask >> i) & 1:
+            right_idx.extend(idx_arr.tolist())
+        else:
+            left_idx.extend(idx_arr.tolist())
+    right_idx = np.asarray(sorted(right_idx), dtype=int)
+    left_idx = np.asarray(sorted(left_idx), dtype=int)
+    if right_idx.size != right_channels or left_idx.size != left_channels:
+        raise RuntimeError(
+            f"Inferred mapping size mismatch: right={right_idx.size}/{right_channels}, "
+            f"left={left_idx.size}/{left_channels}."
+        )
+    return right_idx, left_idx
+
+
 def main(argv=None):
     if MODE not in ("right", "left", "dual"):
         raise ValueError(f"MODE must be 'right', 'left', or 'dual', got {MODE!r}")
 
     # Derive defaults from config; CLI args can still override.
     # In "left" mode, the left model runs as single-arm (left sensors paired first).
-    _config_right = MODEL_LEFT if MODE == "left" else MODEL_RIGHT
-    _config_left  = MODEL_LEFT if MODE == "dual"  else None
+    _config_two_stage = bool(USE_TWO_STAGE and MODE != "dual")
+    if MODE == "left":
+        _config_right = MODEL_LEFT
+    else:
+        _config_right = MODEL_STAGE_B if _config_two_stage else MODEL_RIGHT
+    _config_left = MODEL_LEFT if MODE == "dual" else None
+    _config_stage_a = MODEL_STAGE_A if _config_two_stage else None
+    _config_stage_b = MODEL_STAGE_B if _config_two_stage else None
 
     parser = argparse.ArgumentParser(description="Real-time CNN gesture inference.")
     parser.add_argument("--model",       default=_config_right,
@@ -579,21 +804,66 @@ def main(argv=None):
                         help="Right arm model alias; overrides --model if both given.")
     parser.add_argument("--model-left",  default=_config_left,
                         help="Left arm model. Set automatically from MODE=dual; overrides config.")
+    parser.add_argument("--two-stage", action="store_true", default=USE_TWO_STAGE,
+                        help="Use two-stage inference (Stage A neutral/active + Stage B active gestures).")
+    parser.add_argument("--no-two-stage", action="store_true", default=False,
+                        help="Force-disable two-stage inference even if USE_TWO_STAGE=True in config.")
+    parser.add_argument("--model-stage-a", default=_config_stage_a,
+                        help="Stage A model path for two-stage mode (neutral vs active).")
+    parser.add_argument("--model-stage-b", default=_config_stage_b,
+                        help="Stage B model path for two-stage mode (active gestures).")
 
     args = parser.parse_args(argv)
 
     # --model-right overrides --model so either flag works
     model_right_path = args.model_right if args.model_right else args.model
-    model_left_path  = args.model_left   # None → single-arm mode
+    model_left_path = args.model_left   # None -> single-arm mode
+    use_two_stage = bool(args.two_stage and not args.no_two_stage)
+    model_stage_a_path = args.model_stage_a
+    model_stage_b_path = args.model_stage_b if args.model_stage_b else model_right_path
+    dual_arm = model_left_path is not None
+    if use_two_stage and dual_arm:
+        raise RuntimeError("Two-stage mode currently supports single-arm inference only.")
 
     print("[gesture] cwd:", os.getcwd())
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print('[gesture] device:', device)
 
-    # Right arm bundle (always loaded)
-    print("[gesture] right arm model:", model_right_path)
-    bundle_right  = load_cnn_bundle(model_right_path, device=device)
+    bundle_stage_a = None
+    stage_a_neutral_idx = None
+    stage_a_active_idx = None
+
+    # Right arm bundle (always loaded in single-stage; Stage B in two-stage)
+    if use_two_stage:
+        if not model_stage_a_path:
+            raise ValueError("Two-stage mode requires --model-stage-a.")
+        print("[gesture] two-stage mode: ON")
+        print("[gesture] stage A model:", model_stage_a_path)
+        bundle_stage_a = load_cnn_bundle(model_stage_a_path, device=device)
+        print("[gesture] stage B model:", model_stage_b_path)
+        bundle_right = load_cnn_bundle(model_stage_b_path, device=device)
+
+        if bundle_stage_a.channel_count != bundle_right.channel_count:
+            raise RuntimeError(
+                "Two-stage channel mismatch: "
+                f"Stage A expects {bundle_stage_a.channel_count}, "
+                f"Stage B expects {bundle_right.channel_count}."
+            )
+        stage_a_index_to_label = _canonical_label_map(bundle_stage_a.index_to_label)
+        stage_a_neutral_idx, stage_a_active_idx = _resolve_two_stage_indices(
+            stage_a_index_to_label, "right"
+        )
+        stage_b_labels = {str(lbl) for lbl in bundle_right.index_to_label.values()}
+        if str(LOW_CONFIDENCE_LABEL) in stage_b_labels:
+            raise RuntimeError(
+                "Two-stage Stage B should not contain the neutral label. "
+                "Use the active-gesture Stage B bundle."
+            )
+    else:
+        print("[gesture] right arm model:", model_right_path)
+        bundle_right = load_cnn_bundle(model_right_path, device=device)
+
     model_channels = bundle_right.channel_count   # kept for single-arm compat
     index_to_label_right = _canonical_label_map(bundle_right.index_to_label)
     allowed_labels_right, allowed_indices_right = _resolve_allowed_labels(
@@ -601,7 +871,6 @@ def main(argv=None):
     )
 
     # Left arm bundle (dual-arm mode only)
-    dual_arm = model_left_path is not None
     bundle_left   = None
     left_channels = 0
     index_to_label_left = {}
@@ -619,9 +888,19 @@ def main(argv=None):
     else:
         print("[gesture] single-arm mode")
 
+    bundle_fs_stage_a = _resolve_target_fs_hz_from_bundle(bundle_stage_a) if use_two_stage else None
     bundle_fs_right = _resolve_target_fs_hz_from_bundle(bundle_right)
     bundle_fs_left = _resolve_target_fs_hz_from_bundle(bundle_left) if dual_arm else None
-    bundle_target_fs = bundle_fs_right if bundle_fs_right is not None else bundle_fs_left
+    bundle_target_fs = bundle_fs_right
+    if bundle_target_fs is None:
+        bundle_target_fs = bundle_fs_stage_a if bundle_fs_stage_a is not None else bundle_fs_left
+
+    if use_two_stage and bundle_fs_stage_a is not None and bundle_fs_right is not None:
+        if abs(bundle_fs_stage_a - bundle_fs_right) > 1e-6:
+            raise RuntimeError(
+                f"Stage A/B target fs mismatch: {bundle_fs_stage_a:.3f} vs "
+                f"{bundle_fs_right:.3f} Hz. Re-export two-stage bundles with matching preprocessing."
+            )
     if dual_arm and bundle_fs_right is not None and bundle_fs_left is not None:
         if abs(bundle_fs_right - bundle_fs_left) > 1e-6:
             raise RuntimeError(
@@ -665,11 +944,20 @@ def main(argv=None):
         raise RuntimeError("Failed to configure Trigno pipeline.")
 
     stream_channels = len(base.channel_guids)
+    channel_labels = list(getattr(base, "emgChannelNames", []))
+    if len(channel_labels) != stream_channels:
+        channel_labels = [f"ch{idx}" for idx in range(stream_channels)]
 
     # For single-arm left mode: auto-detect channel offset so the system works
     # whether only left arm sensors are connected (left_arm_start=0) or all
     # sensors are connected from a prior dual-arm session (left_arm_start=17).
     left_arm_start = 0
+    right_channel_indices = np.arange(min(RIGHT_ARM_CHANNELS, stream_channels), dtype=int)
+    left_channel_indices = np.arange(
+        RIGHT_ARM_CHANNELS,
+        min(RIGHT_ARM_CHANNELS + left_channels, stream_channels),
+        dtype=int,
+    )
     if not dual_arm and MODE == "left":
         if stream_channels >= RIGHT_ARM_CHANNELS + model_channels:
             left_arm_start = RIGHT_ARM_CHANNELS
@@ -688,6 +976,11 @@ def main(argv=None):
                 f"({RIGHT_ARM_CHANNELS} right + {left_channels} left) "
                 f"but stream only has {stream_channels}. "
                 "Pair right arm sensors first, then left arm sensors, before scanning."
+            )
+        if stream_channels > expected_total:
+            print(
+                f"[gesture] stream has {stream_channels} channels; "
+                f"dual models use {expected_total}. Extra channels may be ignored."
             )
     else:
         required = left_arm_start + model_channels
@@ -711,6 +1004,12 @@ def main(argv=None):
         )
     else:
         print("[gesture] hysteresis: OFF")
+    if use_two_stage:
+        print(
+            "[gesture] two-stage gate: ON "
+            f"(enter={TWO_STAGE_ACTIVE_ENTER_THRESHOLD:.2f}, "
+            f"exit={TWO_STAGE_ACTIVE_EXIT_THRESHOLD:.2f})"
+        )
 
     base.TrigBase.Start(handler.streamYTData)
 
@@ -821,15 +1120,123 @@ def main(argv=None):
 
         return None, None  # unreachable but keeps linter happy
 
+    def _ratio_from_filtered(neutral_f, mvc_f):
+        neutral_rms = np.sqrt(np.mean(neutral_f ** 2, axis=0))
+        mvc_rms = np.sqrt(np.mean(mvc_f ** 2, axis=0))
+        ratio = np.ones_like(mvc_rms, dtype=float)
+        np.divide(mvc_rms, neutral_rms, out=ratio, where=neutral_rms >= 1e-9)
+        return ratio
+
+    def _collect_calibration_full(arm_label):
+        print(f"\nCalibration [{arm_label}]: RELAX {arm_label} arm completely "
+              f"for {CALIB_NEUTRAL_S:.1f}s.")
+        n_samples, n_times = _collect_samples(
+            handler, CALIB_NEUTRAL_S, stream_channels, None, poll_sleep
+        )
+        nonlocal fs, filter_obj
+        if fs is None and n_times.size:
+            fs = _estimate_fs(n_times)
+            if fs is not None and filter_obj is None:
+                filter_obj = define_filters(fs)
+                print(f"Estimated fs: {fs:.2f} Hz")
+        if filter_obj is None:
+            return None, None
+
+        if CALIB_MVC_PREP_S > 0:
+            print(f"Prepare: SQUEEZE {arm_label.upper()} ARM as hard as possible "
+                  f"in {CALIB_MVC_PREP_S:.0f}s...")
+            time.sleep(CALIB_MVC_PREP_S)
+        print(f"Calibration [{arm_label}]: SQUEEZE {arm_label.upper()} ARM "
+              f"as hard as possible for {CALIB_MVC_S:.1f}s.")
+        m_samples, m_times = _collect_samples(
+            handler, CALIB_MVC_S, stream_channels, None, poll_sleep
+        )
+        if fs is None and m_times.size:
+            fs = _estimate_fs(m_times)
+            if fs is not None and filter_obj is None:
+                filter_obj = define_filters(fs)
+                print(f"Estimated fs: {fs:.2f} Hz")
+        if not (n_samples.size and m_samples.size):
+            return None, None
+        return apply_filters(filter_obj, n_samples), apply_filters(filter_obj, m_samples)
+
+    def _finalize_calibration_from_indices(arm_label, neutral_f, mvc_f, indices):
+        target = len(indices)
+        n_arr = _slice_channels_by_indices(neutral_f, indices, target)
+        m_arr = _slice_channels_by_indices(mvc_f, indices, target)
+        ratio = _ratio_from_filtered(n_arr, m_arr)
+        median_ratio = float(np.median(ratio))
+        n_weak = int(np.sum(ratio < MVC_MIN_RATIO))
+        print(
+            f"MVC quality [{arm_label}]: {median_ratio:.1f}x median "
+            f"({n_weak}/{len(ratio)} channels below {MVC_MIN_RATIO:.0f}x)"
+        )
+        if median_ratio < MVC_MIN_RATIO:
+            print(
+                f"[{arm_label}] Calibration quality below threshold; "
+                "MVC normalization disabled for this arm."
+            )
+            return None, None
+        n_mean = np.mean(n_arr, axis=0)
+        m_scale = np.percentile(m_arr, MVC_PERCENTILE, axis=0)
+        m_scale = np.where(m_scale < 1e-6, 1.0, m_scale)
+        print(f"[{arm_label}] Calibration complete. (quality: {median_ratio:.1f}x)")
+        return n_mean, m_scale
+
+    def _print_dual_channel_mapping(right_idx, left_idx):
+        print(f"[gesture] dual mapping right indices ({len(right_idx)}): {right_idx.tolist()}")
+        print(f"[gesture] dual mapping left indices  ({len(left_idx)}): {left_idx.tolist()}")
+        if channel_labels:
+            right_pairs = sorted({
+                _parse_pair_number(channel_labels[int(i)])
+                for i in right_idx
+                if _parse_pair_number(channel_labels[int(i)]) is not None
+            })
+            left_pairs = sorted({
+                _parse_pair_number(channel_labels[int(i)])
+                for i in left_idx
+                if _parse_pair_number(channel_labels[int(i)]) is not None
+            })
+            print(f"[gesture] dual mapping right pairs: {right_pairs}")
+            print(f"[gesture] dual mapping left pairs:  {left_pairs}")
+
     if CALIBRATE:
         if dual_arm:
-            # Dual-arm: calibrate each arm separately so MVC squeeze is arm-specific
-            neutral_mean_right, mvc_scale_right = _do_calibration(
-                "right", RIGHT_ARM_CHANNELS, collect_channels=None, channel_start=0
-            )
-            neutral_mean_left, mvc_scale_left = _do_calibration(
-                "left", left_channels, collect_channels=None, channel_start=RIGHT_ARM_CHANNELS
-            )
+            if AUTO_DUAL_ARM_CHANNEL_MAPPING:
+                right_neutral_f, right_mvc_f = _collect_calibration_full("right")
+                left_neutral_f, left_mvc_f = _collect_calibration_full("left")
+                if (
+                    right_neutral_f is None or right_mvc_f is None
+                    or left_neutral_f is None or left_mvc_f is None
+                ):
+                    print("[gesture] dual-arm calibration unavailable; MVC normalization disabled.")
+                    neutral_mean_right = mvc_scale_right = None
+                    neutral_mean_left = mvc_scale_left = None
+                else:
+                    right_ratio_full = _ratio_from_filtered(right_neutral_f, right_mvc_f)
+                    left_ratio_full = _ratio_from_filtered(left_neutral_f, left_mvc_f)
+                    right_channel_indices, left_channel_indices = _derive_dual_indices_from_pairs(
+                        channel_labels,
+                        RIGHT_ARM_CHANNELS,
+                        left_channels,
+                        right_ratio_full,
+                        left_ratio_full,
+                    )
+                    _print_dual_channel_mapping(right_channel_indices, left_channel_indices)
+                    neutral_mean_right, mvc_scale_right = _finalize_calibration_from_indices(
+                        "right", right_neutral_f, right_mvc_f, right_channel_indices
+                    )
+                    neutral_mean_left, mvc_scale_left = _finalize_calibration_from_indices(
+                        "left", left_neutral_f, left_mvc_f, left_channel_indices
+                    )
+            else:
+                # Legacy dual-arm contiguous split (requires right channels first).
+                neutral_mean_right, mvc_scale_right = _do_calibration(
+                    "right", RIGHT_ARM_CHANNELS, collect_channels=None, channel_start=0
+                )
+                neutral_mean_left, mvc_scale_left = _do_calibration(
+                    "left", left_channels, collect_channels=None, channel_start=RIGHT_ARM_CHANNELS
+                )
         else:
             # Single-arm: if left_arm_start > 0 (all sensors connected in left mode),
             # collect all channels then slice; otherwise collect only model_channels.
@@ -842,7 +1249,9 @@ def main(argv=None):
         neutral_mean = neutral_mean_right
         mvc_scale    = mvc_scale_right
 
-    if CALIBRATE and GESTURE_CALIB and filter_obj is not None:
+    if dual_arm and GESTURE_CALIB:
+        print("[gesture] dual-arm mode: skipping per-gesture fine-tuning calibration.")
+    if CALIBRATE and GESTURE_CALIB and (not dual_arm) and filter_obj is not None:
         print("\n=== Per-gesture calibration ===")
         print(f"Perform each gesture for {GESTURE_CALIB_S:.0f}s when prompted.\n")
 
@@ -937,6 +1346,8 @@ def main(argv=None):
     warmup_right       = FILTER_WARMUP == 0
     pending_right      = 0
     pred_history_right = deque(maxlen=max(1, SMOOTHING))
+    pred_history_stage_a_right = deque(maxlen=max(1, SMOOTHING))
+    two_stage_state_right = {"active": False}
     hysteresis_state_right = {"label": LOW_CONFIDENCE_LABEL}
 
     # Left arm (dual-arm mode only)
@@ -1007,8 +1418,12 @@ def main(argv=None):
 
             # --- split channels by arm ---
             if dual_arm:
-                batch_right = _slice_channels(batch_arr, 0, RIGHT_ARM_CHANNELS)
-                batch_left = _slice_channels(batch_arr, RIGHT_ARM_CHANNELS, left_channels)
+                batch_right = _slice_channels_by_indices(
+                    batch_arr, right_channel_indices, RIGHT_ARM_CHANNELS
+                )
+                batch_left = _slice_channels_by_indices(
+                    batch_arr, left_channel_indices, left_channels
+                )
             else:
                 batch_right = _slice_channels(batch_arr, left_arm_start, model_channels)
 
@@ -1048,19 +1463,48 @@ def main(argv=None):
                     )
                     filtered = (filtered - neutral_mean_right) / mvc_scale_right
 
-                window = filtered.T[np.newaxis, :, :].astype(np.float32)
-                window = bundle_right.standardize(window)
-                probs  = bundle_right.predict_proba(window)[0]
-                probs  = _restrict_probs(probs, allowed_indices_right)
+                window_raw = filtered.T[np.newaxis, :, :].astype(np.float32)
+                if use_two_stage:
+                    window_a = bundle_stage_a.standardize(window_raw)
+                    probs_a = bundle_stage_a.predict_proba(window_a)[0]
+                    pred_history_stage_a_right.append(probs_a)
+                    if SMOOTHING > 1:
+                        probs_a = np.mean(np.stack(pred_history_stage_a_right, axis=0), axis=0)
 
-                pred_history_right.append(probs)
-                if SMOOTHING > 1:
-                    probs = np.mean(np.stack(pred_history_right, axis=0), axis=0)
+                    active_prob = float(probs_a[int(stage_a_active_idx)])
+                    neutral_prob = float(probs_a[int(stage_a_neutral_idx)])
+                    stage_is_active = _two_stage_active_gate(active_prob, two_stage_state_right)
 
-                label_right, conf_right, _ = _decode_prediction(probs, index_to_label_right)
-                label_right, conf_right = _apply_hysteresis(
-                    label_right, conf_right, probs, index_to_label_right, hysteresis_state_right
-                )
+                    if stage_is_active:
+                        window_b = bundle_right.standardize(window_raw)
+                        probs = bundle_right.predict_proba(window_b)[0]
+                        probs = _restrict_probs(probs, allowed_indices_right)
+                        pred_history_right.append(probs)
+                        if SMOOTHING > 1:
+                            probs = np.mean(np.stack(pred_history_right, axis=0), axis=0)
+                        label_right, conf_right, _ = _decode_prediction(probs, index_to_label_right)
+                        label_right, conf_right = _apply_hysteresis(
+                            label_right, conf_right, probs, index_to_label_right, hysteresis_state_right
+                        )
+                    else:
+                        # Reset gesture decoder memory when Stage A returns to neutral.
+                        pred_history_right.clear()
+                        hysteresis_state_right["label"] = LOW_CONFIDENCE_LABEL
+                        label_right = LOW_CONFIDENCE_LABEL
+                        conf_right = neutral_prob
+                else:
+                    window = bundle_right.standardize(window_raw)
+                    probs  = bundle_right.predict_proba(window)[0]
+                    probs  = _restrict_probs(probs, allowed_indices_right)
+
+                    pred_history_right.append(probs)
+                    if SMOOTHING > 1:
+                        probs = np.mean(np.stack(pred_history_right, axis=0), axis=0)
+
+                    label_right, conf_right, _ = _decode_prediction(probs, index_to_label_right)
+                    label_right, conf_right = _apply_hysteresis(
+                        label_right, conf_right, probs, index_to_label_right, hysteresis_state_right
+                    )
 
                 inference_ran = True
                 # We intentionally keep only the newest inference point and

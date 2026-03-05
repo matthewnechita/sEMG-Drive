@@ -51,6 +51,32 @@ Common commands
   python realtime_gesture.py --model models/gesture_classifier.pkl --show-confidence
 - Run live CNN inference (per-subject — replace subject01 with actual subject ID):
   python realtime_gesture_cnn.py --model models/subject01_gesture_cnn.pt
+- Train cross-subject CNN (current default is two-stage):
+  python train_cross_subject.py
+- Run live cross-subject CNN (two-stage):
+  python realtime_gesture_cnn.py --two-stage --model-stage-a models/cross_subject/right/gesture_cnn_v3_m2_excl05_label_smoothing005_stage_a_neutral_active.pt --model-stage-b models/cross_subject/right/gesture_cnn_v3_m2_excl05_label_smoothing005_stage_b_active_gestures.pt
+- Run live cross-subject CNN (single-stage fallback):
+  python realtime_gesture_cnn.py --no-two-stage --model models/cross_subject/right/gesture_cnn_v3_m2_excl05_label_smoothing005.pt
+
+Cross-subject CNN status (March 4, 2026)
+- `train_cross_subject.py` default settings:
+  - `MODEL_OUT = models/cross_subject/right/gesture_cnn_v3_m2_excl05_label_smoothing005.pt`
+  - `MIN_LABEL_CONFIDENCE = 0.8`
+  - `LABEL_SMOOTHING = 0.05`
+  - `USE_TWO_STAGE = True` (Stage A neutral/active + Stage B active gestures)
+- Two-stage model outputs are saved as:
+  - `..._stage_a_neutral_active.pt`
+  - `..._stage_b_active_gestures.pt`
+- Realtime two-stage support is implemented in `realtime_gesture_cnn.py`:
+  - Flags: `--two-stage`, `--model-stage-a`, `--model-stage-b`, `--no-two-stage`
+  - Stage A gate thresholds: `TWO_STAGE_ACTIVE_ENTER_THRESHOLD=0.60`, `TWO_STAGE_ACTIVE_EXIT_THRESHOLD=0.45`
+  - Safety check: Stage B must NOT contain `neutral` label.
+  - Limitation: two-stage is currently single-arm only (not dual-arm).
+- Realtime calibration threshold aligned with training:
+  - `MVC_MIN_RATIO = 1.5` in realtime (matches training policy).
+- Current realtime config in file is tuned for responsiveness tests:
+  - `SMOOTHING=7`, `MIN_CONFIDENCE=0.55`.
+- `INCLUDED_GESTURES` is still code-driven; keep using it for custom gesture subset experiments.
 
 Notes
 - data_collection.py now saves into a raw/ subfolder with _raw.npz suffix.
@@ -62,7 +88,7 @@ Notes
 - realtime_gesture_cnn.py loads CNN bundles with torch.load(weights_only=False) for PyTorch 2.6+ compatibility.
 - Data collection GUI plot throttling: plot updates ~30 Hz, plot queue maxlen 64, plot window 5,000 samples to reduce lag.
 - EMG drift over time can cause gesture flicker; collect longer sessions and keep placement consistent.
-- Realtime defaults: SMOOTHING=11 (~550ms), MIN_CONFIDENCE=0.65 — tuned for 6-class stability.
+- Realtime legacy defaults (older runs): SMOOTHING=11 (~550ms), MIN_CONFIDENCE=0.65.
 - Consider per-channel normalization (rolling mean/std) in both training and realtime if drift persists.
 - If realtime starts from a non-neutral pose and biases to one label, treat it as baseline/pose shift; mitigate via per-session calibration (neutral + MVC) with the same normalization in training + realtime, add an "other/rest" class, and/or rely on confidence gating to force neutral when uncertain.
 - Adding a new participant's data to a cross-subject model rarely improves test accuracy because: (a) the test metric is dominated by existing subjects, (b) inter-subject EMG patterns don't transfer without a larger model. Use PER_SUBJECT_MODELS = True instead.
@@ -76,3 +102,5 @@ Notes
   - Inference: compute left/right labels + confidences, then fuse post-hoc:
     - If both arms agree with high confidence, collapse to one control label (strengthen).
     - If they disagree, emit per-arm labels or pick higher-confidence label if above threshold; otherwise neutral.
+- Dev environment note:
+  - Expected conda env for training/inference/testing is `capstone-emg` (has `torch` and `libemg`).

@@ -794,13 +794,32 @@ class CollectDataWindow(QWidget):
                 if calib_neutral_x and calib_mvc_x:
                     neutral_arr = np.asarray(calib_neutral_x, dtype=float)
                     mvc_arr = np.asarray(calib_mvc_x, dtype=float)
-                    neutral_rms = np.sqrt(np.mean(neutral_arr ** 2, axis=0))
-                    mvc_rms = np.sqrt(np.mean(mvc_arr ** 2, axis=0))
+                    quality_neutral = neutral_arr
+                    quality_mvc = mvc_arr
+                    quality_scope = f"all {neutral_arr.shape[1]} channels"
+
+                    # If both arms are connected in one stream, score only the selected arm.
+                    # Sensor pairing contract is right arm channels first, then left arm channels.
+                    if neutral_arr.shape[1] >= 30 and neutral_arr.shape[1] == mvc_arr.shape[1]:
+                        split_idx = (neutral_arr.shape[1] + 1) // 2
+                        if config.arm == "right":
+                            quality_neutral = neutral_arr[:, :split_idx]
+                            quality_mvc = mvc_arr[:, :split_idx]
+                        else:
+                            quality_neutral = neutral_arr[:, split_idx:]
+                            quality_mvc = mvc_arr[:, split_idx:]
+                        quality_scope = (
+                            f"{config.arm} arm channels "
+                            f"({quality_neutral.shape[1]}/{neutral_arr.shape[1]})"
+                        )
+
+                    neutral_rms = np.sqrt(np.mean(quality_neutral ** 2, axis=0))
+                    mvc_rms = np.sqrt(np.mean(quality_mvc ** 2, axis=0))
                     ratio = np.where(neutral_rms < 1e-9, 1.0, mvc_rms / neutral_rms)
                     median_ratio = float(np.median(ratio))
                     n_weak = int(np.sum(ratio < config.calibration_min_ratio))
                     quality_msg = (
-                        f"MVC quality: {median_ratio:.1f}x median "
+                        f"MVC quality ({quality_scope}): {median_ratio:.1f}x median "
                         f"({n_weak}/{len(ratio)} channels below {config.calibration_min_ratio:.0f}x)"
                     )
                     events.append({
@@ -808,6 +827,7 @@ class CollectDataWindow(QWidget):
                         "t_wall": time.time(),
                         "median_ratio": median_ratio,
                         "n_weak_channels": n_weak,
+                        "scope": quality_scope,
                     })
                     if median_ratio < config.calibration_min_ratio:
                         self.update_instruction(

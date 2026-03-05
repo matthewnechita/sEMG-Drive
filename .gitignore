@@ -1,5 +1,11 @@
 # Data artifacts
 data/
+data_resampled/
+
+# Generated local experiment artifacts
+models/cross_subject/left/
+models/cross_subject/right/*_stage_a_neutral_active.pt
+models/cross_subject/right/*_stage_b_active_gestures.pt
 
 # Python caches
 __pycache__/
