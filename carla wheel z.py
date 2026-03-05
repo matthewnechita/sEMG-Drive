@@ -339,15 +339,6 @@ class DualControl(object):
 
     def _parse_vehicle_keys(self, keys, milliseconds):
         self._control.throttle = 1.0 if keys[K_UP] or keys[K_w] else 0.0
-        steer_increment = 5e-4 * milliseconds
-        if keys[K_LEFT] or keys[K_a]:
-            self._steer_cache -= steer_increment
-        elif keys[K_RIGHT] or keys[K_d]:
-            self._steer_cache += steer_increment
-        else:
-            self._steer_cache = 0.0
-        self._steer_cache = min(0.7, max(-0.7, self._steer_cache))
-        self._control.steer = round(self._steer_cache, 1)
         self._control.brake = 1.0 if keys[K_DOWN] or keys[K_s] else 0.0
         self._control.hand_brake = keys[K_SPACE]
 
@@ -426,18 +417,18 @@ class DualControl(object):
     
             # Optional: cancel signals when returning to neutral (you can remove if you want)
             if label == "neutral" and self._signal_state != "off":
-                self._set_turn_signal("off")
+                self._turn_signal("off")
             return
     
         # --- Signal gestures ---
         if label == "signal_left":
             if self._signal_state != "left":
-                self._set_turn_signal("left")
+                self._turn_signal("left")
             return
     
         if label == "signal_right":
             if self._signal_state != "right":
-                self._set_turn_signal("right")
+                self._turn_signal("right")
             return
     
         # --- Horn gesture ---
@@ -448,6 +439,37 @@ class DualControl(object):
     @staticmethod
     def _is_quit_shortcut(key):
         return (key == K_ESCAPE) or (key == K_q and pygame.key.get_mods() & KMOD_CTRL)
+
+    def _set_turn_signal(self, side: str):
+        """
+        side: "off" | "left" | "right"
+        """
+        if not isinstance(self._player, carla.Vehicle):
+            return
+    
+        # Preserve any existing lights, but replace blinker bits.
+        current = int(self._player.get_light_state())
+        left_bit = int(carla.VehicleLightState.LeftBlinker)
+        right_bit = int(carla.VehicleLightState.RightBlinker)
+        mask = left_bit | right_bit
+    
+        new_bits = 0
+        if side == "left":
+            new_bits = left_bit
+        elif side == "right":
+            new_bits = right_bit
+    
+        new_state = (current & ~mask) | new_bits
+        self._player.set_light_state(carla.VehicleLightState(new_state))
+        self._signal_state = side
+    
+    def _honk(self):
+        # CARLA doesn't have a built-in horn actuator for standard vehicles,
+        # so we simulate it with a HUD notification (and optional sound if you add one).
+        if hasattr(self, "_hud") and self._hud is not None:
+            self._hud.notification("HORN!", seconds=0.2)
+        else:
+            print("HORN!")
 
 
 # ==============================================================================
@@ -585,37 +607,6 @@ class HUD(object):
                 v_offset += 18
         self._notifications.render(display)
         self.help.render(display)
-
-    def _set_turn_signal(self, side: str):
-        """
-        side: "off" | "left" | "right"
-        """
-        if not isinstance(self._player, carla.Vehicle):
-            return
-    
-        # Preserve any existing lights, but replace blinker bits.
-        current = int(self._player.get_light_state())
-        left_bit = int(carla.VehicleLightState.LeftBlinker)
-        right_bit = int(carla.VehicleLightState.RightBlinker)
-        mask = left_bit | right_bit
-    
-        new_bits = 0
-        if side == "left":
-            new_bits = left_bit
-        elif side == "right":
-            new_bits = right_bit
-    
-        new_state = (current & ~mask) | new_bits
-        self._player.set_light_state(carla.VehicleLightState(new_state))
-        self._signal_state = side
-    
-    def _honk(self):
-        # CARLA doesn't have a built-in horn actuator for standard vehicles,
-        # so we simulate it with a HUD notification (and optional sound if you add one).
-        if hasattr(self, "_hud") and self._hud is not None:
-            self._hud.notification("HORN!", seconds=0.2)
-        else:
-            print("HORN!")
 
 
 # ==============================================================================
