@@ -417,18 +417,18 @@ class DualControl(object):
     
             # Optional: cancel signals when returning to neutral (you can remove if you want)
             if label == "neutral" and self._signal_state != "off":
-                self._turn_signal("off")
+                self._set_turn_signal("off")
             return
     
         # --- Signal gestures ---
         if label == "signal_left":
             if self._signal_state != "left":
-                self._turn_signal("left")
+                self._set_turn_signal("left")
             return
     
         if label == "signal_right":
             if self._signal_state != "right":
-                self._turn_signal("right")
+                self._set_turn_signal("right")
             return
     
         # --- Horn gesture ---
