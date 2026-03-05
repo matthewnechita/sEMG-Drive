@@ -251,19 +251,23 @@ class DualControl(object):
         self._handbrake_idx = int(
             self._parser.get('G29 Racing Wheel', 'handbrake'))
         
-        # work in progress
-        self._wheel_delta_deadzone = 0.02
-        self._gesture_override_window = 0.35
-        self._gesture_max_age = 0.5
-        self._last_wheel_input_ts = 0.0
-        self._last_jsInputs = None
-
+        # Store references so gesture actions can affect vehicle + HUD
+        self._player = world.player
+        self._hud = world.hud
+        
+        # Gesture freshness (optional safety: ignore stale labels)
+        self._gesture_max_age = 0.75
+        
+        # Gestures -> steering only (NO throttle/brake from gestures)
         self._gesture_to_steer = {
-            "left_turn": -0.5,
-            "right_turn": 0.5,
-            "neutral": 0.0,
+            "left_turn":  -0.5,
+            "right_turn":  0.5,
+            "neutral":     0.0,
         }
-        self._gesture_throttle_when_idle = 0.35
+        
+        # Track signals so they behave like a real car (stay on until changed/canceled)
+        self._signal_state = "off"  # "off" | "left" | "right"
+        
         self._gesture_thread = None
         self._start_gesture_thread()
 
@@ -353,21 +357,8 @@ class DualControl(object):
         # print (jsInputs)
         jsButtons = [float(self._joystick.get_button(i)) for i in
                      range(self._joystick.get_numbuttons())]
-        now = time.time()
-        if self._last_jsInputs is None:
-            self._last_jsInputs = jsInputs
-        else:
-            max_delta = max(abs(a - b) for a, b in zip(jsInputs, self._last_jsInputs)) if jsInputs else 0.0
-            any_button = any(b > 0.5 for b in jsButtons) if jsButtons else False
-            if max_delta > self._wheel_delta_deadzone or any_button:
-                self._last_wheel_input_ts = now
-            self._last_jsInputs = jsInputs
 
-        # Custom function to map range of inputs [1, -1] to outputs [0, 1] i.e 1 from inputs means nothing is pressed
-        # For the steering, it seems fine as it is
-        K1 = 1.0  # 0.55
-        steerCmd = K1 * math.tan(1.1 * jsInputs[self._steer_idx])
-
+        
         K2 = 1.6  # 1.6
         throttleCmd = K2 + (2.05 * math.log10(
             -0.7 * jsInputs[self._throttle_idx] + 1.4) - 1.2) / 0.92
@@ -383,7 +374,6 @@ class DualControl(object):
         elif brakeCmd > 1:
             brakeCmd = 1
 
-        self._control.steer = steerCmd
         self._control.brake = brakeCmd
         self._control.throttle = throttleCmd
 
@@ -425,16 +415,35 @@ class DualControl(object):
     def _apply_gesture_override(self):
         if realtime_gesture is None:
             return
-        
-        if (time.time() - self._last_wheel_input_ts) < self._gesture_override_window:
-            return
-        
+    
         label, age = realtime_gesture.get_latest_gesture()
         if age > self._gesture_max_age:
             return
-        
-        steer = self._gesture_to_steer.get(label, 0.0)
-        self._control.steer = float(steer)
+    
+        # --- Steering gestures ---
+        if label in self._gesture_to_steer:
+            self._control.steer = float(self._gesture_to_steer[label])
+    
+            # Optional: cancel signals when returning to neutral (you can remove if you want)
+            if label == "neutral" and self._signal_state != "off":
+                self._set_turn_signal("off")
+            return
+    
+        # --- Signal gestures ---
+        if label == "signal_left":
+            if self._signal_state != "left":
+                self._set_turn_signal("left")
+            return
+    
+        if label == "signal_right":
+            if self._signal_state != "right":
+                self._set_turn_signal("right")
+            return
+    
+        # --- Horn gesture ---
+        if label == "horn":
+            self._honk()
+            return
 
     @staticmethod
     def _is_quit_shortcut(key):
@@ -576,6 +585,37 @@ class HUD(object):
                 v_offset += 18
         self._notifications.render(display)
         self.help.render(display)
+
+    def _set_turn_signal(self, side: str):
+        """
+        side: "off" | "left" | "right"
+        """
+        if not isinstance(self._player, carla.Vehicle):
+            return
+    
+        # Preserve any existing lights, but replace blinker bits.
+        current = int(self._player.get_light_state())
+        left_bit = int(carla.VehicleLightState.LeftBlinker)
+        right_bit = int(carla.VehicleLightState.RightBlinker)
+        mask = left_bit | right_bit
+    
+        new_bits = 0
+        if side == "left":
+            new_bits = left_bit
+        elif side == "right":
+            new_bits = right_bit
+    
+        new_state = (current & ~mask) | new_bits
+        self._player.set_light_state(carla.VehicleLightState(new_state))
+        self._signal_state = side
+    
+    def _honk(self):
+        # CARLA doesn't have a built-in horn actuator for standard vehicles,
+        # so we simulate it with a HUD notification (and optional sound if you add one).
+        if hasattr(self, "_hud") and self._hud is not None:
+            self._hud.notification("HORN!", seconds=0.2)
+        else:
+            print("HORN!")
 
 
 # ==============================================================================
