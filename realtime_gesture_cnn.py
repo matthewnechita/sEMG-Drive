@@ -6,6 +6,9 @@ from collections import deque
 import os
 import threading
 
+# Base directory of this script (used to build absolute model paths)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 import numpy as np
 import torch
 
@@ -108,8 +111,21 @@ GESTURE_INSTRUCTIONS = {
 #   "left"  - left arm only   (pair left arm sensors first in Delsys)
 #   "dual"  - both arms fused (pair right first, then left in Delsys)
 MODE        = "dual"
-MODEL_RIGHT = "models/cross_subject/right/gesture_cnn_v3_m2_excl05_label_smoothing005.pt"
-MODEL_LEFT  = "models/cross_subject/left/gesture_cnn_v3_left_m1_single_stage_dual_ready.pt"
+MODEL_RIGHT = os.path.join(
+    BASE_DIR,
+    "models",
+    "cross_subject",
+    "right",
+    "gesture_cnn_v3_m2_excl05_label_smoothing005.pt",
+)
+
+MODEL_LEFT = os.path.join(
+    BASE_DIR,
+    "models",
+    "cross_subject",
+    "left",
+    "gesture_cnn_v3_left_m1_single_stage_dual_ready.pt",
+)
 # ================================
 
 # ======== Two-stage inference (single-arm only) ========
