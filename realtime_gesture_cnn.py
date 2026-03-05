@@ -39,7 +39,7 @@ NEUTRAL_OVERRIDE_MARGIN = 0.15
 NEUTRAL_OVERRIDE_MIN_CONFIDENCE = 0.60
 # If left_turn is close to signal_left, promote left_turn to counter
 # the observed left-turn under-detection bias in live use.
-ENABLE_LEFT_TURN_PROMOTION = True
+ENABLE_LEFT_TURN_PROMOTION = False
 LEFT_TURN_PROMOTION_MARGIN = 0.05
 LEFT_TURN_PROMOTION_MIN_CONFIDENCE = 0.35
 # Hysteresis is an optional post-decoder state machine.
