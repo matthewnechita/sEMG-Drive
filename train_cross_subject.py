@@ -37,9 +37,9 @@ from emg.gesture_model_cnn import GestureCNNv2
 
 
 # ======== Config ========
-ARM        = "left"            # ← set to "right" or "left" before running
-DATA_ROOT  = Path("data") / f"{ARM} arm"
-MODEL_OUT  = Path("models/cross_subject") / ARM / "gesture_cnn_v3_left_m1_single_stage_dual_ready.pt"
+ARM        = "right"            # ← set to "right" or "left" before running
+DATA_ROOT  = Path("data_resampled") / f"{ARM} arm"
+MODEL_OUT  = Path("models/cross_subject") / ARM / "gesture_cnn_v3_right_arm_new.pt"
 PATTERN    = "*_filtered.npz"
 
 WINDOW_SIZE = 200

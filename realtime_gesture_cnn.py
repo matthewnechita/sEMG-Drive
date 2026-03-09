@@ -31,10 +31,10 @@ REALTIME_RESAMPLE = True
 # Set to None to use model metadata when available.
 REALTIME_TARGET_FS_HZ = 2000.0
 
-SMOOTHING = 5   # balance stability without excessive response lag
+SMOOTHING = 1   # balance stability without excessive response lag
 MIN_CONFIDENCE = 0.45  # reduce neutral fallback when Stage B is moderately confident
 LOW_CONFIDENCE_LABEL = "neutral"
-ENABLE_NEUTRAL_OVERRIDE = True
+ENABLE_NEUTRAL_OVERRIDE = False
 NEUTRAL_OVERRIDE_MARGIN = 0.15
 NEUTRAL_OVERRIDE_MIN_CONFIDENCE = 0.60
 # If left_turn is close to signal_left, promote left_turn to counter
@@ -44,7 +44,7 @@ LEFT_TURN_PROMOTION_MARGIN = 0.05
 LEFT_TURN_PROMOTION_MIN_CONFIDENCE = 0.35
 # Hysteresis is an optional post-decoder state machine.
 # Disable quickly by setting ENABLE_HYSTERESIS = False.
-ENABLE_HYSTERESIS = True
+ENABLE_HYSTERESIS = False
 HYSTERESIS_ENTER_THRESHOLD = 0.60   # neutral -> gesture
 HYSTERESIS_EXIT_THRESHOLD = 0.38    # gesture -> neutral (lower than enter)
 HYSTERESIS_SWITCH_THRESHOLD = 0.70  # gesture A -> gesture B

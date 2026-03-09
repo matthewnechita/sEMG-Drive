@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-DATA_ROOT  = Path("data")
+DATA_ROOT  = Path("data_resampled")
 PATTERN    = "*_filtered.npz"
 PERCENTILE = 95.0
 

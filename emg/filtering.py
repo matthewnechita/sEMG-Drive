@@ -3,6 +3,25 @@ from pathlib import Path
 from libemg import filtering as libemg_filter
 
 
+def _coerce_scalar_fs(value):
+    """
+    Convert fs payloads (Python scalar, 0-d array, size-1 array) to float.
+    Returns None when conversion is not possible.
+    """
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=float).reshape(-1)
+    except Exception:
+        return None
+    if arr.size != 1:
+        return None
+    fs = float(arr[0])
+    if not np.isfinite(fs):
+        return None
+    return fs
+
+
 # LOAD IN THE RAW EMG DATA
 def load_emg_data(file_path):
     """
@@ -14,7 +33,7 @@ def load_emg_data(file_path):
 
     if "emg" in data:
         emg = data["emg"]
-        fs = data["fs"]
+        fs = _coerce_scalar_fs(data.get("fs"))
         # carry any additional keys through to the filtered file
         extras = {k: data[k] for k in data.files if k not in ["emg", "fs"]}
     else:
@@ -34,16 +53,16 @@ def load_emg_data(file_path):
                 extras[key] = data.get(key)
         # derive sampling rate from timestamp spacing if not present
         if "fs" in data:
-            fs = data["fs"]
+            fs = _coerce_scalar_fs(data.get("fs"))
         elif isinstance(metadata, dict) and "fs" in metadata:
-            fs = metadata["fs"]
+            fs = _coerce_scalar_fs(metadata.get("fs"))
         elif timestamps is not None:
             step = np.median(np.diff(timestamps[:, 0]))
             fs = 1.0 / step if step else None
         else:
             fs = None
 
-    return emg, fs, extras
+    return emg, _coerce_scalar_fs(fs), extras
 
 
 # DEFINE THE FILTERS USING libEMG
@@ -97,7 +116,7 @@ def destination_for_filtered(raw_path: Path) -> Path:
 
 
 if __name__ == "__main__":
-    root = Path("data")
+    root = Path("data_resampled")
 
     for fp in root.rglob("*_raw.npz"):
         out_path = destination_for_filtered(fp)

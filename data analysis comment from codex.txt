@@ -63,3 +63,49 @@
 
   If you want, I can next do a clean ablation retrain plan (exclude subject04 first, then add back session-by-session)
   and give you a strict keep/drop manifest.
+
+
+• Right-arm cross-subject drop list, grouped by subject (25 files total):
+
+  [Matthew] (3)
+  Matthew_session01_relabeled_first_gesture_dropped_filtered.npz
+  Matthew_session20_filtered.npz
+  Matthew_session21_filtered.npz
+
+  [subject03] (2)
+  subject03_session05_relabeled_first_gesture_dropped_filtered.npz
+  subject03_session06_relabeled_first_gesture_dropped_filtered.npz
+
+  [subject04] (5)
+  subject04_session01_relabeled_first_gesture_dropped_filtered.npz
+  subject04_session02_relabeled_first_gesture_dropped_filtered.npz
+  subject04_session03_relabeled_first_gesture_dropped_filtered.npz
+  subject04_session04_relabeled_first_gesture_dropped_filtered.npz
+  subject04_session05_relabeled_first_gesture_dropped_filtered.npz
+
+  [subject05] (4)
+  subject05_session01_relabeled_first_gesture_dropped_filtered.npz
+  subject05_session02_relabeled_first_gesture_dropped_filtered.npz
+  subject05_session03_relabeled_first_gesture_dropped_filtered.npz
+  subject05_session04_relabeled_first_gesture_dropped_filtered.npz
+
+  [subject06] (7)
+  subject06_session01_relabeled_first_gesture_dropped_filtered.npz
+  subject06_session02_relabeled_first_gesture_dropped_filtered.npz
+  subject06_session03_relabeled_first_gesture_dropped_filtered.npz
+  subject06_session04_relabeled_first_gesture_dropped_filtered.npz
+  subject06_session05_relabeled_first_gesture_dropped_filtered.npz
+  subject06_session06_relabeled_first_gesture_dropped_filtered.npz
+  subject06_session07_relabeled_first_gesture_dropped_filtered.npz
+
+  [subject07] (1)
+  subject07_session01_filtered.npz
+
+  [subject10] (3)
+  subject10_session01_filtered.npz
+  subject10_session04_filtered.npz
+  subject10_session07_filtered.npz
+
+  Optional left-arm review/drop candidate:
+
+  - subject12_session06_filtered.npz
