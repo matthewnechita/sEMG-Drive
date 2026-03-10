@@ -1,1 +1,13 @@
 When trying the mvc calibration in data collection, no matter how hard I flexed and contracted my muscles, I couldn't even get close to 2x median, the best I got was 1.1x, 9/17 channels were under the 2x minimum calibration ratio
+
+[2026-03-09] Realtime mismatch likely explained by hardware failure:
+- Both Maize sensors appear to have died (timing unknown).
+- This can cause severe train/realtime distribution shift because the model expects a fixed channel pattern from the original sensor setup.
+- Observed failure pattern (right_turn not recognized, class collapse toward left_turn/neutral) is consistent with dead/flat/missing channels.
+
+Resume plan after sensors are charged/fixed:
+1) Verify sensor health first (especially Maize channels).
+2) Keep hardware/channel setup fixed for the entire run.
+3) Recollect a short right-arm dataset with the exact current sensor configuration.
+4) Retrain right-arm per-subject model on that configuration.
+5) Re-run `realtime_confidence_analysis.py --mode right` before dual-arm tests.

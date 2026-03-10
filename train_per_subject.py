@@ -1,70 +1,75 @@
-"""Per-subject EMG gesture classifier training — Stream 1.
+"""Single-subject EMG gesture classifier training (cross-subject-aligned).
 
-Uses GestureCNN (120K params, z-score normalisation, no InstanceNorm).
-Trains one model per subject; models are saved to models/per_subject/.
+Uses GestureCNNv2 (InstanceNorm input + energy bypass) with the same core
+training/evaluation style as train_cross_subject.py, but trains exactly one
+model for TARGET_SUBJECT.
 
 Usage:
     python train_per_subject.py
 
-To run realtime inference with a per-subject model:
-    python realtime_gesture_cnn.py --model models/per_subject/Matthew_cnn.pt
+To run realtime inference with the trained model:
+    python realtime_gesture_cnn.py --model models/per_subject/right/Matthew_cnn.pt
 """
+import copy
 import datetime as dt
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.metrics import accuracy_score, classification_report
+import torch.nn.functional as _F
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+)
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from libemg.utils import get_windows
-from emg.gesture_model_cnn import GestureCNN
+from emg.gesture_model_cnn import GestureCNNv2
 
 
 # ======== Config ========
-ARM        = "right"           # ← set to "right" or "left" before running
-DATA_ROOT  = Path("data") / f"{ARM} arm"
-MODEL_DIR  = Path("models/per_subject") / ARM
-PATTERN    = "*_filtered.npz"
+ARM = "left"  # set to "right" or "left" before running
+TARGET_SUBJECT = "Matthew"
+
+DATA_ROOT = Path("data_resampled") / f"{ARM} arm"
+PATTERN = "*_filtered.npz"
+MODEL_OUT = Path("models/per_subject") / ARM / f"{TARGET_SUBJECT}_cnn_resample.pt"
 
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
 
-USE_CALIBRATION        = True
-MVC_PERCENTILE         = 95.0
+USE_CALIBRATION = True
+MVC_PERCENTILE = 95.0
 USE_MIN_LABEL_CONFIDENCE = True
-MIN_LABEL_CONFIDENCE   = 0.8
+MIN_LABEL_CONFIDENCE = 0.75
 
-TEST_SIZE     = 0.2
-RANDOM_STATE  = 42
-BATCH_SIZE    = 512
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+BATCH_SIZE = 512
 
-# Per-subject hyperparameters
-# GestureCNN at 120K params fits well with 11K–23K per-subject training windows.
-EPOCHS   = 80      # convergence-appropriate for smaller model + per-subject data volume
-LR       = 3e-4    # slightly higher LR than cross-subject; smaller model, smaller dataset
-DROPOUT  = 0.2     # less regularisation; GestureCNN is already compact
-KERNEL_SIZE = 7    # original GestureCNN kernel
+EPOCHS = 65
+LR = 1e-4
+DROPOUT = 0.25
+LABEL_SMOOTHING = 0.05
 
 USE_CLASS_WEIGHTS = True
+USE_BALANCED_SAMPLING = True
 
-# Augmentation — narrow amplitude range matches within-subject EMG variance.
-# Between-subject amplitude can vary 5–10×; within-subject varies ~30%.
 USE_AUGMENTATION = True
-AMP_RANGE = (0.7, 1.4)   # within-subject amplitude variance range
-AUG_PROB  = 0.4           # slightly lower probability than cross-subject
+AMP_RANGE = (0.5, 2.0)
+AUG_PROB = 0.5
 
-# Subjects to skip entirely (e.g. data quality issues).
-# Per-subject training handles each subject independently so exclusion here
-# simply means no model is produced for that subject.
-EXCLUDED_SUBJECTS: list[str] = []
+EXCLUDED_SUBJECTS: list[str] = []  # Keep empty for Matthew-only runs unless you need to blacklist a subject.
+INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "signal_left", "signal_right"}  # Example subset: {"neutral", "left_turn", "right_turn"}.
 # ========================
 
 
-# ── Label utilities ──────────────────────────────────────────────────────────
+# -- Label utilities -----------------------------------------------------------
 
 def majority_label_with_confidence(segment):
     if segment.size == 0:
@@ -99,32 +104,143 @@ def majority_label_with_confidence(segment):
     return values[idx], confidence
 
 
-# ── Calibration ──────────────────────────────────────────────────────────────
+def _normalize_rows(cm: np.ndarray) -> np.ndarray:
+    row_sums = cm.sum(axis=1, keepdims=True).astype(float)
+    out = np.zeros_like(cm, dtype=float)
+    np.divide(cm, row_sums, out=out, where=row_sums != 0)
+    return out
 
-MVC_QUALITY_MIN_RATIO = 1.5  # skip MVC normalization if median ratio falls below this
+
+def _normalize_cols(cm: np.ndarray) -> np.ndarray:
+    col_sums = cm.sum(axis=0, keepdims=True).astype(float)
+    out = np.zeros_like(cm, dtype=float)
+    np.divide(cm, col_sums, out=out, where=col_sums != 0)
+    return out
+
+
+def _print_confusion_matrix(title: str, matrix: np.ndarray, label_names: list[str], as_percent: bool):
+    row_w = max(8, max(len(name) for name in label_names))
+    cell_w = max(8, max(len(name) for name in label_names))
+    header = " " * (row_w + 3) + " ".join(f"{name:>{cell_w}}" for name in label_names)
+    print(f"\n{title}")
+    print(header)
+    for i, name in enumerate(label_names):
+        if as_percent:
+            row = " ".join(f"{(100.0 * float(v)):>{cell_w}.1f}" for v in matrix[i])
+        else:
+            row = " ".join(f"{int(v):>{cell_w}d}" for v in matrix[i])
+        print(f"{name:>{row_w}} | {row}")
+
+
+def _compute_eval_artifacts(y_true, y_pred, index_to_label):
+    label_indices = list(range(len(index_to_label)))
+    label_names = [index_to_label[i] for i in label_indices]
+
+    report_text = classification_report(
+        y_true,
+        y_pred,
+        target_names=label_names,
+        zero_division=0,
+    )
+    report_dict = classification_report(
+        y_true,
+        y_pred,
+        target_names=label_names,
+        output_dict=True,
+        zero_division=0,
+    )
+
+    cm_counts = confusion_matrix(y_true, y_pred, labels=label_indices)
+    cm_row_norm = _normalize_rows(cm_counts)
+    cm_col_norm = _normalize_cols(cm_counts)
+
+    per_class = []
+    for name in label_names:
+        stats = report_dict.get(name, {})
+        precision = float(stats.get("precision", 0.0))
+        recall = float(stats.get("recall", 0.0))
+        f1 = float(stats.get("f1-score", 0.0))
+        per_class.append(
+            {
+                "label": name,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "pr_gap": abs(precision - recall),
+            }
+        )
+
+    worst_recall = min(per_class, key=lambda item: item["recall"]) if per_class else None
+
+    confusion_to_neutral_rate = {}
+    neutral_prediction_fp_rate = None
+    if "neutral" in label_names:
+        neutral_idx = label_names.index("neutral")
+        for i, name in enumerate(label_names):
+            if i == neutral_idx:
+                continue
+            row_total = int(cm_counts[i].sum())
+            rate = float(cm_counts[i, neutral_idx] / row_total) if row_total > 0 else 0.0
+            confusion_to_neutral_rate[name] = rate
+
+        pred_neutral_total = int(cm_counts[:, neutral_idx].sum())
+        neutral_tp = int(cm_counts[neutral_idx, neutral_idx])
+        neutral_fp = pred_neutral_total - neutral_tp
+        neutral_prediction_fp_rate = (
+            float(neutral_fp / pred_neutral_total) if pred_neutral_total > 0 else 0.0
+        )
+
+    return {
+        "classification_report_text": report_text,
+        "classification_report_dict": report_dict,
+        "confusion_matrix_counts": cm_counts,
+        "confusion_matrix_row_norm": cm_row_norm,
+        "confusion_matrix_col_norm": cm_col_norm,
+        "per_class": per_class,
+        "test_accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "macro_precision": float(report_dict["macro avg"]["precision"]),
+        "macro_recall": float(report_dict["macro avg"]["recall"]),
+        "macro_f1": float(report_dict["macro avg"]["f1-score"]),
+        "weighted_precision": float(report_dict["weighted avg"]["precision"]),
+        "weighted_recall": float(report_dict["weighted avg"]["recall"]),
+        "weighted_f1": float(report_dict["weighted avg"]["f1-score"]),
+        "worst_class_recall_label": worst_recall["label"] if worst_recall else None,
+        "worst_class_recall": worst_recall["recall"] if worst_recall else None,
+        "max_pr_gap_label": max(per_class, key=lambda item: item["pr_gap"])["label"] if per_class else None,
+        "max_pr_gap": max((item["pr_gap"] for item in per_class), default=None),
+        "confusion_to_neutral_rate": confusion_to_neutral_rate,
+        "neutral_prediction_fp_rate": neutral_prediction_fp_rate,
+    }
+
+
+# -- Calibration ---------------------------------------------------------------
+
+MVC_QUALITY_MIN_RATIO = 1.5
+
 
 def compute_calibration(neutral_emg, mvc_emg, percentile):
     neutral = np.asarray(neutral_emg, dtype=float)
-    mvc     = np.asarray(mvc_emg, dtype=float)
+    mvc = np.asarray(mvc_emg, dtype=float)
     if neutral.size == 0 or mvc.size == 0:
         return None, None
 
     neutral_rms = np.sqrt(np.mean(neutral ** 2, axis=0))
-    mvc_rms     = np.sqrt(np.mean(mvc ** 2, axis=0))
-    ratio       = np.where(neutral_rms < 1e-9, 1.0, mvc_rms / neutral_rms)
+    mvc_rms = np.sqrt(np.mean(mvc ** 2, axis=0))
+    ratio = np.where(neutral_rms < 1e-9, 1.0, mvc_rms / neutral_rms)
     median_ratio = float(np.median(ratio))
 
     if median_ratio < MVC_QUALITY_MIN_RATIO:
         print(
             f"  [calib] SKIP: median MVC/neutral ratio={median_ratio:.2f}x "
             f"(< {MVC_QUALITY_MIN_RATIO}x threshold). "
-            "MVC calibration failed — normalization not applied for this session."
+            "MVC calibration failed - normalization not applied for this session."
         )
         return None, None
 
     neutral_mean = np.mean(neutral, axis=0)
-    mvc_scale    = np.percentile(mvc, percentile, axis=0)
-    mvc_scale    = np.where(mvc_scale < 1e-6, 1.0, mvc_scale)
+    mvc_scale = np.percentile(mvc, percentile, axis=0)
+    mvc_scale = np.where(mvc_scale < 1e-6, 1.0, mvc_scale)
     return neutral_mean, mvc_scale
 
 
@@ -139,7 +255,8 @@ def validate_calibration_data(files):
             missing.append(fp)
     if missing:
         print(
-            f"WARNING: {len(missing)} file(s) lack calibration data. "
+            f"WARNING: {len(missing)} file(s) lack calibration data "
+            "(calib_neutral_emg / calib_mvc_emg). "
             "Calibration normalisation will be skipped for these sessions."
         )
         for fp in missing[:5]:
@@ -148,10 +265,19 @@ def validate_calibration_data(files):
             print(f"  ... and {len(missing) - 5} more.")
 
 
-# ── Data loading ─────────────────────────────────────────────────────────────
+# -- Data loading --------------------------------------------------------------
 
 def subject_from_path(path: Path) -> str:
     return path.parent.parent.name
+
+
+def _keep_gesture_label(label) -> bool:
+    if label is None:
+        return False
+    label = str(label)
+    if INCLUDED_GESTURES is not None and label not in INCLUDED_GESTURES:
+        return False
+    return True
 
 
 def load_windows_from_file(path):
@@ -162,7 +288,7 @@ def load_windows_from_file(path):
 
     if USE_CALIBRATION:
         calib_neutral = data.get("calib_neutral_emg")
-        calib_mvc     = data.get("calib_mvc_emg")
+        calib_mvc = data.get("calib_mvc_emg")
         if calib_neutral is not None and calib_mvc is not None:
             neutral_mean, mvc_scale = compute_calibration(
                 calib_neutral, calib_mvc, MVC_PERCENTILE
@@ -171,11 +297,11 @@ def load_windows_from_file(path):
                 emg = (emg - neutral_mean) / mvc_scale
 
     windows = get_windows(emg, WINDOW_SIZE, WINDOW_STEP)
-    labels  = np.asarray(data["y"], dtype=object)
+    labels = np.asarray(data["y"], dtype=object)
 
     n_windows = windows.shape[0]
-    starts    = np.arange(n_windows) * WINDOW_STEP
-    ends      = starts + WINDOW_SIZE
+    starts = np.arange(n_windows) * WINDOW_STEP
+    ends = starts + WINDOW_SIZE
 
     window_labels = []
     for s, e in zip(starts, ends):
@@ -184,11 +310,13 @@ def load_windows_from_file(path):
             lbl = None
         if USE_MIN_LABEL_CONFIDENCE and lbl is not None and confidence < MIN_LABEL_CONFIDENCE:
             lbl = None
+        if lbl is not None and not _keep_gesture_label(lbl):
+            lbl = None
         window_labels.append(lbl)
 
     window_labels = np.asarray(window_labels, dtype=object)
-    keep          = window_labels != None  # noqa: E711
-    windows       = windows[keep]
+    keep = window_labels != None  # noqa: E711
+    windows = windows[keep]
     window_labels = window_labels[keep]
 
     if windows.size == 0:
@@ -196,14 +324,24 @@ def load_windows_from_file(path):
     return windows.astype(np.float32), window_labels
 
 
-def load_dataset():
+def load_dataset(target_subject: str):
     files = sorted(DATA_ROOT.rglob(PATTERN))
     if not files:
         raise FileNotFoundError(f"No filtered files found under {DATA_ROOT}")
 
-    if EXCLUDED_SUBJECTS:
-        files = [f for f in files if subject_from_path(f) not in EXCLUDED_SUBJECTS]
-        print(f"Excluded subjects: {EXCLUDED_SUBJECTS}")
+    files = [f for f in files if subject_from_path(f) == target_subject]
+    if not files:
+        raise FileNotFoundError(
+            f"No filtered files found for TARGET_SUBJECT={target_subject!r} under {DATA_ROOT}"
+        )
+
+    if EXCLUDED_SUBJECTS and target_subject in EXCLUDED_SUBJECTS:
+        raise ValueError(
+            f"TARGET_SUBJECT={target_subject!r} is listed in EXCLUDED_SUBJECTS."
+        )
+
+    if INCLUDED_GESTURES is not None:
+        print(f"Including gestures only: {sorted(INCLUDED_GESTURES)}")
 
     if USE_CALIBRATION:
         validate_calibration_data(files)
@@ -221,7 +359,7 @@ def load_dataset():
         channel_counts.append(int(windows.shape[1]))
 
     if not X_list:
-        raise ValueError("No labeled windows found in filtered files.")
+        raise ValueError(f"No labeled windows found for TARGET_SUBJECT={target_subject!r}.")
 
     unique_counts = sorted(set(channel_counts))
     if len(unique_counts) != 1:
@@ -236,183 +374,207 @@ def load_dataset():
     )
 
 
-# ── Normalisation ─────────────────────────────────────────────────────────────
+# -- Normalisation -------------------------------------------------------------
 
-def standardize_per_channel(X, mean, std):
-    return (X - mean.reshape(1, -1, 1)) / std.reshape(1, -1, 1)
-
-
-def _prepare_test_data(X, mean, std):
-    return standardize_per_channel(X, mean, std).astype(np.float32)
+def _prepare_test_data(X, _mean, _std):
+    # GestureCNNv2 handles normalisation internally via InstanceNorm1d.
+    return X.astype(np.float32)
 
 
-# ── Augmentation (GPU-native) ─────────────────────────────────────────────────
-# AMP_RANGE = (0.7, 1.4) is narrowed from the cross-subject (0.5, 2.0) because
-# within-subject EMG amplitude is much more consistent than between-subject.
-
-import torch.nn.functional as _F
+# -- Augmentation --------------------------------------------------------------
 
 def augment_emg_gpu(xb: torch.Tensor, p: float) -> torch.Tensor:
     """In-place-safe GPU augmentation. xb: (B, C, T) float32 on device."""
-    B, C, T = xb.shape
+    bsz, channels, t_len = xb.shape
     dev = xb.device
     xb = xb.clone()
 
-    # 1. Amplitude scaling
-    mask = torch.rand(B, device=dev) < p
+    mask = torch.rand(bsz, device=dev) < p
     if mask.any():
         n = int(mask.sum())
         factors = torch.empty(n, 1, 1, device=dev).uniform_(AMP_RANGE[0], AMP_RANGE[1])
         xb[mask] = xb[mask] * factors
 
-    # 2. Additive Gaussian noise (SNR-calibrated)
-    mask = torch.rand(B, device=dev) < p
+    mask = torch.rand(bsz, device=dev) < p
     if mask.any():
         n = int(mask.sum())
-        snr_db     = torch.empty(n, device=dev).uniform_(10.0, 30.0)
+        snr_db = torch.empty(n, device=dev).uniform_(10.0, 30.0)
         snr_linear = 10.0 ** (snr_db / 10.0)
-        sig_power  = xb[mask].var(dim=(1, 2)).clamp(min=1e-8)
-        noise_std  = (sig_power / snr_linear).sqrt().view(n, 1, 1)
-        xb[mask]   = xb[mask] + torch.randn(n, C, T, device=dev) * noise_std
+        sig_power = xb[mask].var(dim=(1, 2)).clamp(min=1e-8)
+        noise_std = (sig_power / snr_linear).sqrt().view(n, 1, 1)
+        xb[mask] = xb[mask] + torch.randn(n, channels, t_len, device=dev) * noise_std
 
-    # 3. Temporal shift (vectorised gather)
-    mask = torch.rand(B, device=dev) < p
+    mask = torch.rand(bsz, device=dev) < p
     if mask.any():
-        n      = int(mask.sum())
+        n = int(mask.sum())
         shifts = torch.randint(-20, 21, (n,), device=dev)
-        idx    = (torch.arange(T, device=dev).unsqueeze(0) - shifts.unsqueeze(1)) % T
-        idx    = idx.unsqueeze(1).expand(-1, C, -1)
+        idx = (torch.arange(t_len, device=dev).unsqueeze(0) - shifts.unsqueeze(1)) % t_len
+        idx = idx.unsqueeze(1).expand(-1, channels, -1)
         xb[mask] = torch.gather(xb[mask], 2, idx)
 
-    # 4. Channel dropout (vectorised scatter)
-    mask = torch.rand(B, device=dev) < p
+    mask = torch.rand(bsz, device=dev) < p
     if mask.any():
-        n       = int(mask.sum())
-        drop_ch = torch.randint(0, C, (n,), device=dev)
-        ch_mask = torch.zeros(n, C, device=dev, dtype=torch.bool)
+        n = int(mask.sum())
+        drop_ch = torch.randint(0, channels, (n,), device=dev)
+        ch_mask = torch.zeros(n, channels, device=dev, dtype=torch.bool)
         ch_mask.scatter_(1, drop_ch.unsqueeze(1), True)
         xb[mask] = xb[mask].masked_fill(ch_mask.unsqueeze(2), 0.0)
 
-    # 5. Temporal stretch (single batched interpolation — one factor per batch)
     if torch.rand(1, device=dev).item() < p:
-        factor  = torch.empty(1, device=dev).uniform_(0.85, 1.15).item()
-        new_len = max(1, int(T * factor))
+        factor = torch.empty(1, device=dev).uniform_(0.8, 1.2).item()
+        new_len = max(1, int(t_len * factor))
         stretched = _F.interpolate(xb, size=new_len, mode="linear", align_corners=False)
-        if new_len >= T:
-            xb = stretched[:, :, :T]
+        if new_len >= t_len:
+            xb = stretched[:, :, :t_len]
         else:
-            xb = _F.pad(stretched, (0, T - new_len), mode="replicate")
+            xb = _F.pad(stretched, (0, t_len - new_len), mode="replicate")
 
     return xb
 
 
-# ── Model ─────────────────────────────────────────────────────────────────────
+def make_subject_sample_weights(subjects: np.ndarray) -> np.ndarray:
+    unique, counts = np.unique(subjects, return_counts=True)
+    weight_map = {s: 1.0 / c for s, c in zip(unique, counts)}
+    return np.array([weight_map[s] for s in subjects], dtype=np.float32)
+
+
+# -- Training ------------------------------------------------------------------
 
 def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
-    """Always GestureCNN for per-subject training."""
-    return GestureCNN(
-        channels=[in_channels, 32, 64, 128],
+    return GestureCNNv2(
+        in_channels=in_channels,
         num_classes=num_classes,
         dropout=DROPOUT,
-        kernel_size=KERNEL_SIZE,
     ).to(device)
 
 
-# ── Training ──────────────────────────────────────────────────────────────────
-
-def train_eval_split(X_train, y_train, X_eval, y_eval, channels, num_classes, epochs, device):
+def train_eval_split(
+    X_train, y_train, X_eval, y_eval,
+    channel_count, num_classes, epochs, device,
+    subjects_train=None,
+):
     mean = X_train.mean(axis=(0, 2))
-    std  = X_train.std(axis=(0, 2))
-    std  = np.where(std < 1e-6, 1.0, std)
+    std = X_train.std(axis=(0, 2))
+    std = np.where(std < 1e-6, 1.0, std)
 
-    X_train_t = standardize_per_channel(X_train, mean, std).astype(np.float32)
-    X_eval_t  = standardize_per_channel(X_eval,  mean, std).astype(np.float32)
+    X_train_t = X_train.astype(np.float32)
+    X_eval_t = X_eval.astype(np.float32)
 
-    train_loader = DataLoader(
-        TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train)),
-        batch_size=BATCH_SIZE, shuffle=True, drop_last=False, pin_memory=True,
-    )
+    train_ds = TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train))
+    eval_ds = TensorDataset(torch.from_numpy(X_eval_t), torch.from_numpy(y_eval))
+
+    if USE_BALANCED_SAMPLING and subjects_train is not None:
+        weights = make_subject_sample_weights(subjects_train)
+        sampler = WeightedRandomSampler(
+            torch.from_numpy(weights), num_samples=len(weights), replacement=True
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=BATCH_SIZE, sampler=sampler, drop_last=False, pin_memory=True
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, pin_memory=True
+        )
+
     eval_loader = DataLoader(
-        TensorDataset(torch.from_numpy(X_eval_t), torch.from_numpy(y_eval)),
-        batch_size=BATCH_SIZE, shuffle=False, drop_last=False, pin_memory=True,
+        eval_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, pin_memory=True
     )
 
-    model = _build_model(int(channels[0]), num_classes, device)
+    model = _build_model(int(channel_count), num_classes, device)
 
     class_weight = None
     if USE_CLASS_WEIGHTS:
         class_counts = np.bincount(y_train, minlength=num_classes)
-        w = class_counts.sum() / np.maximum(class_counts, 1)
-        class_weight = torch.tensor(w / w.mean(), dtype=torch.float32, device=device)
+        weights_cls = class_counts.sum() / np.maximum(class_counts, 1)
+        weights_cls = weights_cls / weights_cls.mean()
+        class_weight = torch.tensor(weights_cls, dtype=torch.float32, device=device)
 
-    criterion = nn.CrossEntropyLoss(weight=class_weight)
+    criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=LABEL_SMOOTHING)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    # patience=8 is generous relative to per-subject data volume (fewer batches per epoch)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=8, threshold=1e-4, min_lr=1e-6,
+        optimizer, mode="min", factor=0.5, patience=5, threshold=1e-4, min_lr=1e-6
     )
 
-    best_state, best_acc = None, -1.0
+    best_state = None
+    best_acc = -1.0
     start_time = time.time()
+
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
         model.train()
-        train_correct = train_total = 0
+        train_correct = 0
+        train_total = 0
         train_loss = 0.0
+
         for xb, yb in train_loader:
-            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
             if USE_AUGMENTATION:
                 xb = augment_emg_gpu(xb, p=AUG_PROB)
+
             optimizer.zero_grad()
             logits = model(xb)
-            loss   = criterion(logits, yb)
+            loss = criterion(logits, yb)
             loss.backward()
             optimizer.step()
-            train_loss    += loss.item() * xb.size(0)
-            preds          = torch.argmax(logits, dim=1)
+
+            train_loss += loss.item() * xb.size(0)
+            preds = torch.argmax(logits, dim=1)
             train_correct += (preds == yb).sum().item()
-            train_total   += xb.size(0)
+            train_total += xb.size(0)
 
         model.eval()
-        eval_correct = eval_total = eval_loss_sum = 0
+        eval_correct = 0
+        eval_total = 0
+        eval_loss = 0.0
         with torch.no_grad():
             for xb, yb in eval_loader:
-                xb, yb = xb.to(device), yb.to(device)
+                xb = xb.to(device)
+                yb = yb.to(device)
                 logits = model(xb)
-                l      = criterion(logits, yb)
-                eval_loss_sum  += l.item() * xb.size(0)
-                eval_correct   += (torch.argmax(logits, 1) == yb).sum().item()
-                eval_total     += xb.size(0)
+                loss = criterion(logits, yb)
+                eval_loss += loss.item() * xb.size(0)
+                preds = torch.argmax(logits, dim=1)
+                eval_correct += (preds == yb).sum().item()
+                eval_total += xb.size(0)
 
         train_acc = train_correct / max(train_total, 1)
-        eval_acc  = eval_correct  / max(eval_total, 1)
-        avg_loss  = train_loss    / max(train_total, 1)
-        avg_eval  = eval_loss_sum / max(eval_total, 1)
+        eval_acc = eval_correct / max(eval_total, 1)
+        avg_loss = train_loss / max(train_total, 1)
+        avg_eval_loss = eval_loss / max(eval_total, 1)
         print(
-            f"Epoch {epoch:02d} | loss {avg_loss:.4f} | eval_loss {avg_eval:.4f} "
-            f"| train {train_acc:.3f} | eval {eval_acc:.3f}"
+            f"Epoch {epoch:02d} | loss {avg_loss:.4f} | "
+            f"eval_loss {avg_eval_loss:.4f} | train {train_acc:.3f} | "
+            f"eval {eval_acc:.3f}"
         )
+
         prev_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(avg_eval)
-        if optimizer.param_groups[0]["lr"] < prev_lr:
-            print(f"LR reduced: {prev_lr:.2e} -> {optimizer.param_groups[0]['lr']:.2e}")
+        scheduler.step(avg_eval_loss)
+        new_lr = optimizer.param_groups[0]["lr"]
+        if new_lr < prev_lr:
+            print(f"LR reduced: {prev_lr:.2e} -> {new_lr:.2e}")
+
         if epoch == 1:
-            est = (time.time() - epoch_start) * epochs
-            print(f"Estimated remaining: ~{max(0, est - (time.time() - start_time)):.0f}s")
+            epoch_time = time.time() - epoch_start
+            est_total = epoch_time * epochs
+            est_remaining = max(0.0, est_total - (time.time() - start_time))
+            print(f"Estimated remaining time (this phase): ~{est_remaining:.1f}s")
+
         if eval_acc > best_acc:
-            best_acc   = eval_acc
-            best_state = model.state_dict()
+            best_acc = eval_acc
+            best_state = copy.deepcopy(model.state_dict())
 
     if best_state is not None:
         model.load_state_dict(best_state)
     return model, mean, std, best_acc
 
 
-# ── Save bundle ───────────────────────────────────────────────────────────────
+# -- Train/eval/save -----------------------------------------------------------
 
-def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
-                    labels, label_to_index, index_to_label, channel_count,
-                    model_out, subject_tag):
+def _train_and_save(
+    X, y_idx, groups, subjects, channel_count, num_classes, device,
+    labels, label_to_index, index_to_label, model_out, subject_tag,
+):
     unique_groups = np.unique(groups)
     print(f"{X.shape[0]} windows across {len(unique_groups)} session file(s).")
 
@@ -423,20 +585,21 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
     else:
         indices = np.arange(X.shape[0])
         train_idx, test_idx = train_test_split(
-            indices, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y_idx,
+            indices, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y_idx
         )
         split_mode = "stratified-random"
 
     train_files = sorted({str(g) for g in groups[train_idx]})
-    test_files  = sorted({str(g) for g in groups[test_idx]})
+    test_files = sorted({str(g) for g in groups[test_idx]})
     print(f"Train ({len(train_files)} files): {[Path(f).name for f in train_files]}")
     print(f"Test  ({len(test_files)} files):  {[Path(f).name for f in test_files]}")
-    print(f"\nTraining GestureCNN for {EPOCHS} epochs on {len(train_idx)} windows.")
+    print(f"\nTraining GestureCNNv2 for {EPOCHS} epochs on {len(train_idx)} windows.")
 
     model, mean, std, _ = train_eval_split(
         X[train_idx], y_idx[train_idx],
-        X[test_idx],  y_idx[test_idx],
-        channels, num_classes, EPOCHS, device,
+        X[test_idx], y_idx[test_idx],
+        channel_count, num_classes, EPOCHS, device,
+        subjects_train=subjects[train_idx],
     )
 
     model.eval()
@@ -452,11 +615,64 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
     y_pred = np.concatenate(all_preds)
     y_test = y_idx[test_idx]
 
-    test_accuracy = float(accuracy_score(y_test, y_pred))
-    report = classification_report(y_test, y_pred,
-                                   target_names=[index_to_label[i] for i in range(len(labels))])
-    print(f"\nTest accuracy: {test_accuracy:.3f}")
-    print("\nReport:\n", report)
+    eval_artifacts = _compute_eval_artifacts(y_test, y_pred, index_to_label)
+    test_accuracy = float(eval_artifacts["test_accuracy"])
+    print(f"\nIn-distribution test accuracy: {test_accuracy:.3f}")
+    print("\nReport:\n", eval_artifacts["classification_report_text"])
+    _print_confusion_matrix(
+        "Confusion matrix (counts, rows=true, cols=pred):",
+        eval_artifacts["confusion_matrix_counts"],
+        [index_to_label[i] for i in range(len(labels))],
+        as_percent=False,
+    )
+    _print_confusion_matrix(
+        "Confusion matrix (row-normalized %, rows=true, cols=pred):",
+        eval_artifacts["confusion_matrix_row_norm"],
+        [index_to_label[i] for i in range(len(labels))],
+        as_percent=True,
+    )
+    _print_confusion_matrix(
+        "Confusion matrix (col-normalized %, rows=true, cols=pred):",
+        eval_artifacts["confusion_matrix_col_norm"],
+        [index_to_label[i] for i in range(len(labels))],
+        as_percent=True,
+    )
+
+    print("\nCore metrics:")
+    print(f"  balanced_accuracy: {eval_artifacts['balanced_accuracy']:.3f}")
+    print(
+        f"  macro P/R/F1: "
+        f"{eval_artifacts['macro_precision']:.3f} / "
+        f"{eval_artifacts['macro_recall']:.3f} / "
+        f"{eval_artifacts['macro_f1']:.3f}"
+    )
+    print(
+        f"  weighted P/R/F1: "
+        f"{eval_artifacts['weighted_precision']:.3f} / "
+        f"{eval_artifacts['weighted_recall']:.3f} / "
+        f"{eval_artifacts['weighted_f1']:.3f}"
+    )
+    if eval_artifacts["worst_class_recall_label"] is not None:
+        print(
+            f"  worst_class_recall: "
+            f"{eval_artifacts['worst_class_recall_label']} = "
+            f"{eval_artifacts['worst_class_recall']:.3f}"
+        )
+    if eval_artifacts["max_pr_gap_label"] is not None:
+        print(
+            f"  max_precision_recall_gap: "
+            f"{eval_artifacts['max_pr_gap_label']} = "
+            f"{eval_artifacts['max_pr_gap']:.3f}"
+        )
+    if eval_artifacts["confusion_to_neutral_rate"]:
+        print("  confusion_to_neutral_rate:")
+        for label, rate in sorted(eval_artifacts["confusion_to_neutral_rate"].items()):
+            print(f"    {label} -> neutral: {rate:.3f}")
+    if eval_artifacts["neutral_prediction_fp_rate"] is not None:
+        print(
+            f"  neutral_prediction_fp_rate: "
+            f"{eval_artifacts['neutral_prediction_fp_rate']:.3f}"
+        )
 
     bundle = {
         "model_state": model.state_dict(),
@@ -464,15 +680,17 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
         "label_to_index": label_to_index,
         "index_to_label": index_to_label,
         "architecture": {
-            "type": "GestureCNN",
-            "channels": channels,
+            "type": "GestureCNNv2",
+            "in_channels": int(channel_count),
             "dropout": float(DROPOUT),
-            "kernel_size": int(KERNEL_SIZE),
         },
         "metadata": {
             "created_at": dt.datetime.now().isoformat(),
-            "stream": "per_subject",
+            "stream": "per_subject_single",
             "subject": subject_tag,
+            "target_subject": subject_tag,
+            "excluded_subjects": list(EXCLUDED_SUBJECTS),
+            "included_gestures": sorted(INCLUDED_GESTURES) if INCLUDED_GESTURES is not None else None,
             "window_size_samples": WINDOW_SIZE,
             "window_step_samples": WINDOW_STEP,
             "channel_count": int(channel_count),
@@ -481,7 +699,7 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
             "test_size": float(TEST_SIZE),
             "calibration_used": bool(USE_CALIBRATION),
             "calibration_mvc_percentile": float(MVC_PERCENTILE),
-            "use_instance_norm_input": False,
+            "use_instance_norm_input": True,
             "label_confidence_filter": {
                 "enabled": bool(USE_MIN_LABEL_CONFIDENCE),
                 "min_label_confidence": float(MIN_LABEL_CONFIDENCE),
@@ -492,12 +710,31 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
                 "lr": float(LR),
                 "amp_range": list(AMP_RANGE),
                 "use_augmentation": bool(USE_AUGMENTATION),
-                "use_balanced_sampling": False,
+                "use_balanced_sampling": bool(USE_BALANCED_SAMPLING),
+                "label_smoothing": float(LABEL_SMOOTHING),
                 "use_mixup": False,
             },
-            "metrics": {"test_accuracy": test_accuracy},
+            "metrics": {
+                "test_accuracy": test_accuracy,
+                "balanced_accuracy": eval_artifacts["balanced_accuracy"],
+                "macro_precision": eval_artifacts["macro_precision"],
+                "macro_recall": eval_artifacts["macro_recall"],
+                "macro_f1": eval_artifacts["macro_f1"],
+                "weighted_precision": eval_artifacts["weighted_precision"],
+                "weighted_recall": eval_artifacts["weighted_recall"],
+                "weighted_f1": eval_artifacts["weighted_f1"],
+                "worst_class_recall_label": eval_artifacts["worst_class_recall_label"],
+                "worst_class_recall": eval_artifacts["worst_class_recall"],
+                "max_precision_recall_gap_label": eval_artifacts["max_pr_gap_label"],
+                "max_precision_recall_gap": eval_artifacts["max_pr_gap"],
+                "confusion_to_neutral_rate": eval_artifacts["confusion_to_neutral_rate"],
+                "neutral_prediction_fp_rate": eval_artifacts["neutral_prediction_fp_rate"],
+                "confusion_matrix_counts": eval_artifacts["confusion_matrix_counts"].tolist(),
+                "confusion_matrix_row_norm": eval_artifacts["confusion_matrix_row_norm"].tolist(),
+                "confusion_matrix_col_norm": eval_artifacts["confusion_matrix_col_norm"].tolist(),
+            },
             "train_files": [Path(f).name for f in train_files],
-            "test_files":  [Path(f).name for f in test_files],
+            "test_files": [Path(f).name for f in test_files],
         },
     }
 
@@ -506,12 +743,15 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
     print(f"Saved to {model_out}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 
 def main():
     if ARM not in ("right", "left"):
         raise ValueError(f"ARM must be 'right' or 'left', got {ARM!r}")
-    confirm = input(f"Training {ARM} arm per-subject models — continue? [y/N] ").strip().lower()
+
+    confirm = input(
+        f"Training {ARM} arm single-subject model for '{TARGET_SUBJECT}' - continue? [y/N] "
+    ).strip().lower()
     if confirm != "y":
         print("Aborted.")
         return
@@ -519,7 +759,7 @@ def main():
     np.random.seed(RANDOM_STATE)
     torch.manual_seed(RANDOM_STATE)
 
-    X, y, groups, subjects, channel_count = load_dataset()
+    X, y, groups, subjects, channel_count = load_dataset(target_subject=TARGET_SUBJECT)
     unique_subjects = sorted(np.unique(subjects))
     print(
         f"Loaded {X.shape[0]} windows, {channel_count} channels, "
@@ -527,31 +767,24 @@ def main():
         f"{unique_subjects}"
     )
 
-    labels         = sorted({str(lbl) for lbl in np.unique(y)})
+    labels = sorted({str(lbl) for lbl in np.unique(y)})
     label_to_index = {label: idx for idx, label in enumerate(labels)}
     index_to_label = {idx: label for label, idx in label_to_index.items()}
-    y_idx          = np.array([label_to_index[str(lbl)] for lbl in y], dtype=np.int64)
+    y_idx = np.array([label_to_index[str(lbl)] for lbl in y], dtype=np.int64)
 
-    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    channels = [int(channel_count), 32, 64, 128]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = len(labels)
 
-    for subject in unique_subjects:
-        print(f"\n{'=' * 55}")
-        print(f"Per-subject model: {subject}")
-        mask = subjects == subject
-        _train_and_save(
-            X[mask], y_idx[mask], groups[mask], subjects[mask],
-            channels, num_classes, device,
-            labels, label_to_index, index_to_label, channel_count,
-            model_out=MODEL_DIR / f"{subject}_cnn.pt",
-            subject_tag=subject,
-        )
+    print(f"\n{'=' * 55}")
+    print(f"Single-subject model: {TARGET_SUBJECT}")
+    _train_and_save(
+        X, y_idx, groups, subjects, channel_count, num_classes, device,
+        labels, label_to_index, index_to_label, MODEL_OUT, TARGET_SUBJECT,
+    )
 
     print(f"\n{'=' * 55}")
-    print("Per-subject training complete.")
-    for subject in unique_subjects:
-        print(f"  python realtime_gesture_cnn.py --model {MODEL_DIR / f'{subject}_cnn.pt'}")
+    print("Single-subject training complete.")
+    print(f"  python realtime_gesture_cnn.py --model {MODEL_OUT}")
 
 
 if __name__ == "__main__":

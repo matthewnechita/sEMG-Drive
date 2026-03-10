@@ -1,0 +1,4 @@
+timestamp,elapsed_s,prompt_label,pred_label,pred_conf,fused_left_turn,fused_neutral,fused_right_turn
+t,1,left_turn,left_turn,0.92,0.85,0.08,0.07
+t,2,right_turn,right_turn,0.75,0.1,0.2,0.7
+t,3,neutral,neutral,0.85,0.08,0.84,0.08

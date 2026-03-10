@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 # ── Original architecture (kept for backward compatibility) ──────────────────
@@ -32,6 +33,14 @@ class GestureCNN(nn.Module):
     def forward(self, x):
         x = self.features(x)
         return self.head(x)
+
+    def extract_embedding(self, x, l2_normalize=False):
+        x = self.features(x)
+        x = self.head[0](x)  # AdaptiveAvgPool1d(1)
+        x = self.head[1](x)  # Flatten
+        if l2_normalize:
+            x = F.normalize(x, p=2, dim=1, eps=1e-8)
+        return x
 
 
 # ── V2 building blocks ────────────────────────────────────────────────────────
@@ -129,6 +138,10 @@ class GestureCNNv2(nn.Module):
         self.head = nn.Linear(129, num_classes)
 
     def forward(self, x):
+        combined = self.extract_embedding(x, l2_normalize=False)
+        return self.head(combined)
+
+    def extract_embedding(self, x, l2_normalize=False):
         # Capture raw energy BEFORE InstanceNorm (preserves neutral detection)
         energy = x.pow(2).mean(dim=(1, 2)).unsqueeze(1)  # (B, 1)
         x = self.input_norm(x)
@@ -137,7 +150,9 @@ class GestureCNNv2(nn.Module):
         x = self.stage2(self.stage2_proj(x))
         feats = self.stage3(self.stage3_proj(x))  # (B, 128)
         combined = torch.cat([feats, energy], dim=1)  # (B, 129)
-        return self.head(combined)
+        if l2_normalize:
+            combined = F.normalize(combined, p=2, dim=1, eps=1e-8)
+        return combined
 
 
 # ── Architecture registry ────────────────────────────────────────────────────
@@ -180,6 +195,20 @@ class CnnBundle:
             logits = self.model(xb)
             probs = torch.softmax(logits, dim=1).cpu().numpy()
         return probs
+
+    def embed(self, X: np.ndarray, l2_normalize: bool = False) -> np.ndarray:
+        self.model.eval()
+        device = next(self.model.parameters()).device
+        with torch.no_grad():
+            xb = torch.from_numpy(X.astype(np.float32)).to(device)
+            if hasattr(self.model, "extract_embedding"):
+                emb = self.model.extract_embedding(xb, l2_normalize=l2_normalize)
+            else:
+                logits = self.model(xb)
+                emb = logits
+                if l2_normalize:
+                    emb = F.normalize(emb, p=2, dim=1, eps=1e-8)
+            return emb.cpu().numpy()
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         probs = self.predict_proba(X)

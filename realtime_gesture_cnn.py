@@ -19,6 +19,7 @@ from AeroPy.DataManager import DataKernel
 # from emg.filtering import define_filters, apply_filters, make_filter_state, apply_filters_stateful
 from libemg import filtering as libemg_filter
 from emg.gesture_model_cnn import load_cnn_bundle, quick_finetune
+from emg.prototype_classifier import PrototypeClassifier
 
 
 # ======== Config (edit as needed) ========
@@ -31,8 +32,8 @@ REALTIME_RESAMPLE = True
 # Set to None to use model metadata when available.
 REALTIME_TARGET_FS_HZ = 2000.0
 
-SMOOTHING = 1   # balance stability without excessive response lag
-MIN_CONFIDENCE = 0.45  # reduce neutral fallback when Stage B is moderately confident
+SMOOTHING = 7   # reduce carryover while keeping short-term stability
+MIN_CONFIDENCE = 0.55  # moderate confidence gate
 LOW_CONFIDENCE_LABEL = "neutral"
 ENABLE_NEUTRAL_OVERRIDE = False
 NEUTRAL_OVERRIDE_MARGIN = 0.15
@@ -60,7 +61,7 @@ CALIB_MVC_S = 5.0
 CALIB_MVC_PREP_S = 2.0    # countdown pause before MVC window
 MVC_PERCENTILE = 95.0
 # Keep this aligned with train_cross_subject.py (MVC_QUALITY_MIN_RATIO).
-MVC_MIN_RATIO = 1.5        # minimum acceptable median MVC/neutral ratio
+MVC_MIN_RATIO = 2.0        # allow normalization unless calibration is clearly weak
 
 # ======== Dual-arm config ========
 # Right arm channels come first in the Delsys stream (pair right arm sensors first).
@@ -68,16 +69,17 @@ MVC_MIN_RATIO = 1.5        # minimum acceptable median MVC/neutral ratio
 RIGHT_ARM_CHANNELS = 17   # fixed: 6 right arm sensors → 17 channels
 # Optional explicit arm mapping by sensor pair number from scan output.
 # Example: RIGHT_ARM_PAIR_NUMBERS = {1,2,3,4,5,6}
-RIGHT_ARM_PAIR_NUMBERS = None
-LEFT_ARM_PAIR_NUMBERS = None
+# Locked from current scan/mapping output to avoid runtime auto-swap drift.
+RIGHT_ARM_PAIR_NUMBERS = {1, 2, 3, 8, 9, 11}
+LEFT_ARM_PAIR_NUMBERS = {4, 5, 6, 7, 10}
 AUTO_DUAL_ARM_CHANNEL_MAPPING = True
 # Left arm uses 5 sensors → 16 channels (one fewer sensor than right arm)
 # Fusion thresholds:
 #   AGREE_THRESHOLD  — minimum confidence to emit a gesture when BOTH arms agree
 #                      (lower than single-arm threshold because agreement strengthens prediction)
 #   SINGLE_THRESHOLD — minimum confidence to emit when only one arm is available/confident
-DUAL_ARM_AGREE_THRESHOLD  = 0.55
-DUAL_ARM_SINGLE_THRESHOLD = MIN_CONFIDENCE
+DUAL_ARM_AGREE_THRESHOLD  = 0.60
+DUAL_ARM_SINGLE_THRESHOLD = 0.70
 # =================================
 
 # ======== Per-gesture calibration ========
@@ -88,10 +90,20 @@ GESTURE_CALIB        = True  # adapt Stage B head to current user/session
 GESTURE_CALIB_S      = 5.0   # seconds of EMG to collect per gesture
 GESTURE_CALIB_PREP_S = 2.0   # countdown pause before each gesture
 
+# Prototype classifier (phase 1): build per-gesture embedding centroids from
+# gesture calibration windows, then classify by cosine-distance-derived scores.
+# Keep disabled to preserve legacy softmax behavior.
+USE_PROTOTYPE_CLASSIFIER = False
+PROTOTYPE_L2_NORMALIZE = True
+PROTOTYPE_TEMPERATURE = 0.20
+PROTOTYPE_ADAPTIVE_UPDATE = False
+PROTOTYPE_ADAPTIVE_ALPHA = 0.05
+PROTOTYPE_ADAPTIVE_MIN_CONFIDENCE = 0.80
+
 # Optional runtime gesture filtering (code-only; no CLI flags).
 # Example (3-class mode):
 # INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"}
-INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"}
+INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn", "signal_left", "signal_right"}
 
 GESTURE_LABELS = ["neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"]
 
@@ -110,21 +122,22 @@ GESTURE_INSTRUCTIONS = {
 #   "right" - right arm only  (pair right arm sensors first in Delsys)
 #   "left"  - left arm only   (pair left arm sensors first in Delsys)
 #   "dual"  - both arms fused (pair right first, then left in Delsys)
-MODE        = "dual"
+MODE        = "left"
+# Default to Matthew per-subject bundles. Override with CLI flags as needed.
 MODEL_RIGHT = os.path.join(
     BASE_DIR,
     "models",
-    "cross_subject",
+    "per_subject",
     "right",
-    "gesture_cnn_v3_m2_excl05_label_smoothing005.pt",
+    "Matthew_cnn_resample.pt",
 )
 
 MODEL_LEFT = os.path.join(
     BASE_DIR,
     "models",
-    "cross_subject",
+    "per_subject",
     "left",
-    "gesture_cnn_v3_left_m1_single_stage_dual_ready.pt",
+    "Matthew_cnn_resample.pt",
 )
 # ================================
 
@@ -885,6 +898,7 @@ def main(argv=None):
     allowed_labels_right, allowed_indices_right = _resolve_allowed_labels(
         index_to_label_right, "right"
     )
+    label_to_idx_right = {str(label): int(idx) for idx, label in index_to_label_right.items()}
 
     # Left arm bundle (dual-arm mode only)
     bundle_left   = None
@@ -900,9 +914,31 @@ def main(argv=None):
         allowed_labels_left, allowed_indices_left = _resolve_allowed_labels(
             index_to_label_left, "left"
         )
+        label_to_idx_left = {str(label): int(idx) for idx, label in index_to_label_left.items()}
         print(f"[gesture] dual-arm mode | right={RIGHT_ARM_CHANNELS}ch left={left_channels}ch")
     else:
+        label_to_idx_left = {}
         print("[gesture] single-arm mode")
+
+    use_prototype_classifier = bool(USE_PROTOTYPE_CLASSIFIER)
+    if use_prototype_classifier and use_two_stage:
+        print("[gesture] prototype classifier disabled: two-stage mode is not supported yet.")
+        use_prototype_classifier = False
+    if use_prototype_classifier and dual_arm:
+        print("[gesture] prototype classifier disabled: dual-arm mode is not supported yet.")
+        use_prototype_classifier = False
+    if use_prototype_classifier and (not CALIBRATE or not GESTURE_CALIB):
+        print(
+            "[gesture] prototype classifier disabled: requires CALIBRATE=True and GESTURE_CALIB=True."
+        )
+        use_prototype_classifier = False
+    if use_prototype_classifier:
+        print("[gesture] prototype classifier: ON (calibration centroids + cosine scoring)")
+    else:
+        print("[gesture] prototype classifier: OFF (softmax decoder)")
+
+    prototype_right = None
+    prototype_left = None
 
     bundle_fs_stage_a = _resolve_target_fs_hz_from_bundle(bundle_stage_a) if use_two_stage else None
     bundle_fs_right = _resolve_target_fs_hz_from_bundle(bundle_right)
@@ -1342,18 +1378,56 @@ def main(argv=None):
         if wins_r:
             X_r = np.concatenate(wins_r, axis=0)
             y_r = np.array(labs_r, dtype=np.int64)
-            print(f"\nFine-tuning right arm model ({len(y_r)} windows)...")
-            quick_finetune(bundle_right, X_r, y_r, device=device)
-            print("  Right arm model updated.")
+            if use_prototype_classifier:
+                print(f"\nBuilding right-arm prototypes ({len(y_r)} windows)...")
+                X_r_std = bundle_right.standardize(X_r)
+                E_r = bundle_right.embed(X_r_std, l2_normalize=PROTOTYPE_L2_NORMALIZE)
+                prototype_right = PrototypeClassifier.fit(
+                    E_r,
+                    y_r,
+                    temperature=PROTOTYPE_TEMPERATURE,
+                    l2_normalize=PROTOTYPE_L2_NORMALIZE,
+                )
+                print(f"  Right-arm prototypes ready: {len(prototype_right.class_indices)} classes.")
+            else:
+                print(f"\nFine-tuning right arm model ({len(y_r)} windows)...")
+                quick_finetune(bundle_right, X_r, y_r, device=device)
+                print("  Right arm model updated.")
 
         if dual_arm and wins_l:
             X_l = np.concatenate(wins_l, axis=0)
             y_l = np.array(labs_l, dtype=np.int64)
-            print(f"Fine-tuning left arm model ({len(y_l)} windows)...")
-            quick_finetune(bundle_left, X_l, y_l, device=device)
-            print("  Left arm model updated.")
+            if use_prototype_classifier:
+                print(f"Building left-arm prototypes ({len(y_l)} windows)...")
+                X_l_std = bundle_left.standardize(X_l)
+                E_l = bundle_left.embed(X_l_std, l2_normalize=PROTOTYPE_L2_NORMALIZE)
+                prototype_left = PrototypeClassifier.fit(
+                    E_l,
+                    y_l,
+                    temperature=PROTOTYPE_TEMPERATURE,
+                    l2_normalize=PROTOTYPE_L2_NORMALIZE,
+                )
+                print(f"  Left-arm prototypes ready: {len(prototype_left.class_indices)} classes.")
+            else:
+                print(f"Fine-tuning left arm model ({len(y_l)} windows)...")
+                quick_finetune(bundle_left, X_l, y_l, device=device)
+                print("  Left arm model updated.")
+
+        if use_prototype_classifier and prototype_right is None:
+            print(
+                "[gesture] WARNING: prototype calibration produced no right-arm centroids; "
+                "falling back to softmax decoder."
+            )
+            use_prototype_classifier = False
 
         print("\n=== Gesture calibration complete. Starting inference... ===\n")
+
+    if use_prototype_classifier and prototype_right is None:
+        print(
+            "[gesture] WARNING: prototype classifier enabled but no centroids were built; "
+            "using softmax decoder."
+        )
+        use_prototype_classifier = False
 
     buffer_len = WINDOW_SIZE + FILTER_WARMUP
 
@@ -1469,6 +1543,7 @@ def main(argv=None):
             inference_ran = False
             label_right = LOW_CONFIDENCE_LABEL
             conf_right  = 0.0
+            emb_right = None
             if warmup_right and pending_right >= WINDOW_STEP and len(raw_buffer_right) >= WINDOW_SIZE:
                 raw = np.asarray(raw_buffer_right, dtype=float)
                 filtered_full = apply_filters(filter_obj, raw)
@@ -1510,7 +1585,15 @@ def main(argv=None):
                         conf_right = neutral_prob
                 else:
                     window = bundle_right.standardize(window_raw)
-                    probs  = bundle_right.predict_proba(window)[0]
+                    if use_prototype_classifier and prototype_right is not None:
+                        emb_right = bundle_right.embed(
+                            window, l2_normalize=PROTOTYPE_L2_NORMALIZE
+                        )[0]
+                        probs = prototype_right.predict_proba(
+                            emb_right, num_classes=len(index_to_label_right)
+                        )
+                    else:
+                        probs = bundle_right.predict_proba(window)[0]
                     probs  = _restrict_probs(probs, allowed_indices_right)
 
                     pred_history_right.append(probs)
@@ -1521,6 +1604,19 @@ def main(argv=None):
                     label_right, conf_right = _apply_hysteresis(
                         label_right, conf_right, probs, index_to_label_right, hysteresis_state_right
                     )
+                    if (
+                        use_prototype_classifier
+                        and prototype_right is not None
+                        and PROTOTYPE_ADAPTIVE_UPDATE
+                        and emb_right is not None
+                        and label_right != LOW_CONFIDENCE_LABEL
+                        and conf_right >= float(PROTOTYPE_ADAPTIVE_MIN_CONFIDENCE)
+                    ):
+                        pred_idx = label_to_idx_right.get(str(label_right))
+                        if pred_idx is not None:
+                            prototype_right.update(
+                                pred_idx, emb_right, alpha=PROTOTYPE_ADAPTIVE_ALPHA
+                            )
 
                 inference_ran = True
                 # We intentionally keep only the newest inference point and
@@ -1530,6 +1626,7 @@ def main(argv=None):
             # --- inference: left arm (dual-arm mode only) ---
             label_left = LOW_CONFIDENCE_LABEL
             conf_left  = 0.0
+            emb_left = None
             if dual_arm:
                 if warmup_left and pending_left >= WINDOW_STEP and len(raw_buffer_left) >= WINDOW_SIZE:
                     raw = np.asarray(raw_buffer_left, dtype=float)
@@ -1543,7 +1640,15 @@ def main(argv=None):
 
                     window = filtered.T[np.newaxis, :, :].astype(np.float32)
                     window = bundle_left.standardize(window)
-                    probs  = bundle_left.predict_proba(window)[0]
+                    if use_prototype_classifier and prototype_left is not None:
+                        emb_left = bundle_left.embed(
+                            window, l2_normalize=PROTOTYPE_L2_NORMALIZE
+                        )[0]
+                        probs = prototype_left.predict_proba(
+                            emb_left, num_classes=len(index_to_label_left)
+                        )
+                    else:
+                        probs = bundle_left.predict_proba(window)[0]
                     probs  = _restrict_probs(probs, allowed_indices_left)
 
                     pred_history_left.append(probs)
@@ -1554,6 +1659,19 @@ def main(argv=None):
                     label_left, conf_left = _apply_hysteresis(
                         label_left, conf_left, probs, index_to_label_left, hysteresis_state_left
                     )
+                    if (
+                        use_prototype_classifier
+                        and prototype_left is not None
+                        and PROTOTYPE_ADAPTIVE_UPDATE
+                        and emb_left is not None
+                        and label_left != LOW_CONFIDENCE_LABEL
+                        and conf_left >= float(PROTOTYPE_ADAPTIVE_MIN_CONFIDENCE)
+                    ):
+                        pred_idx = label_to_idx_left.get(str(label_left))
+                        if pred_idx is not None:
+                            prototype_left.update(
+                                pred_idx, emb_left, alpha=PROTOTYPE_ADAPTIVE_ALPHA
+                            )
 
                     inference_ran = True
                     # Same backlog policy as right arm: latest window only.
