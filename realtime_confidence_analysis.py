@@ -127,7 +127,6 @@ def _infer_one_arm(
     neutral_mean,
     mvc_scale,
     pred_history,
-    hysteresis_state,
 ):
     raw = np.asarray(raw_buffer, dtype=float)
     filtered_full = rt.apply_filters(filter_obj, raw)
@@ -148,7 +147,6 @@ def _infer_one_arm(
         probs = np.mean(np.stack(pred_history, axis=0), axis=0)
 
     label, conf, _ = rt._decode_prediction(probs, index_to_label)
-    label, conf = rt._apply_hysteresis(label, conf, probs, index_to_label, hysteresis_state)
     return str(label), float(conf), np.asarray(probs, dtype=float)
 
 
@@ -184,10 +182,10 @@ def main(argv=None):
     mode = str(args.mode)
     dual_arm = mode == "dual"
     if mode == "left":
-        model_right_path = args.model_left
+        model_right_path = str(args.model_left)
     else:
-        model_right_path = args.model_right
-    model_left_path = args.model_left if dual_arm else None
+        model_right_path = str(args.model_right)
+    model_left_path: str | None = str(args.model_left) if dual_arm else None
 
     print("[analysis] right model:", model_right_path)
     bundle_right = load_cnn_bundle(model_right_path, device=device)
@@ -203,6 +201,8 @@ def main(argv=None):
     allowed_labels_left = set()
     allowed_indices_left = set()
     if dual_arm:
+        if model_left_path is None:
+            raise ValueError("Dual-arm mode requires --model-left.")
         print("[analysis] left model:", model_left_path)
         bundle_left = load_cnn_bundle(model_left_path, device=device)
         left_channels = bundle_left.channel_count
@@ -263,12 +263,21 @@ def main(argv=None):
             )
 
     # Sampling + filter setup
-    runtime_target_fs = float(rt.REALTIME_TARGET_FS_HZ) if rt.REALTIME_TARGET_FS_HZ else None
+    runtime_target_fs: float | None = (
+        float(rt.REALTIME_TARGET_FS_HZ)
+        if rt.REALTIME_TARGET_FS_HZ is not None
+        else None
+    )
     use_timestamp_resampling = bool(
         rt.REALTIME_RESAMPLE and runtime_target_fs is not None and runtime_target_fs > 0
     )
     base.TrigBase.Start(handler.streamYTData)
-    fs = float(runtime_target_fs) if use_timestamp_resampling else None
+    fs: float | None
+    if use_timestamp_resampling:
+        assert runtime_target_fs is not None
+        fs = float(runtime_target_fs)
+    else:
+        fs = None
     filter_obj = rt.define_filters(fs) if fs is not None else None
     resampler = rt._RealtimeTimestampResampler(stream_channels, fs) if fs is not None else None
     if use_timestamp_resampling:
@@ -345,8 +354,6 @@ def main(argv=None):
 
     pred_history_right = deque(maxlen=max(1, int(rt.SMOOTHING)))
     pred_history_left = deque(maxlen=max(1, int(rt.SMOOTHING)))
-    hyst_right = {"label": rt.LOW_CONFIDENCE_LABEL}
-    hyst_left = {"label": rt.LOW_CONFIDENCE_LABEL}
 
     latest = {
         "right_label": rt.LOW_CONFIDENCE_LABEL,
@@ -389,6 +396,7 @@ def main(argv=None):
                 continue
 
             if use_timestamp_resampling:
+                assert resampler is not None
                 batch_arr, _ = resampler.push(channel_times, channel_values)
                 if batch_arr.size == 0:
                     continue
@@ -437,7 +445,6 @@ def main(argv=None):
                     neutral_mean_right,
                     mvc_scale_right,
                     pred_history_right,
-                    hyst_right,
                 )
                 latest["right_label"] = r_label
                 latest["right_conf"] = r_conf
@@ -445,6 +452,7 @@ def main(argv=None):
                 pending_right = 0
 
             if dual_arm and warmup_left and pending_left >= rt.WINDOW_STEP and len(raw_buffer_left) >= rt.WINDOW_SIZE:
+                assert bundle_left is not None
                 l_label, l_conf, l_probs = _infer_one_arm(
                     raw_buffer_left,
                     filter_obj,
@@ -454,7 +462,6 @@ def main(argv=None):
                     neutral_mean_left,
                     mvc_scale_left,
                     pred_history_left,
-                    hyst_left,
                 )
                 latest["left_label"] = l_label
                 latest["left_conf"] = l_conf

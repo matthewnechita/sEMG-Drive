@@ -14,6 +14,7 @@ import copy
 import datetime as dt
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -26,19 +27,19 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, TensorDataset
 
 from libemg.utils import get_windows
 from emg.gesture_model_cnn import GestureCNNv2
 
 
 # ======== Config ========
-ARM = "left"  # set to "right" or "left" before running
+ARM = "right"  # set to "right" or "left" before running
 TARGET_SUBJECT = "Matthew"
 
 DATA_ROOT = Path("data_resampled") / f"{ARM} arm"
 PATTERN = "*_filtered.npz"
-MODEL_OUT = Path("models/per_subject") / ARM / f"{TARGET_SUBJECT}_cnn_resample.pt"
+MODEL_OUT = Path("models/per_subject") / ARM / f"{TARGET_SUBJECT}_3_gesture.pt"
 
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
@@ -57,15 +58,12 @@ LR = 1e-4
 DROPOUT = 0.25
 LABEL_SMOOTHING = 0.05
 
-USE_CLASS_WEIGHTS = True
-USE_BALANCED_SAMPLING = True
-
 USE_AUGMENTATION = True
-AMP_RANGE = (0.5, 2.0)
-AUG_PROB = 0.5
+AMP_RANGE = (0.7, 1.4)
+AUG_PROB = 0.4
 
 EXCLUDED_SUBJECTS: list[str] = []  # Keep empty for Matthew-only runs unless you need to blacklist a subject.
-INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "signal_left", "signal_right"}  # Example subset: {"neutral", "left_turn", "right_turn"}.
+INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn"}  # Example subset: {"neutral", "left_turn", "right_turn"}.
 # ========================
 
 
@@ -142,13 +140,16 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
         target_names=label_names,
         zero_division=0,
     )
-    report_dict = classification_report(
+    report_dict_raw = classification_report(
         y_true,
         y_pred,
         target_names=label_names,
         output_dict=True,
         zero_division=0,
     )
+    if not isinstance(report_dict_raw, dict):
+        raise TypeError("classification_report(output_dict=True) did not return a dict.")
+    report_dict: dict[str, Any] = {str(k): v for k, v in report_dict_raw.items()}
 
     cm_counts = confusion_matrix(y_true, y_pred, labels=label_indices)
     cm_row_norm = _normalize_rows(cm_counts)
@@ -156,7 +157,8 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
 
     per_class = []
     for name in label_names:
-        stats = report_dict.get(name, {})
+        stats_obj = report_dict.get(name, {})
+        stats = stats_obj if isinstance(stats_obj, dict) else {}
         precision = float(stats.get("precision", 0.0))
         recall = float(stats.get("recall", 0.0))
         f1 = float(stats.get("f1-score", 0.0))
@@ -190,6 +192,11 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
             float(neutral_fp / pred_neutral_total) if pred_neutral_total > 0 else 0.0
         )
 
+    macro_avg_obj = report_dict.get("macro avg", {})
+    macro_avg = macro_avg_obj if isinstance(macro_avg_obj, dict) else {}
+    weighted_avg_obj = report_dict.get("weighted avg", {})
+    weighted_avg = weighted_avg_obj if isinstance(weighted_avg_obj, dict) else {}
+
     return {
         "classification_report_text": report_text,
         "classification_report_dict": report_dict,
@@ -199,12 +206,12 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
         "per_class": per_class,
         "test_accuracy": float(accuracy_score(y_true, y_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "macro_precision": float(report_dict["macro avg"]["precision"]),
-        "macro_recall": float(report_dict["macro avg"]["recall"]),
-        "macro_f1": float(report_dict["macro avg"]["f1-score"]),
-        "weighted_precision": float(report_dict["weighted avg"]["precision"]),
-        "weighted_recall": float(report_dict["weighted avg"]["recall"]),
-        "weighted_f1": float(report_dict["weighted avg"]["f1-score"]),
+        "macro_precision": float(macro_avg.get("precision", 0.0)),
+        "macro_recall": float(macro_avg.get("recall", 0.0)),
+        "macro_f1": float(macro_avg.get("f1-score", 0.0)),
+        "weighted_precision": float(weighted_avg.get("precision", 0.0)),
+        "weighted_recall": float(weighted_avg.get("recall", 0.0)),
+        "weighted_f1": float(weighted_avg.get("f1-score", 0.0)),
         "worst_class_recall_label": worst_recall["label"] if worst_recall else None,
         "worst_class_recall": worst_recall["recall"] if worst_recall else None,
         "max_pr_gap_label": max(per_class, key=lambda item: item["pr_gap"])["label"] if per_class else None,
@@ -432,12 +439,6 @@ def augment_emg_gpu(xb: torch.Tensor, p: float) -> torch.Tensor:
     return xb
 
 
-def make_subject_sample_weights(subjects: np.ndarray) -> np.ndarray:
-    unique, counts = np.unique(subjects, return_counts=True)
-    weight_map = {s: 1.0 / c for s, c in zip(unique, counts)}
-    return np.array([weight_map[s] for s in subjects], dtype=np.float32)
-
-
 # -- Training ------------------------------------------------------------------
 
 def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
@@ -451,7 +452,6 @@ def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
 def train_eval_split(
     X_train, y_train, X_eval, y_eval,
     channel_count, num_classes, epochs, device,
-    subjects_train=None,
 ):
     mean = X_train.mean(axis=(0, 2))
     std = X_train.std(axis=(0, 2))
@@ -463,18 +463,9 @@ def train_eval_split(
     train_ds = TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train))
     eval_ds = TensorDataset(torch.from_numpy(X_eval_t), torch.from_numpy(y_eval))
 
-    if USE_BALANCED_SAMPLING and subjects_train is not None:
-        weights = make_subject_sample_weights(subjects_train)
-        sampler = WeightedRandomSampler(
-            torch.from_numpy(weights), num_samples=len(weights), replacement=True
-        )
-        train_loader = DataLoader(
-            train_ds, batch_size=BATCH_SIZE, sampler=sampler, drop_last=False, pin_memory=True
-        )
-    else:
-        train_loader = DataLoader(
-            train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, pin_memory=True
-        )
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, pin_memory=True
+    )
 
     eval_loader = DataLoader(
         eval_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, pin_memory=True
@@ -482,14 +473,7 @@ def train_eval_split(
 
     model = _build_model(int(channel_count), num_classes, device)
 
-    class_weight = None
-    if USE_CLASS_WEIGHTS:
-        class_counts = np.bincount(y_train, minlength=num_classes)
-        weights_cls = class_counts.sum() / np.maximum(class_counts, 1)
-        weights_cls = weights_cls / weights_cls.mean()
-        class_weight = torch.tensor(weights_cls, dtype=torch.float32, device=device)
-
-    criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=LABEL_SMOOTHING)
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5, threshold=1e-4, min_lr=1e-6
@@ -599,7 +583,6 @@ def _train_and_save(
         X[train_idx], y_idx[train_idx],
         X[test_idx], y_idx[test_idx],
         channel_count, num_classes, EPOCHS, device,
-        subjects_train=subjects[train_idx],
     )
 
     model.eval()
@@ -710,7 +693,7 @@ def _train_and_save(
                 "lr": float(LR),
                 "amp_range": list(AMP_RANGE),
                 "use_augmentation": bool(USE_AUGMENTATION),
-                "use_balanced_sampling": bool(USE_BALANCED_SAMPLING),
+                "use_balanced_sampling": False,
                 "label_smoothing": float(LABEL_SMOOTHING),
                 "use_mixup": False,
             },

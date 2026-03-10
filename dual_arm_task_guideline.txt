@@ -1,0 +1,127 @@
+Dual-Arm EMG Task Guideline (Final Execution Plan)
+Date: 2026-03-10
+
+Objective
+- Deliver stable dual-arm realtime inference as the final demo path.
+- Support both:
+  - 3-gesture fallback: neutral, left_turn, right_turn
+  - Full-gesture mode: neutral, left_turn, right_turn, signal_left, signal_right, horn
+- Keep architecture fixed and measure changes with controlled A/B runs.
+
+Current model/runtime baseline
+- Training architecture: GestureCNNv2 (not legacy GestureCNN) in both:
+  - train_per_subject.py
+  - train_cross_subject.py
+- Realtime decoder options:
+  - Softmax decoder (default model head)
+  - Prototype decoder (calibration centroids + cosine scoring + reject gate)
+- Current realtime defaults (realtime_gesture_cnn.py):
+  - MODE = "dual"
+  - SMOOTHING = 1
+  - MIN_CONFIDENCE = 0.45
+  - DUAL_ARM_AGREE_THRESHOLD = 0.60
+  - DUAL_ARM_SINGLE_THRESHOLD = MIN_CONFIDENCE
+  - USE_PROTOTYPE_CLASSIFIER = True (toggle for A/B)
+
+Hard rules for every test day
+1. Verify sensors are fully charged and healthy before collecting or testing.
+2. Keep the same sensor placement/mapping for the entire session.
+3. Do not add new algorithmic features before baseline A/B is complete.
+4. Change one variable at a time.
+
+Data pipeline (for new data)
+1. Collect raw sessions.
+2. Resample raw dataset:
+   - python tools/resample_raw_dataset.py
+3. Filter resampled raw files:
+   - python emg/filtering.py
+4. Confirm training points to data_resampled:
+   - train_per_subject.py -> DATA_ROOT = Path("data_resampled") / f"{ARM} arm"
+   - train_cross_subject.py -> DATA_ROOT = Path("data_resampled") / f"{ARM} arm"
+
+Training workflow
+Per-subject (demo priority)
+1. Train right arm:
+   - In train_per_subject.py set:
+     - ARM = "right"
+     - TARGET_SUBJECT = "Matthew"
+     - INCLUDED_GESTURES for target mode:
+       - 3-gesture: {"neutral", "left_turn", "right_turn"}
+       - Full-gesture: None
+     - MODEL_OUT to distinct filenames (example):
+       - models/per_subject/right/Matthew_3_gesture.pt
+       - models/per_subject/right/Matthew_full_gesture.pt
+   - Run:
+     - python train_per_subject.py
+2. Train left arm:
+   - Repeat with ARM = "left"
+   - Use matching gesture mode and output naming.
+
+Cross-subject (secondary, for completeness)
+1. In train_cross_subject.py set ARM ("right" then "left"), INCLUDED_GESTURES mode, MODEL_OUT filename.
+2. Run:
+   - python train_cross_subject.py
+3. Keep subject/session drop policy aligned with your data-analysis notes.
+
+Realtime run plan (must run as an A/B matrix)
+Model path rule
+- Always pass explicit model paths in CLI to avoid loading an unintended file.
+
+A/B matrix to run (same hardware setup, same protocol)
+1. 3-gesture + softmax
+   - Set USE_PROTOTYPE_CLASSIFIER = False
+   - Launch:
+     - python realtime_gesture_cnn.py --model-right <right_3g_model.pt> --model-left <left_3g_model.pt>
+2. 3-gesture + prototype
+   - Set USE_PROTOTYPE_CLASSIFIER = True
+   - Launch same command with same model files.
+3. Full-gesture + softmax
+   - USE_PROTOTYPE_CLASSIFIER = False
+   - Use full-gesture model files.
+4. Full-gesture + prototype
+   - USE_PROTOTYPE_CLASSIFIER = True
+   - Use full-gesture model files.
+
+Per run evaluation protocol
+1. Do calibration as prompted.
+2. Perform each gesture with clean holds and neutral gaps.
+3. Record:
+   - obvious confusions (especially right gestures predicted as left/neutral)
+   - flicker behavior
+   - false activations at neutral
+4. Save notes in testing findings.txt with run label:
+   - [date][mode][gesture-set][prototype on/off]
+
+What is already implemented in prototype path
+1. Per-gesture calibration collection.
+2. Embedding extraction from the loaded CNN bundle.
+3. Per-class centroid fit (per arm).
+4. Cosine scoring + temperature softmax over centroids.
+5. Reject gate (min confidence + min margin) to force neutral on ambiguity.
+6. Automatic fallback to softmax if prototypes are unavailable.
+
+What NOT to implement right now
+1. Gaussian prototypes / Mahalanobis distance.
+2. k-NN embedding classifier.
+3. Unsupervised k-means clustering.
+4. Metric-learning retrain changes (triplet/contrastive/prototypical losses).
+Reason: these are larger changes and will hide whether current fixes actually helped.
+
+Only add this later if needed
+- Online adaptive centroid update (EMA) with strict gating.
+- Add only after baseline matrix shows gradual drift during long runtime.
+
+Quick troubleshooting guide
+- If calibration warns weak MVC ratio:
+  - Re-seat sensors, retry calibration, or skip MVC normalization if clearly invalid.
+- If right gestures collapse into left/neutral:
+  - Recheck sensor health and channel mapping first (before retraining).
+- If neutral false positives are high:
+  - Increase MIN_CONFIDENCE slightly or tighten prototype reject thresholds.
+- If outputs are too sticky/laggy:
+  - Keep SMOOTHING low (current = 1) and retest.
+
+Definition of done for this phase
+1. A/B matrix completed (3-gesture and full-gesture, prototype OFF/ON).
+2. Best config selected from measured behavior, not intuition.
+3. Final demo command documented with exact model paths.

@@ -201,10 +201,16 @@ class CnnBundle:
         device = next(self.model.parameters()).device
         with torch.no_grad():
             xb = torch.from_numpy(X.astype(np.float32)).to(device)
-            if hasattr(self.model, "extract_embedding"):
-                emb = self.model.extract_embedding(xb, l2_normalize=l2_normalize)
+            extract_embedding = getattr(self.model, "extract_embedding", None)
+            if callable(extract_embedding):
+                emb_out = extract_embedding(xb, l2_normalize=l2_normalize)
+                if not isinstance(emb_out, torch.Tensor):
+                    raise TypeError("Model extract_embedding returned a non-tensor object.")
+                emb = emb_out
             else:
                 logits = self.model(xb)
+                if not isinstance(logits, torch.Tensor):
+                    raise TypeError("Model forward pass returned a non-tensor object.")
                 emb = logits
                 if l2_normalize:
                     emb = F.normalize(emb, p=2, dim=1, eps=1e-8)
@@ -337,7 +343,10 @@ def quick_finetune(
     # Freeze everything except the head
     for param in model.parameters():
         param.requires_grad = False
-    for param in model.head.parameters():
+    head_module = getattr(model, "head", None)
+    if not isinstance(head_module, nn.Module):
+        raise AttributeError("quick_finetune expects bundle.model.head to be an nn.Module.")
+    for param in head_module.parameters():
         param.requires_grad = True
 
     xb = torch.from_numpy(calib_windows.astype(np.float32))

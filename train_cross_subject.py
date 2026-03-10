@@ -19,6 +19,7 @@ import datetime as dt
 import copy
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -37,9 +38,9 @@ from emg.gesture_model_cnn import GestureCNNv2
 
 
 # ======== Config ========
-ARM        = "left"            # ← set to "right" or "left" before running, lowercase l
+ARM        = "right"            # ← set to "right" or "left" before running, lowercase l
 DATA_ROOT  = Path("data_resampled") / f"{ARM} arm"
-MODEL_OUT  = Path("models/cross_subject") / ARM / "gesture_cnn_v3_left_arm_new.pt"
+MODEL_OUT  = Path("models/cross_subject") / ARM / "gesture_cnn_v3_3_gestures.pt"
 PATTERN    = "*_filtered.npz"
 
 WINDOW_SIZE = 200
@@ -63,8 +64,7 @@ LR      = 1e-4
 DROPOUT = 0.25
 LABEL_SMOOTHING = 0.05
 
-USE_CLASS_WEIGHTS    = True
-USE_BALANCED_SAMPLING = True   # up-weights under-represented subjects
+# Subject-balanced sampling is always on for cross-subject training.
 
 # Augmentation — wide amplitude range matches inter-subject EMG amplitude
 # variance (~5-10x between people due to electrode placement, muscle mass).
@@ -88,12 +88,6 @@ INCLUDED_GESTURES: set[str] | None = None # set to = None to include all gesture
 # Minimum recommended LOSO accuracy before deployment: 65%.
 LOSO_EVAL = False
 
-# Two-stage training mode:
-#   Stage A: neutral vs active (binary)
-#   Stage B: active gesture classification only (neutral excluded)
-# Set to False to keep legacy single-stage training.
-USE_TWO_STAGE = False
-TWO_STAGE_NEUTRAL_LABEL = "neutral"
 # ========================
 
 
@@ -170,13 +164,16 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
         target_names=label_names,
         zero_division=0,
     )
-    report_dict = classification_report(
+    report_dict_raw = classification_report(
         y_true,
         y_pred,
         target_names=label_names,
         output_dict=True,
         zero_division=0,
     )
+    if not isinstance(report_dict_raw, dict):
+        raise TypeError("classification_report(output_dict=True) did not return a dict.")
+    report_dict: dict[str, Any] = {str(k): v for k, v in report_dict_raw.items()}
 
     cm_counts = confusion_matrix(y_true, y_pred, labels=label_indices)
     cm_row_norm = _normalize_rows(cm_counts)
@@ -184,7 +181,8 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
 
     per_class = []
     for name in label_names:
-        stats = report_dict.get(name, {})
+        stats_obj = report_dict.get(name, {})
+        stats = stats_obj if isinstance(stats_obj, dict) else {}
         precision = float(stats.get("precision", 0.0))
         recall = float(stats.get("recall", 0.0))
         f1 = float(stats.get("f1-score", 0.0))
@@ -218,6 +216,11 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
             float(neutral_fp / pred_neutral_total) if pred_neutral_total > 0 else 0.0
         )
 
+    macro_avg_obj = report_dict.get("macro avg", {})
+    macro_avg = macro_avg_obj if isinstance(macro_avg_obj, dict) else {}
+    weighted_avg_obj = report_dict.get("weighted avg", {})
+    weighted_avg = weighted_avg_obj if isinstance(weighted_avg_obj, dict) else {}
+
     return {
         "classification_report_text": report_text,
         "classification_report_dict": report_dict,
@@ -227,12 +230,12 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
         "per_class": per_class,
         "test_accuracy": float(accuracy_score(y_true, y_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "macro_precision": float(report_dict["macro avg"]["precision"]),
-        "macro_recall": float(report_dict["macro avg"]["recall"]),
-        "macro_f1": float(report_dict["macro avg"]["f1-score"]),
-        "weighted_precision": float(report_dict["weighted avg"]["precision"]),
-        "weighted_recall": float(report_dict["weighted avg"]["recall"]),
-        "weighted_f1": float(report_dict["weighted avg"]["f1-score"]),
+        "macro_precision": float(macro_avg.get("precision", 0.0)),
+        "macro_recall": float(macro_avg.get("recall", 0.0)),
+        "macro_f1": float(macro_avg.get("f1-score", 0.0)),
+        "weighted_precision": float(weighted_avg.get("precision", 0.0)),
+        "weighted_recall": float(weighted_avg.get("recall", 0.0)),
+        "weighted_f1": float(weighted_avg.get("f1-score", 0.0)),
         "worst_class_recall_label": worst_recall["label"] if worst_recall else None,
         "worst_class_recall": worst_recall["recall"] if worst_recall else None,
         "max_pr_gap_label": max(per_class, key=lambda item: item["pr_gap"])["label"] if per_class else None,
@@ -401,29 +404,6 @@ def _prepare_test_data(X, _mean, _std):
     return X.astype(np.float32)
 
 
-def _predict_indices(model: nn.Module, X: np.ndarray, device) -> np.ndarray:
-    X_t = _prepare_test_data(X, None, None)
-    loader = DataLoader(
-        TensorDataset(torch.from_numpy(X_t), torch.zeros(len(X_t), dtype=torch.long)),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-    )
-    preds = []
-    model.eval()
-    with torch.no_grad():
-        for xb, _ in loader:
-            logits = model(xb.to(device))
-            preds.append(torch.argmax(logits, dim=1).cpu().numpy())
-    return np.concatenate(preds) if preds else np.empty((0,), dtype=np.int64)
-
-
-def _derive_two_stage_paths(model_out: Path) -> tuple[Path, Path]:
-    stem = model_out.stem
-    stage_a = model_out.with_name(f"{stem}_stage_a_neutral_active.pt")
-    stage_b = model_out.with_name(f"{stem}_stage_b_active_gestures.pt")
-    return stage_a, stage_b
-
-
 # ── Augmentation (GPU-native) ─────────────────────────────────────────────────
 # All ops run on the GPU tensor after .to(device), eliminating CPU↔GPU round-trips.
 # Temporal stretch uses a single F.interpolate over the whole batch (one factor per
@@ -507,7 +487,7 @@ def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train_eval_split(X_train, y_train, X_eval, y_eval,
-                     channels, num_classes, epochs, device, subjects_train=None):
+                     channels, num_classes, epochs, device, subjects_train):
     # No z-score: GestureCNNv2 normalises internally via InstanceNorm.
     # Compute mean/std for bundle compatibility (inference path checks metadata).
     mean = X_train.mean(axis=(0, 2))
@@ -520,31 +500,23 @@ def train_eval_split(X_train, y_train, X_eval, y_eval,
     train_ds = TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train))
     eval_ds  = TensorDataset(torch.from_numpy(X_eval_t),  torch.from_numpy(y_eval))
 
-    if USE_BALANCED_SAMPLING and subjects_train is not None:
-        weights = make_subject_sample_weights(subjects_train)
-        sampler = WeightedRandomSampler(
-            torch.from_numpy(weights), num_samples=len(weights), replacement=True
-        )
-        train_loader = DataLoader(
-            train_ds, batch_size=BATCH_SIZE, sampler=sampler, drop_last=False, pin_memory=True,
-        )
-    else:
-        train_loader = DataLoader(
-            train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, pin_memory=True,
-        )
+    if subjects_train is None:
+        raise ValueError("subjects_train is required for cross-subject balanced sampling.")
+    weights = make_subject_sample_weights(subjects_train)
+    weights_seq: list[float] = [float(w) for w in weights.tolist()]
+    sampler = WeightedRandomSampler(
+        weights_seq, num_samples=len(weights_seq), replacement=True
+    )
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, sampler=sampler, drop_last=False, pin_memory=True,
+    )
     eval_loader = DataLoader(
         eval_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, pin_memory=True,
     )
 
     model = _build_model(int(channels[0]), num_classes, device)
 
-    class_weight = None
-    if USE_CLASS_WEIGHTS:
-        class_counts = np.bincount(y_train, minlength=num_classes)
-        w = class_counts.sum() / np.maximum(class_counts, 1)
-        class_weight = torch.tensor(w / w.mean(), dtype=torch.float32, device=device)
-
-    criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=float(LABEL_SMOOTHING))
+    criterion = nn.CrossEntropyLoss(label_smoothing=float(LABEL_SMOOTHING))
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     # patience=5: cross-subject dataset is large; loss moves slowly
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -713,7 +685,7 @@ def _build_bundle(
             "lr": float(LR),
             "amp_range": list(AMP_RANGE),
             "use_augmentation": bool(USE_AUGMENTATION),
-            "use_balanced_sampling": bool(USE_BALANCED_SAMPLING),
+            "use_balanced_sampling": True,
             "label_smoothing": float(LABEL_SMOOTHING),
             "use_mixup": False,
         },
@@ -894,7 +866,7 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
                 "lr": float(LR),
                 "amp_range": list(AMP_RANGE),
                 "use_augmentation": bool(USE_AUGMENTATION),
-                "use_balanced_sampling": bool(USE_BALANCED_SAMPLING),
+                "use_balanced_sampling": True,
                 "label_smoothing": float(LABEL_SMOOTHING),
                 "use_mixup": False,
             },
@@ -928,193 +900,6 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-
-def _train_two_stage_and_save(
-    X,
-    y_labels,
-    groups,
-    subjects,
-    channel_count,
-    device,
-    model_out_stage_a: Path,
-    model_out_stage_b: Path,
-):
-    y_labels = np.asarray([str(lbl) for lbl in y_labels], dtype=object)
-    neutral_label = str(TWO_STAGE_NEUTRAL_LABEL)
-    if neutral_label not in set(y_labels.tolist()):
-        raise ValueError(
-            f"TWO_STAGE_NEUTRAL_LABEL={neutral_label!r} not found in dataset labels: "
-            f"{sorted(set(y_labels.tolist()))}"
-        )
-
-    unique_groups = np.unique(groups)
-    print(f"{X.shape[0]} windows across {len(unique_groups)} session file(s).")
-
-    splitter = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)
-    train_idx, test_idx = next(splitter.split(X, np.zeros(len(X), dtype=np.int64), groups))
-    split_mode = "group-file"
-
-    train_files = sorted({str(g) for g in groups[train_idx]})
-    test_files = sorted({str(g) for g in groups[test_idx]})
-    print(f"Train ({len(train_files)} files): {[Path(f).name for f in train_files]}")
-    print(f"Test  ({len(test_files)} files):  {[Path(f).name for f in test_files]}")
-
-    channels = [int(channel_count), 32, 64, 128]
-
-    print(f"\nTraining Stage A (neutral vs active) for {EPOCHS} epochs.")
-    y_stage_a = np.where(y_labels == neutral_label, 0, 1).astype(np.int64)
-    label_to_index_a = {neutral_label: 0, "active": 1}
-    index_to_label_a = {0: neutral_label, 1: "active"}
-    labels_a = [neutral_label, "active"]
-
-    model_a, mean_a, std_a, _ = train_eval_split(
-        X[train_idx], y_stage_a[train_idx],
-        X[test_idx], y_stage_a[test_idx],
-        channels, 2, EPOCHS, device,
-        subjects_train=subjects[train_idx],
-    )
-    y_pred_a = _predict_indices(model_a, X[test_idx], device)
-    eval_a = _compute_eval_artifacts(y_stage_a[test_idx], y_pred_a, index_to_label_a)
-    cm_a = eval_a["confusion_matrix_counts"]
-    neutral_row = float(cm_a[0].sum()) if cm_a.shape[0] > 0 else 0.0
-    active_row = float(cm_a[1].sum()) if cm_a.shape[0] > 1 else 0.0
-    stage_a_false_activation_rate = float(cm_a[0, 1] / neutral_row) if neutral_row > 0 else 0.0
-    stage_a_missed_activation_rate = float(cm_a[1, 0] / active_row) if active_row > 0 else 0.0
-    print(
-        f"Stage A test accuracy: {eval_a['test_accuracy']:.3f} | "
-        f"false_activation_rate: {stage_a_false_activation_rate:.3f} | "
-        f"missed_activation_rate: {stage_a_missed_activation_rate:.3f}"
-    )
-    print("\nStage A report:\n", eval_a["classification_report_text"])
-
-    extra_a = {
-        "two_stage": {
-            "enabled": True,
-            "role": "stage_a_neutral_vs_active",
-            "neutral_label": neutral_label,
-            "active_label": "active",
-            "recommended_enter_threshold": 0.60,
-            "recommended_exit_threshold": 0.45,
-            "false_activation_rate": stage_a_false_activation_rate,
-            "missed_activation_rate": stage_a_missed_activation_rate,
-        }
-    }
-    bundle_a = _build_bundle(
-        model=model_a,
-        mean=mean_a,
-        std=std_a,
-        label_to_index=label_to_index_a,
-        index_to_label=index_to_label_a,
-        labels=labels_a,
-        channel_count=channel_count,
-        split_mode=split_mode,
-        train_files=train_files,
-        test_files=test_files,
-        eval_artifacts=eval_a,
-        extra_metadata=extra_a,
-    )
-
-    print(f"\nTraining Stage B (active gestures only) for {EPOCHS} epochs.")
-    active_mask = y_labels != neutral_label
-    labels_b = sorted({lbl for lbl in y_labels[active_mask]})
-    if len(labels_b) < 2:
-        raise ValueError(
-            "Stage B requires at least 2 active gesture classes after filtering. "
-            f"Found: {labels_b}"
-        )
-    label_to_index_b = {label: idx for idx, label in enumerate(labels_b)}
-    index_to_label_b = {idx: label for label, idx in label_to_index_b.items()}
-
-    y_stage_b = np.full(len(y_labels), -1, dtype=np.int64)
-    for i, lbl in enumerate(y_labels):
-        if lbl != neutral_label:
-            y_stage_b[i] = label_to_index_b[lbl]
-
-    train_mask = np.zeros(len(y_labels), dtype=bool)
-    test_mask = np.zeros(len(y_labels), dtype=bool)
-    train_mask[train_idx] = True
-    test_mask[test_idx] = True
-    train_active_mask = train_mask & active_mask
-    test_active_mask = test_mask & active_mask
-    if int(train_active_mask.sum()) == 0:
-        raise ValueError(
-            "Stage B has zero active training windows after split/filtering. "
-            "Adjust TEST_SIZE, INCLUDED_GESTURES, or dataset composition."
-        )
-    if int(test_active_mask.sum()) == 0:
-        raise ValueError(
-            "Stage B has zero active test windows after split/filtering. "
-            "Adjust TEST_SIZE, INCLUDED_GESTURES, or dataset composition."
-        )
-    print(
-        f"Stage B windows: train={int(train_active_mask.sum())} "
-        f"test={int(test_active_mask.sum())} classes={labels_b}"
-    )
-
-    model_b, mean_b, std_b, _ = train_eval_split(
-        X[train_active_mask], y_stage_b[train_active_mask],
-        X[test_active_mask], y_stage_b[test_active_mask],
-        channels, len(labels_b), EPOCHS, device,
-        subjects_train=subjects[train_active_mask],
-    )
-    y_pred_b = _predict_indices(model_b, X[test_active_mask], device)
-    eval_b = _compute_eval_artifacts(y_stage_b[test_active_mask], y_pred_b, index_to_label_b)
-    print(f"Stage B active-only test accuracy: {eval_b['test_accuracy']:.3f}")
-    print("\nStage B report:\n", eval_b["classification_report_text"])
-
-    extra_b = {
-        "two_stage": {
-            "enabled": True,
-            "role": "stage_b_active_gestures",
-            "neutral_label": neutral_label,
-            "active_labels": labels_b,
-        }
-    }
-    bundle_b = _build_bundle(
-        model=model_b,
-        mean=mean_b,
-        std=std_b,
-        label_to_index=label_to_index_b,
-        index_to_label=index_to_label_b,
-        labels=labels_b,
-        channel_count=channel_count,
-        split_mode=split_mode,
-        train_files=train_files,
-        test_files=test_files,
-        eval_artifacts=eval_b,
-        extra_metadata=extra_b,
-    )
-
-    y_true_labels = y_labels[test_idx]
-    pred_labels = np.full(test_idx.shape[0], neutral_label, dtype=object)
-    pred_active_mask = y_pred_a == 1
-    if np.any(pred_active_mask):
-        y_pred_b_for_active = _predict_indices(model_b, X[test_idx][pred_active_mask], device)
-        pred_labels[pred_active_mask] = np.array(
-            [index_to_label_b[int(i)] for i in y_pred_b_for_active], dtype=object
-        )
-
-    final_labels = [neutral_label] + labels_b
-    final_label_to_index = {label: idx for idx, label in enumerate(final_labels)}
-    final_index_to_label = {idx: label for label, idx in final_label_to_index.items()}
-    y_true_final = np.array([final_label_to_index[str(lbl)] for lbl in y_true_labels], dtype=np.int64)
-    y_pred_final = np.array([final_label_to_index[str(lbl)] for lbl in pred_labels], dtype=np.int64)
-    eval_final = _compute_eval_artifacts(y_true_final, y_pred_final, final_index_to_label)
-    print(f"\nTwo-stage end-to-end test accuracy: {eval_final['test_accuracy']:.3f}")
-    print("Two-stage end-to-end report:\n", eval_final["classification_report_text"])
-    if eval_final["confusion_to_neutral_rate"]:
-        print("Two-stage confusion_to_neutral_rate:")
-        for label, rate in sorted(eval_final["confusion_to_neutral_rate"].items()):
-            print(f"  {label} -> neutral: {rate:.3f}")
-    if eval_final["neutral_prediction_fp_rate"] is not None:
-        print(f"Two-stage neutral_prediction_fp_rate: {eval_final['neutral_prediction_fp_rate']:.3f}")
-
-    model_out_stage_a.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(bundle_a, model_out_stage_a)
-    torch.save(bundle_b, model_out_stage_b)
-    print(f"\nSaved Stage A bundle: {model_out_stage_a}")
-    print(f"Saved Stage B bundle: {model_out_stage_b}")
-
 
 def main():
     if ARM not in ("right", "left"):
@@ -1154,37 +939,18 @@ def main():
         loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_to_label)
 
     print(f"\n{'=' * 55}")
-    if USE_TWO_STAGE:
-        stage_a_out, stage_b_out = _derive_two_stage_paths(MODEL_OUT)
-        print("Final cross-subject model (two-stage: A neutral/active + B active gestures)")
-        _train_two_stage_and_save(
-            X, y, groups, subjects,
-            channel_count, device,
-            model_out_stage_a=stage_a_out,
-            model_out_stage_b=stage_b_out,
-        )
-        print(f"\n{'=' * 55}")
-        print("Two-stage cross-subject bundles saved.")
-        print(f"  Stage A: {stage_a_out}")
-        print(f"  Stage B: {stage_b_out}")
-        print("Run realtime inference:")
-        print(
-            "  python realtime_gesture_cnn.py "
-            f"--two-stage --model-stage-a {stage_a_out} --model-stage-b {stage_b_out}"
-        )
-    else:
-        print("Final cross-subject model (all subjects pooled)")
-        _train_and_save(
-            X, y_idx, groups, subjects,
-            channels, num_classes, device,
-            labels, label_to_index, index_to_label, channel_count,
-            model_out=MODEL_OUT,
-        )
+    print("Final cross-subject model (all subjects pooled)")
+    _train_and_save(
+        X, y_idx, groups, subjects,
+        channels, num_classes, device,
+        labels, label_to_index, index_to_label, channel_count,
+        model_out=MODEL_OUT,
+    )
 
-        print(f"\n{'=' * 55}")
-        print(f"Cross-subject model saved to {MODEL_OUT}")
-        print(f"Run realtime inference:")
-        print(f"  python realtime_gesture_cnn.py --model {MODEL_OUT}")
+    print(f"\n{'=' * 55}")
+    print(f"Cross-subject model saved to {MODEL_OUT}")
+    print(f"Run realtime inference:")
+    print(f"  python realtime_gesture_cnn.py --model {MODEL_OUT}")
 
 
 if __name__ == "__main__":
