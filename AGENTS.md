@@ -104,3 +104,7 @@ Notes
     - If they disagree, emit per-arm labels or pick higher-confidence label if above threshold; otherwise neutral.
 - Dev environment note:
   - Expected conda env for training/inference/testing is `capstone-emg` (has `torch` and `libemg`).
+- Branch planning note (March 11, 2026):
+  - See `project_notes/strict_sensor_placement_branch_plan_2026-03-11.txt`
+  - Current branch preserves the salvage path (`USE_SENSOR_TYPE_CANONICALIZATION=True`, `USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION=True`).
+  - Planned comparison branch is a strict fixed-position workflow with clean recollection and both toggles disabled.
