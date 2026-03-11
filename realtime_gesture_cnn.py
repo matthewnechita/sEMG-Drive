@@ -19,6 +19,7 @@ from AeroPy.DataManager import DataKernel
 # Old libEMG filtering (re-enabled). Commenting out the SciPy SOS filtering.
 # from emg.filtering import define_filters, apply_filters, make_filter_state, apply_filters_stateful
 from libemg import filtering as libemg_filter
+from emg.channel_layout import infer_channel_layout
 from emg.gesture_model_cnn import load_cnn_bundle, quick_finetune
 from emg.prototype_classifier import PrototypeClassifier
 
@@ -34,10 +35,19 @@ REALTIME_RESAMPLE = True
 REALTIME_TARGET_FS_HZ = 2000.0
 
 SMOOTHING = 1
-MIN_CONFIDENCE = 0.45
-DUAL_ARM_AGREE_THRESHOLD  = 0.60
+MIN_CONFIDENCE = 0.80
+DUAL_ARM_AGREE_THRESHOLD  = 0.55
 DUAL_ARM_SINGLE_THRESHOLD = MIN_CONFIDENCE
 LOW_CONFIDENCE_LABEL = "neutral"
+
+OUTPUT_HYSTERESIS = True
+HYSTERESIS_ACTIVE_ENTER_THRESHOLD = 0.85
+HYSTERESIS_ACTIVE_EXIT_THRESHOLD = 0.60
+HYSTERESIS_ACTIVE_SWITCH_THRESHOLD = 0.88
+HYSTERESIS_NEUTRAL_ENTER_THRESHOLD = 0.75
+HYSTERESIS_ENTER_CONFIRM_FRAMES = 2
+HYSTERESIS_SWITCH_CONFIRM_FRAMES = 2
+HYSTERESIS_NEUTRAL_CONFIRM_FRAMES = 2
 
 LATEST_LOCK = threading.Lock()
 LATEST_GESTURE = LOW_CONFIDENCE_LABEL
@@ -49,7 +59,7 @@ CALIB_MVC_S = 5.0
 CALIB_MVC_PREP_S = 2.0    # countdown pause before MVC window
 MVC_PERCENTILE = 95.0
 # Keep this aligned with train_cross_subject.py (MVC_QUALITY_MIN_RATIO).
-MVC_MIN_RATIO = 2.0        # allow normalization unless calibration is clearly weak
+MVC_MIN_RATIO = 1.5        # allow normalization unless calibration is clearly weak
 
 # ======== Dual-arm config ========
 # Right arm channels come first in the Delsys stream (pair right arm sensors first).
@@ -58,8 +68,12 @@ RIGHT_ARM_CHANNELS = 17   # fixed: 6 right arm sensors → 17 channels
 # Optional explicit arm mapping by sensor pair number from scan output.
 # Example: RIGHT_ARM_PAIR_NUMBERS = {1,2,3,4,5,6}
 # Locked from current scan/mapping output to avoid runtime auto-swap drift.
-RIGHT_ARM_PAIR_NUMBERS = {1, 2, 3, 8, 9, 11}
-LEFT_ARM_PAIR_NUMBERS = {4, 5, 6, 7, 10}
+RIGHT_ARM_PAIR_NUMBERS = {2, 3, 5, 7, 9, 11}
+LEFT_ARM_PAIR_NUMBERS = {1, 4, 6, 8, 10}
+# Canonical within-arm sensor order used to build model input columns.
+# Realtime will reorder channels to this sequence when possible.
+RIGHT_ARM_PAIR_ORDER = []
+LEFT_ARM_PAIR_ORDER = []
 AUTO_DUAL_ARM_CHANNEL_MAPPING = True
 # Left arm uses 5 sensors → 16 channels (one fewer sensor than right arm)
 # =================================
@@ -68,14 +82,14 @@ AUTO_DUAL_ARM_CHANNEL_MAPPING = True
 # Collect a short sample of each gesture before inference to fine-tune
 # the model's classification head for this specific subject.
 # Requires CALIBRATE = True (needs filter_obj and MVC normalization).
-GESTURE_CALIB        = True  # adapt Stage B head to current user/session
+GESTURE_CALIB        = False  # adapt Stage B head to current user/session
 GESTURE_CALIB_S      = 5.0   # seconds of EMG to collect per gesture
 GESTURE_CALIB_PREP_S = 2.0   # countdown pause before each gesture
 
 # Prototype classifier (phase 1): build per-gesture embedding centroids from
 # gesture calibration windows, then classify by cosine-distance-derived scores.
 # Keep this on for dual-arm prototype testing.
-USE_PROTOTYPE_CLASSIFIER = True
+USE_PROTOTYPE_CLASSIFIER = False
 PROTOTYPE_L2_NORMALIZE = True
 PROTOTYPE_TEMPERATURE = 0.20
 PROTOTYPE_REJECT_MIN_CONFIDENCE = 0.55
@@ -84,7 +98,7 @@ PROTOTYPE_REJECT_MIN_MARGIN = 0.08
 # Optional runtime gesture filtering (code-only; no CLI flags).
 # Example (3-class mode):
 # INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"}
-INCLUDED_GESTURES: set[str] | None = None
+INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn"}
 
 GESTURE_LABELS = ["neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"]
 
@@ -103,14 +117,14 @@ GESTURE_INSTRUCTIONS = {
 #   "right" - right arm only  (pair right arm sensors first in Delsys)
 #   "left"  - left arm only   (pair left arm sensors first in Delsys)
 #   "dual"  - both arms fused (pair right first, then left in Delsys)
-MODE        = "dual"
+MODE        = "left"
 # Default to Matthew per-subject bundles. Override with CLI flags as needed.
 MODEL_RIGHT = os.path.join(
     BASE_DIR,
     "models",
     "per_subject",
     "right",
-    "Matthew_cnn_resample.pt",
+    "Matthew_3_gesture.pt",
 )
 
 MODEL_LEFT = os.path.join(
@@ -118,7 +132,7 @@ MODEL_LEFT = os.path.join(
     "models",
     "per_subject",
     "left",
-    "Matthew_cnn_resample.pt",
+    "Matthew_3_gesture.pt",
 )
 # ================================
 
@@ -222,6 +236,95 @@ def _resolve_target_fs_hz_from_bundle(bundle):
         if np.isfinite(fs_hz) and fs_hz > 0:
             return fs_hz
     return None
+
+
+def _bundle_channel_layout_meta(bundle):
+    metadata = bundle.metadata if isinstance(bundle.metadata, dict) else {}
+    layout_meta = metadata.get("channel_layout")
+    return layout_meta if isinstance(layout_meta, dict) else {}
+
+
+def _bundle_uses_type_layout(bundle):
+    return bool(_bundle_channel_layout_meta(bundle).get("type_canonicalization_enabled"))
+
+
+def _bundle_expected_kind_counts(bundle):
+    counts = _bundle_channel_layout_meta(bundle).get("kind_counts")
+    if not isinstance(counts, dict):
+        return {}
+    out = {}
+    for key, value in counts.items():
+        try:
+            out[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ordered_indices_from_type_layout(
+    channel_labels,
+    base_indices,
+    target_channels,
+    bundle,
+    arm_label,
+):
+    base_idx = np.asarray(base_indices, dtype=int)
+    if base_idx.size != int(target_channels):
+        print(
+            f"[gesture:{arm_label}] type canonicalization skipped: "
+            f"candidate subset has {base_idx.size} channels, expected {target_channels}."
+        )
+        return None
+
+    subset_labels = [str(channel_labels[int(i)]) for i in base_idx]
+    layout = infer_channel_layout(channel_labels=subset_labels, channel_count=base_idx.size)
+    if layout is None:
+        print(f"[gesture:{arm_label}] type canonicalization unavailable from live channel labels.")
+        return None
+
+    ordered = base_idx[layout.ordered_indices]
+    expected_kind_counts = _bundle_expected_kind_counts(bundle)
+    if expected_kind_counts and layout.kind_counts != expected_kind_counts:
+        print(
+            f"[gesture:{arm_label}] WARNING: live channel kind counts "
+            f"{layout.kind_counts} do not match bundle metadata {expected_kind_counts}."
+        )
+    print(
+        f"[gesture] {arm_label}-arm type layout via {layout.source}: "
+        f"{layout.kind_counts}"
+    )
+    print(f"[gesture] {arm_label}-arm canonical indices ({len(ordered)}): {ordered.tolist()}")
+    return ordered
+
+
+def _canonicalize_indices_by_type(channel_labels, indices, bundle, arm_label):
+    if not _bundle_uses_type_layout(bundle):
+        return np.asarray(indices, dtype=int)
+    ordered = _ordered_indices_from_type_layout(
+        channel_labels,
+        indices,
+        bundle.channel_count,
+        bundle,
+        arm_label,
+    )
+    if ordered is None:
+        return np.asarray(indices, dtype=int)
+    return ordered
+
+
+def _reorder_calibration_vectors(neutral_mean, mvc_scale, original_indices, ordered_indices):
+    if neutral_mean is None or mvc_scale is None:
+        return neutral_mean, mvc_scale
+    original = np.asarray(original_indices, dtype=int)
+    ordered = np.asarray(ordered_indices, dtype=int)
+    if original.size != ordered.size:
+        return neutral_mean, mvc_scale
+    lookup = {int(idx): pos for pos, idx in enumerate(original.tolist())}
+    try:
+        perm = [lookup[int(idx)] for idx in ordered.tolist()]
+    except KeyError:
+        return neutral_mean, mvc_scale
+    return neutral_mean[perm], mvc_scale[perm]
 
 
 class _RealtimeTimestampResampler:
@@ -442,6 +545,83 @@ def _decode_prediction(probs, index_to_label):
     return pred_label, pred_conf, pred_idx
 
 
+class _OutputHysteresis:
+    """Latch output labels to suppress brief confidence dips and one-frame flips."""
+
+    def __init__(self):
+        self.current_label = str(LOW_CONFIDENCE_LABEL)
+        self.current_conf = 0.0
+        self.candidate_label = None
+        self.candidate_conf = 0.0
+        self.candidate_count = 0
+
+    def _reset_candidate(self):
+        self.candidate_label = None
+        self.candidate_conf = 0.0
+        self.candidate_count = 0
+
+    def _observe_candidate(self, label, conf):
+        if self.candidate_label == label:
+            self.candidate_count += 1
+            self.candidate_conf = max(float(conf), self.candidate_conf)
+            return
+        self.candidate_label = str(label)
+        self.candidate_conf = float(conf)
+        self.candidate_count = 1
+
+    def _switch_to(self, label, conf):
+        self.current_label = str(label)
+        self.current_conf = float(conf)
+        self._reset_candidate()
+        return self.current_label, self.current_conf
+
+    def update(self, label, conf):
+        label = str(label)
+        conf = float(conf)
+        neutral = str(LOW_CONFIDENCE_LABEL)
+        if not OUTPUT_HYSTERESIS:
+            return self._switch_to(label, conf)
+
+        active_enter = max(float(MIN_CONFIDENCE), float(HYSTERESIS_ACTIVE_ENTER_THRESHOLD))
+        active_switch = max(float(MIN_CONFIDENCE), float(HYSTERESIS_ACTIVE_SWITCH_THRESHOLD))
+        neutral_enter = max(float(MIN_CONFIDENCE), float(HYSTERESIS_NEUTRAL_ENTER_THRESHOLD))
+
+        if self.current_label == neutral:
+            if label != neutral and conf >= active_enter:
+                self._observe_candidate(label, conf)
+                if self.candidate_count >= int(max(1, HYSTERESIS_ENTER_CONFIRM_FRAMES)):
+                    return self._switch_to(label, self.candidate_conf)
+            else:
+                self._reset_candidate()
+                self.current_conf = conf if label == neutral else 0.0
+            return self.current_label, self.current_conf
+
+        # Currently holding an active gesture.
+        if label == self.current_label:
+            self._reset_candidate()
+            if conf >= float(HYSTERESIS_ACTIVE_EXIT_THRESHOLD):
+                self.current_conf = conf
+            return self.current_label, self.current_conf
+
+        if label == neutral:
+            if conf >= neutral_enter:
+                self._observe_candidate(label, conf)
+                if self.candidate_count >= int(max(1, HYSTERESIS_NEUTRAL_CONFIRM_FRAMES)):
+                    return self._switch_to(neutral, self.candidate_conf)
+            else:
+                self._reset_candidate()
+            return self.current_label, self.current_conf
+
+        # Competing active label: require sustained high-confidence evidence.
+        if conf >= active_switch:
+            self._observe_candidate(label, conf)
+            if self.candidate_count >= int(max(1, HYSTERESIS_SWITCH_CONFIRM_FRAMES)):
+                return self._switch_to(label, self.candidate_conf)
+        else:
+            self._reset_candidate()
+        return self.current_label, self.current_conf
+
+
 def _apply_prototype_reject_gate(pred_label, pred_conf, pred_idx, probs):
     """Reject ambiguous prototype decisions to neutral."""
     probs = np.asarray(probs, dtype=float).reshape(-1)
@@ -576,6 +756,47 @@ def _build_pair_groups(channel_labels):
     return groups
 
 
+def _pair_order_for_arm(explicit_order, explicit_pairs):
+    if explicit_order:
+        return [int(p) for p in explicit_order]
+    if explicit_pairs:
+        return sorted(int(p) for p in explicit_pairs)
+    return []
+
+
+def _ordered_indices_from_pairs(channel_labels, pair_order, target_channels, arm_label):
+    """Return channel indices ordered by the requested pair-number sequence."""
+    if not pair_order:
+        return None
+
+    groups = _build_pair_groups(channel_labels)
+    pair_to_indices = {}
+    for idxs in groups.values():
+        idx_arr = np.asarray(idxs, dtype=int)
+        pair = _parse_pair_number(channel_labels[int(idx_arr[0])])
+        if pair is None:
+            continue
+        pair_to_indices[int(pair)] = idx_arr
+
+    missing = [int(pair) for pair in pair_order if int(pair) not in pair_to_indices]
+    if missing:
+        print(f"[gesture:{arm_label}] missing pair(s) for ordered mapping: {missing}")
+        return None
+
+    ordered = []
+    for pair in pair_order:
+        ordered.extend(pair_to_indices[int(pair)].tolist())
+
+    ordered_idx = np.asarray(ordered, dtype=int)
+    if ordered_idx.size != target_channels:
+        print(
+            f"[gesture:{arm_label}] ordered pair mapping size mismatch: "
+            f"{ordered_idx.size}/{target_channels}"
+        )
+        return None
+    return ordered_idx
+
+
 def _derive_dual_indices_from_pairs(
     channel_labels,
     right_channels,
@@ -594,19 +815,15 @@ def _derive_dual_indices_from_pairs(
 
     # If explicit pair-number sets are provided, use them.
     if RIGHT_ARM_PAIR_NUMBERS or LEFT_ARM_PAIR_NUMBERS:
-        right_pairs = {int(p) for p in (RIGHT_ARM_PAIR_NUMBERS or set())}
-        left_pairs = {int(p) for p in (LEFT_ARM_PAIR_NUMBERS or set())}
-        right_idx = []
-        left_idx = []
-        for _, idx_arr, _, _ in items:
-            pair = _parse_pair_number(channel_labels[int(idx_arr[0])])
-            if pair in right_pairs:
-                right_idx.extend(idx_arr.tolist())
-            elif pair in left_pairs:
-                left_idx.extend(idx_arr.tolist())
-        right_idx = np.asarray(sorted(right_idx), dtype=int)
-        left_idx = np.asarray(sorted(left_idx), dtype=int)
-        if right_idx.size == right_channels and left_idx.size == left_channels:
+        right_order = _pair_order_for_arm(RIGHT_ARM_PAIR_ORDER, RIGHT_ARM_PAIR_NUMBERS)
+        left_order = _pair_order_for_arm(LEFT_ARM_PAIR_ORDER, LEFT_ARM_PAIR_NUMBERS)
+        right_idx = _ordered_indices_from_pairs(
+            channel_labels, right_order, right_channels, "right"
+        )
+        left_idx = _ordered_indices_from_pairs(
+            channel_labels, left_order, left_channels, "left"
+        )
+        if right_idx is not None and left_idx is not None:
             return right_idx, left_idx
         print(
             "[gesture] explicit RIGHT/LEFT pair mapping count mismatch; "
@@ -786,12 +1003,52 @@ def main(argv=None):
     # whether only left arm sensors are connected (left_arm_start=0) or all
     # sensors are connected from a prior dual-arm session (left_arm_start=17).
     left_arm_start = 0
+    single_arm_channel_indices = None
     right_channel_indices = np.arange(min(RIGHT_ARM_CHANNELS, stream_channels), dtype=int)
     left_channel_indices = np.arange(
         RIGHT_ARM_CHANNELS,
         min(RIGHT_ARM_CHANNELS + left_channels, stream_channels),
         dtype=int,
     )
+    if not dual_arm:
+        pair_order_fallback = False
+        if _bundle_uses_type_layout(bundle_right):
+            if stream_channels == model_channels:
+                single_arm_channel_indices = _ordered_indices_from_type_layout(
+                    channel_labels,
+                    np.arange(stream_channels, dtype=int),
+                    model_channels,
+                    bundle_right,
+                    MODE,
+                )
+            else:
+                print(
+                    f"[gesture:{MODE}] type canonicalization deferred: "
+                    f"stream has {stream_channels} channels, model expects {model_channels}."
+                )
+        if single_arm_channel_indices is None:
+            pair_order_fallback = True
+            if MODE == "right":
+                right_order = _pair_order_for_arm(RIGHT_ARM_PAIR_ORDER, RIGHT_ARM_PAIR_NUMBERS)
+                single_arm_channel_indices = _ordered_indices_from_pairs(
+                    channel_labels, right_order, model_channels, "right"
+                )
+            elif MODE == "left":
+                left_order = _pair_order_for_arm(LEFT_ARM_PAIR_ORDER, LEFT_ARM_PAIR_NUMBERS)
+                single_arm_channel_indices = _ordered_indices_from_pairs(
+                    channel_labels, left_order, model_channels, "left"
+                )
+        if pair_order_fallback and single_arm_channel_indices is not None:
+            print(
+                f"[gesture] {MODE}-arm ordered indices ({len(single_arm_channel_indices)}): "
+                f"{single_arm_channel_indices.tolist()}"
+            )
+            ordered_pairs = []
+            for i in single_arm_channel_indices:
+                pair = _parse_pair_number(channel_labels[int(i)])
+                if pair is not None:
+                    ordered_pairs.append(int(pair))
+            print(f"[gesture] {MODE}-arm ordered pairs: {sorted(set(ordered_pairs))}")
     if not dual_arm and MODE == "left":
         if stream_channels >= RIGHT_ARM_CHANNELS + model_channels:
             left_arm_start = RIGHT_ARM_CHANNELS
@@ -824,7 +1081,7 @@ def main(argv=None):
                 f"(model expects {model_channels} at offset {left_arm_start}), "
                 f"but stream has {stream_channels}. Fix sensor pairing/mode before inference."
             )
-        if stream_channels != required:
+        if single_arm_channel_indices is None and stream_channels != required:
             print(
                 f"Stream has {stream_channels} channels; using slice "
                 f"[{left_arm_start}:{left_arm_start + model_channels}] for model input."
@@ -1048,6 +1305,12 @@ def main(argv=None):
                         right_ratio_full,
                         left_ratio_full,
                     )
+                    right_channel_indices = _canonicalize_indices_by_type(
+                        channel_labels, right_channel_indices, bundle_right, "right"
+                    )
+                    left_channel_indices = _canonicalize_indices_by_type(
+                        channel_labels, left_channel_indices, bundle_left, "left"
+                    )
                     _print_dual_channel_mapping(right_channel_indices, left_channel_indices)
                     neutral_mean_right, mvc_scale_right = _finalize_calibration_from_indices(
                         "right", right_neutral_f, right_mvc_f, right_channel_indices
@@ -1057,19 +1320,49 @@ def main(argv=None):
                     )
             else:
                 # Legacy dual-arm contiguous split (requires right channels first).
+                original_right_indices = right_channel_indices.copy()
+                original_left_indices = left_channel_indices.copy()
                 neutral_mean_right, mvc_scale_right = _do_calibration(
                     "right", RIGHT_ARM_CHANNELS, collect_channels=None, channel_start=0
                 )
                 neutral_mean_left, mvc_scale_left = _do_calibration(
                     "left", left_channels, collect_channels=None, channel_start=RIGHT_ARM_CHANNELS
                 )
+                right_channel_indices = _canonicalize_indices_by_type(
+                    channel_labels, right_channel_indices, bundle_right, "right"
+                )
+                left_channel_indices = _canonicalize_indices_by_type(
+                    channel_labels, left_channel_indices, bundle_left, "left"
+                )
+                neutral_mean_right, mvc_scale_right = _reorder_calibration_vectors(
+                    neutral_mean_right,
+                    mvc_scale_right,
+                    original_right_indices,
+                    right_channel_indices,
+                )
+                neutral_mean_left, mvc_scale_left = _reorder_calibration_vectors(
+                    neutral_mean_left,
+                    mvc_scale_left,
+                    original_left_indices,
+                    left_channel_indices,
+                )
+                _print_dual_channel_mapping(right_channel_indices, left_channel_indices)
         else:
-            # Single-arm: if left_arm_start > 0 (all sensors connected in left mode),
-            # collect all channels then slice; otherwise collect only model_channels.
-            calib_collect = None if left_arm_start > 0 else model_channels
-            neutral_mean_right, mvc_scale_right = _do_calibration(
-                MODE, model_channels, collect_channels=calib_collect, channel_start=left_arm_start
-            )
+            if single_arm_channel_indices is not None:
+                neutral_f, mvc_f = _collect_calibration_full(MODE)
+                if neutral_f is None or mvc_f is None:
+                    neutral_mean_right = mvc_scale_right = None
+                else:
+                    neutral_mean_right, mvc_scale_right = _finalize_calibration_from_indices(
+                        MODE, neutral_f, mvc_f, single_arm_channel_indices
+                    )
+            else:
+                # Single-arm: if left_arm_start > 0 (all sensors connected in left mode),
+                # collect all channels then slice; otherwise collect only model_channels.
+                calib_collect = None if left_arm_start > 0 else model_channels
+                neutral_mean_right, mvc_scale_right = _do_calibration(
+                    MODE, model_channels, collect_channels=calib_collect, channel_start=left_arm_start
+                )
 
         # Single-arm compat aliases
         neutral_mean = neutral_mean_right
@@ -1112,7 +1405,7 @@ def main(argv=None):
             print(f"GO: {instr}")
 
             gesture_collect_channels = None
-            if not dual_arm and left_arm_start == 0:
+            if not dual_arm and left_arm_start == 0 and single_arm_channel_indices is None:
                 # Single-arm right mode: keep calibration collection aligned with model input width.
                 gesture_collect_channels = model_channels
             samples, _ = _collect_samples(
@@ -1125,6 +1418,8 @@ def main(argv=None):
             # Right arm
             if dual_arm:
                 r_raw = _slice_channels_by_indices(samples, right_channel_indices, RIGHT_ARM_CHANNELS)
+            elif single_arm_channel_indices is not None:
+                r_raw = _slice_channels_by_indices(samples, single_arm_channel_indices, model_channels)
             else:
                 r_raw = _slice_channels(samples, left_arm_start, model_channels)
             r_filt = apply_filters(filter_obj, r_raw)
@@ -1225,6 +1520,7 @@ def main(argv=None):
 
     last_output  = None
     last_msg_len = 0
+    output_hysteresis = _OutputHysteresis()
     # === LATENCY MEASURE START ===
     # Comment out this whole block (and other LATENCY blocks below) after measuring.
     # Measures end-to-end latency from "data available in this process" to prediction time.
@@ -1290,6 +1586,10 @@ def main(argv=None):
                 )
                 batch_left = _slice_channels_by_indices(
                     batch_arr, left_channel_indices, left_channels
+                )
+            elif single_arm_channel_indices is not None:
+                batch_right = _slice_channels_by_indices(
+                    batch_arr, single_arm_channel_indices, model_channels
                 )
             else:
                 batch_right = _slice_channels(batch_arr, left_arm_start, model_channels)
@@ -1408,6 +1708,7 @@ def main(argv=None):
                     )
                 else:
                     label, confidence = label_right, conf_right
+                label, confidence = output_hysteresis.update(label, confidence)
 
                 if label != LOW_CONFIDENCE_LABEL or last_output != LOW_CONFIDENCE_LABEL:
                     control_hook(label)

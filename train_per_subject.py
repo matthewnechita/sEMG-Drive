@@ -30,11 +30,12 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from libemg.utils import get_windows
+from emg.channel_layout import CANONICAL_BLOCK_ORDER, infer_channel_layout, reorder_by_layout
 from emg.gesture_model_cnn import GestureCNNv2
 
 
 # ======== Config ========
-ARM = "right"  # set to "right" or "left" before running
+ARM = "left"  # set to "right" or "left" before running
 TARGET_SUBJECT = "Matthew"
 
 DATA_ROOT = Path("data_resampled") / f"{ARM} arm"
@@ -47,13 +48,13 @@ WINDOW_STEP = 100
 USE_CALIBRATION = True
 MVC_PERCENTILE = 95.0
 USE_MIN_LABEL_CONFIDENCE = True
-MIN_LABEL_CONFIDENCE = 0.75
+MIN_LABEL_CONFIDENCE = 0.85
 
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 BATCH_SIZE = 512
 
-EPOCHS = 65
+EPOCHS = 45
 LR = 1e-4
 DROPOUT = 0.25
 LABEL_SMOOTHING = 0.05
@@ -61,6 +62,8 @@ LABEL_SMOOTHING = 0.05
 USE_AUGMENTATION = True
 AMP_RANGE = (0.7, 1.4)
 AUG_PROB = 0.4
+USE_SENSOR_TYPE_CANONICALIZATION = True
+USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION = True
 
 EXCLUDED_SUBJECTS: list[str] = []  # Keep empty for Matthew-only runs unless you need to blacklist a subject.
 INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn"}  # Example subset: {"neutral", "left_turn", "right_turn"}.
@@ -292,11 +295,26 @@ def load_windows_from_file(path):
     if "emg" not in data.files or "y" not in data.files:
         return None
     emg = np.asarray(data["emg"], dtype=float)
+    timestamps = np.asarray(data["timestamps"], dtype=float) if "timestamps" in data.files else None
+    metadata = data.get("metadata")
+    layout = None
+    if USE_SENSOR_TYPE_CANONICALIZATION:
+        layout = infer_channel_layout(
+            metadata=metadata,
+            channel_count=emg.shape[1],
+            timestamps=timestamps,
+        )
+        emg = reorder_by_layout(emg, layout)
 
     if USE_CALIBRATION:
         calib_neutral = data.get("calib_neutral_emg")
         calib_mvc = data.get("calib_mvc_emg")
         if calib_neutral is not None and calib_mvc is not None:
+            calib_neutral = np.asarray(calib_neutral, dtype=float)
+            calib_mvc = np.asarray(calib_mvc, dtype=float)
+            if layout is not None:
+                calib_neutral = reorder_by_layout(calib_neutral, layout)
+                calib_mvc = reorder_by_layout(calib_mvc, layout)
             neutral_mean, mvc_scale = compute_calibration(
                 calib_neutral, calib_mvc, MVC_PERCENTILE
             )
@@ -328,7 +346,7 @@ def load_windows_from_file(path):
 
     if windows.size == 0:
         return None
-    return windows.astype(np.float32), window_labels
+    return windows.astype(np.float32), window_labels, layout
 
 
 def load_dataset(target_subject: str):
@@ -354,16 +372,40 @@ def load_dataset(target_subject: str):
         validate_calibration_data(files)
 
     X_list, y_list, groups_list, subjects_list, channel_counts = [], [], [], [], []
+    permutation_groups = None
+    layout_sources: dict[str, int] = {}
+    layout_kind_counts = None
     for fp in files:
         result = load_windows_from_file(fp)
         if result is None:
             continue
-        windows, labels = result
+        windows, labels, layout = result
         X_list.append(windows)
         y_list.append(labels)
         groups_list.append(np.array([str(fp)] * len(labels), dtype=object))
         subjects_list.append(np.array([subject_from_path(fp)] * len(labels), dtype=object))
         channel_counts.append(int(windows.shape[1]))
+        if layout is not None:
+            layout_sources[layout.source] = layout_sources.get(layout.source, 0) + 1
+            layout_groups = [list(group) for group in layout.permutation_groups]
+            if permutation_groups is None and layout_groups:
+                permutation_groups = layout_groups
+            elif permutation_groups is not None and layout_groups and layout_groups != permutation_groups:
+                raise ValueError(
+                    f"Inconsistent permutation groups while loading {fp.name}: "
+                    f"{layout_groups} vs {permutation_groups}"
+                )
+            if layout_kind_counts is None and layout.kind_counts:
+                layout_kind_counts = dict(layout.kind_counts)
+            elif (
+                layout_kind_counts is not None
+                and layout.kind_counts
+                and layout.kind_counts != layout_kind_counts
+            ):
+                raise ValueError(
+                    f"Inconsistent canonical channel kind counts while loading {fp.name}: "
+                    f"{layout.kind_counts} vs {layout_kind_counts}"
+                )
 
     if not X_list:
         raise ValueError(f"No labeled windows found for TARGET_SUBJECT={target_subject!r}.")
@@ -378,6 +420,9 @@ def load_dataset(target_subject: str):
         np.concatenate(groups_list),
         np.concatenate(subjects_list),
         unique_counts[0],
+        permutation_groups or [],
+        layout_sources,
+        layout_kind_counts or {},
     )
 
 
@@ -390,11 +435,40 @@ def _prepare_test_data(X, _mean, _std):
 
 # -- Augmentation --------------------------------------------------------------
 
-def augment_emg_gpu(xb: torch.Tensor, p: float) -> torch.Tensor:
+def _apply_permutation_groups_gpu(
+    xb: torch.Tensor,
+    permutation_groups: list[list[int]] | None,
+    p: float,
+) -> torch.Tensor:
+    if not permutation_groups or p <= 0.0:
+        return xb
+    bsz = xb.shape[0]
+    dev = xb.device
+    for group in permutation_groups:
+        if len(group) <= 1:
+            continue
+        mask = torch.rand(bsz, device=dev) < p
+        batch_idx = torch.nonzero(mask, as_tuple=False).flatten()
+        if batch_idx.numel() == 0:
+            continue
+        group_idx = torch.as_tensor(group, device=dev, dtype=torch.long)
+        original = xb[batch_idx][:, group_idx, :].clone()
+        for row in range(batch_idx.numel()):
+            perm = torch.randperm(group_idx.numel(), device=dev)
+            xb[batch_idx[row], group_idx, :] = original[row, perm, :]
+    return xb
+
+
+def augment_emg_gpu(
+    xb: torch.Tensor,
+    p: float,
+    permutation_groups: list[list[int]] | None = None,
+) -> torch.Tensor:
     """In-place-safe GPU augmentation. xb: (B, C, T) float32 on device."""
     bsz, channels, t_len = xb.shape
     dev = xb.device
     xb = xb.clone()
+    xb = _apply_permutation_groups_gpu(xb, permutation_groups, p)
 
     mask = torch.rand(bsz, device=dev) < p
     if mask.any():
@@ -452,6 +526,7 @@ def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
 def train_eval_split(
     X_train, y_train, X_eval, y_eval,
     channel_count, num_classes, epochs, device,
+    permutation_groups=None,
 ):
     mean = X_train.mean(axis=(0, 2))
     std = X_train.std(axis=(0, 2))
@@ -494,7 +569,15 @@ def train_eval_split(
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             if USE_AUGMENTATION:
-                xb = augment_emg_gpu(xb, p=AUG_PROB)
+                xb = augment_emg_gpu(
+                    xb,
+                    p=AUG_PROB,
+                    permutation_groups=(
+                        permutation_groups
+                        if USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION
+                        else None
+                    ),
+                )
 
             optimizer.zero_grad()
             logits = model(xb)
@@ -558,6 +641,7 @@ def train_eval_split(
 def _train_and_save(
     X, y_idx, groups, subjects, channel_count, num_classes, device,
     labels, label_to_index, index_to_label, model_out, subject_tag,
+    permutation_groups, layout_sources, layout_kind_counts,
 ):
     unique_groups = np.unique(groups)
     print(f"{X.shape[0]} windows across {len(unique_groups)} session file(s).")
@@ -583,6 +667,7 @@ def _train_and_save(
         X[train_idx], y_idx[train_idx],
         X[test_idx], y_idx[test_idx],
         channel_count, num_classes, EPOCHS, device,
+        permutation_groups=permutation_groups,
     )
 
     model.eval()
@@ -687,12 +772,25 @@ def _train_and_save(
                 "enabled": bool(USE_MIN_LABEL_CONFIDENCE),
                 "min_label_confidence": float(MIN_LABEL_CONFIDENCE),
             },
+            "channel_layout": {
+                "type_canonicalization_enabled": bool(USE_SENSOR_TYPE_CANONICALIZATION),
+                "canonical_block_order": list(CANONICAL_BLOCK_ORDER),
+                "permutation_groups": [list(group) for group in permutation_groups],
+                "permutation_augmentation_enabled": bool(
+                    USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION
+                ),
+                "layout_inference_sources": dict(layout_sources),
+                "kind_counts": dict(layout_kind_counts),
+            },
             "training": {
                 "epochs": int(EPOCHS),
                 "batch_size": int(BATCH_SIZE),
                 "lr": float(LR),
                 "amp_range": list(AMP_RANGE),
                 "use_augmentation": bool(USE_AUGMENTATION),
+                "use_single_block_permutation_augmentation": bool(
+                    USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION
+                ),
                 "use_balanced_sampling": False,
                 "label_smoothing": float(LABEL_SMOOTHING),
                 "use_mixup": False,
@@ -742,13 +840,24 @@ def main():
     np.random.seed(RANDOM_STATE)
     torch.manual_seed(RANDOM_STATE)
 
-    X, y, groups, subjects, channel_count = load_dataset(target_subject=TARGET_SUBJECT)
+    X, y, groups, subjects, channel_count, permutation_groups, layout_sources, layout_kind_counts = load_dataset(
+        target_subject=TARGET_SUBJECT
+    )
     unique_subjects = sorted(np.unique(subjects))
     print(
         f"Loaded {X.shape[0]} windows, {channel_count} channels, "
         f"{len(np.unique(y))} classes, {len(unique_subjects)} subject(s): "
         f"{unique_subjects}"
     )
+    if USE_SENSOR_TYPE_CANONICALIZATION:
+        source_parts = ", ".join(
+            f"{key}={value}" for key, value in sorted(layout_sources.items())
+        ) or "none"
+        print(f"Channel layout canonicalization: ON ({source_parts})")
+        if layout_kind_counts:
+            print(f"Canonical channel kind counts: {layout_kind_counts}")
+        if permutation_groups:
+            print(f"Exchangeable channel groups: {permutation_groups}")
 
     labels = sorted({str(lbl) for lbl in np.unique(y)})
     label_to_index = {label: idx for idx, label in enumerate(labels)}
@@ -763,6 +872,7 @@ def main():
     _train_and_save(
         X, y_idx, groups, subjects, channel_count, num_classes, device,
         labels, label_to_index, index_to_label, MODEL_OUT, TARGET_SUBJECT,
+        permutation_groups, layout_sources, layout_kind_counts,
     )
 
     print(f"\n{'=' * 55}")

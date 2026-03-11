@@ -985,6 +985,7 @@ class CollectDataWindow(QWidget):
             "label_trim_s": config.label_trim_s,
             "rest_label_trim_s": rest_trim_s,
             "ramp_style": "ramp contractions (longer window for non-neutral gestures)",
+            "emg_channel_labels": list(getattr(self.CallbackConnector.base, "emgChannelNames", [])),
         }
         if config.calibrate:
             metadata["calibration"] = {
