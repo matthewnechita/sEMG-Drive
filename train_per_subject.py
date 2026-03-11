@@ -8,7 +8,7 @@ Usage:
     python train_per_subject.py
 
 To run realtime inference with the trained model:
-    python realtime_gesture_cnn.py --model models/per_subject/right/Matthew_cnn.pt
+    python realtime_gesture_cnn.py --model models/strict/per_subject/right/Matthew_3_gesture.pt
 """
 import copy
 import datetime as dt
@@ -37,15 +37,16 @@ from emg.strict_layout import (
     strict_channel_count_for_arm,
     strict_layout_bundle_metadata,
 )
+from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_root
 
 
 # ======== Config ========
-ARM = "left"  # set to "right" or "left" before running
+ARM = "right"  # set to "right" or "left" before running
 TARGET_SUBJECT = "Matthew"
 
-DATA_ROOT = Path("data_resampled") / f"{ARM} arm"
+DATA_ROOT = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
 PATTERN = "*_filtered.npz"
-MODEL_OUT = Path("models/per_subject") / ARM / f"{TARGET_SUBJECT}_3_gesture.pt"
+MODEL_OUT = STRICT_MODELS_ROOT / "per_subject" / ARM / f"{TARGET_SUBJECT}_3_gesture.pt"
 
 WINDOW_SIZE = 200
 WINDOW_STEP = 100

@@ -12,12 +12,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 import numpy as np
 import torch
+from scipy.signal import butter, sosfilt
 
 from AeroPy.TrignoBase import TrignoBase
 from AeroPy.DataManager import DataKernel
 
-# Old libEMG filtering (re-enabled). Commenting out the SciPy SOS filtering.
-# from emg.filtering import define_filters, apply_filters, make_filter_state, apply_filters_stateful
 from libemg import filtering as libemg_filter
 from emg.channel_layout import infer_channel_layout
 from emg.gesture_model_cnn import load_cnn_bundle, quick_finetune
@@ -33,7 +32,8 @@ from emg.strict_layout import (
 # ======== Config (edit as needed) ========
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
-FILTER_WARMUP = 200  # extra samples to stabilize old libEMG filtering on rolling buffers
+REALTIME_FILTER_MODE = "scipy_stateful"  # "scipy_stateful" or "libemg_rolling"
+FILTER_WARMUP = 200  # only used when REALTIME_FILTER_MODE == "libemg_rolling"
 
 REALTIME_RESAMPLE = True
 # Keep this aligned with your training data preprocessing.
@@ -41,12 +41,12 @@ REALTIME_RESAMPLE = True
 REALTIME_TARGET_FS_HZ = 2000.0
 
 SMOOTHING = 1
-MIN_CONFIDENCE = 0.80
+MIN_CONFIDENCE = 0.90
 DUAL_ARM_AGREE_THRESHOLD  = 0.55
 DUAL_ARM_SINGLE_THRESHOLD = MIN_CONFIDENCE
 LOW_CONFIDENCE_LABEL = "neutral"
 
-OUTPUT_HYSTERESIS = True
+OUTPUT_HYSTERESIS = False
 HYSTERESIS_ACTIVE_ENTER_THRESHOLD = 0.85
 HYSTERESIS_ACTIVE_EXIT_THRESHOLD = 0.60
 HYSTERESIS_ACTIVE_SWITCH_THRESHOLD = 0.88
@@ -118,11 +118,12 @@ GESTURE_INSTRUCTIONS = {
 #   "right" - right arm only  (pair right arm sensors first in Delsys)
 #   "left"  - left arm only   (pair left arm sensors first in Delsys)
 #   "dual"  - both arms fused (pair right first, then left in Delsys)
-MODE        = "left"
-# Default to Matthew per-subject bundles. Override with CLI flags as needed.
+MODE        = "right"
+# Default to Matthew strict per-subject bundles. Override with CLI flags as needed.
 MODEL_RIGHT = os.path.join(
     BASE_DIR,
     "models",
+    "strict",
     "per_subject",
     "right",
     "Matthew_3_gesture.pt",
@@ -131,6 +132,7 @@ MODEL_RIGHT = os.path.join(
 MODEL_LEFT = os.path.join(
     BASE_DIR,
     "models",
+    "strict",
     "per_subject",
     "left",
     "Matthew_3_gesture.pt",
@@ -165,6 +167,44 @@ def define_filters(fs):
 def apply_filters(fi, emg):
     filtered_data = fi.filter(emg)
     return np.array(filtered_data, dtype=float)
+
+
+def _define_realtime_stateful_filters(fs):
+    """
+    Causal SOS stack for realtime use.
+
+    This approximates the active offline filter settings:
+    - notch 60 Hz  (bandwidth 3 Hz)
+    - notch 120 Hz (bandwidth 3 Hz)
+    - bandpass 20-450 Hz, order 6
+    """
+    sos_n60 = butter(2, [58.5, 61.5], btype="bandstop", fs=fs, output="sos")
+    sos_n120 = butter(2, [118.5, 121.5], btype="bandstop", fs=fs, output="sos")
+    sos_bp = butter(6, [20.0, 450.0], btype="bandpass", fs=fs, output="sos")
+    return (sos_n60, sos_n120, sos_bp)
+
+
+def _make_realtime_filter_state(filters, num_channels):
+    sos_n60, sos_n120, sos_bp = filters
+    channels = int(num_channels)
+    return [
+        np.zeros((sos_n60.shape[0], 2, channels), dtype=float),
+        np.zeros((sos_n120.shape[0], 2, channels), dtype=float),
+        np.zeros((sos_bp.shape[0], 2, channels), dtype=float),
+    ]
+
+
+def _apply_filters_stateful(filters, samples, state):
+    samples_arr = np.asarray(samples, dtype=float)
+    if samples_arr.size == 0:
+        return samples_arr.reshape(0, 0), state
+
+    sos_n60, sos_n120, sos_bp = filters
+    zi_n60, zi_n120, zi_bp = state
+    out, zi_n60 = sosfilt(sos_n60, samples_arr, axis=0, zi=zi_n60)
+    out, zi_n120 = sosfilt(sos_n120, out, axis=0, zi=zi_n120)
+    out, zi_bp = sosfilt(sos_bp, out, axis=0, zi=zi_bp)
+    return np.asarray(out, dtype=float), [zi_n60, zi_n120, zi_bp]
 
 
 def _make_windows(emg, window_size=WINDOW_SIZE, step=WINDOW_STEP):
@@ -1166,12 +1206,27 @@ def main(argv=None):
         fs = float(runtime_target_fs)
     else:
         fs = None
+    if REALTIME_FILTER_MODE not in {"scipy_stateful", "libemg_rolling"}:
+        raise ValueError(
+            f"Unsupported REALTIME_FILTER_MODE={REALTIME_FILTER_MODE!r}. "
+            "Use 'scipy_stateful' or 'libemg_rolling'."
+        )
+    use_stateful_realtime_filter = REALTIME_FILTER_MODE == "scipy_stateful"
     filter_obj = define_filters(fs) if fs is not None else None
+    realtime_filter_spec = (
+        _define_realtime_stateful_filters(fs)
+        if fs is not None and use_stateful_realtime_filter
+        else None
+    )
     resampler = _RealtimeTimestampResampler(stream_channels, fs) if fs is not None else None
     if use_timestamp_resampling:
         print(f"[gesture] realtime timestamp resampling enabled at {fs:.2f} Hz")
     else:
         print("[gesture] realtime timestamp resampling disabled (legacy index alignment).")
+    if use_stateful_realtime_filter:
+        print("[gesture] realtime filter mode: scipy_stateful")
+    else:
+        print(f"[gesture] realtime filter mode: libemg_rolling (warmup={FILTER_WARMUP})")
 
     poll_sleep = 0.001
 
@@ -1182,6 +1237,15 @@ def main(argv=None):
     mvc_scale_right    = None
     neutral_mean_left  = None
     mvc_scale_left     = None
+
+    def _ensure_filter_backends():
+        nonlocal filter_obj, realtime_filter_spec
+        if fs is None:
+            return
+        if filter_obj is None:
+            filter_obj = define_filters(fs)
+        if use_stateful_realtime_filter and realtime_filter_spec is None:
+            realtime_filter_spec = _define_realtime_stateful_filters(fs)
 
     def _do_calibration(arm_label, arm_channels, collect_channels, channel_start=0):
         """Run one neutral+MVC calibration sequence for a single arm.
@@ -1200,8 +1264,8 @@ def main(argv=None):
             nonlocal fs, filter_obj
             if fs is None and n_times.size:
                 fs = _estimate_fs(n_times)
-                if fs is not None and filter_obj is None:
-                    filter_obj = define_filters(fs)
+                if fs is not None:
+                    _ensure_filter_backends()
                     print(f"Estimated fs: {fs:.2f} Hz")
 
             if filter_obj is None:
@@ -1220,8 +1284,8 @@ def main(argv=None):
             )
             if fs is None and m_times.size:
                 fs = _estimate_fs(m_times)
-                if fs is not None and filter_obj is None:
-                    filter_obj = define_filters(fs)
+                if fs is not None:
+                    _ensure_filter_backends()
                     print(f"Estimated fs: {fs:.2f} Hz")
 
             if not (m_samples.size and n_samples.size):
@@ -1288,8 +1352,8 @@ def main(argv=None):
         nonlocal fs, filter_obj
         if fs is None and n_times.size:
             fs = _estimate_fs(n_times)
-            if fs is not None and filter_obj is None:
-                filter_obj = define_filters(fs)
+            if fs is not None:
+                _ensure_filter_backends()
                 print(f"Estimated fs: {fs:.2f} Hz")
         if filter_obj is None:
             return None, None
@@ -1305,8 +1369,8 @@ def main(argv=None):
         )
         if fs is None and m_times.size:
             fs = _estimate_fs(m_times)
-            if fs is not None and filter_obj is None:
-                filter_obj = define_filters(fs)
+            if fs is not None:
+                _ensure_filter_backends()
                 print(f"Estimated fs: {fs:.2f} Hz")
         if not (n_samples.size and m_samples.size):
             return None, None
@@ -1594,19 +1658,25 @@ def main(argv=None):
         )
         use_prototype_classifier = False
 
-    buffer_len = WINDOW_SIZE + FILTER_WARMUP
-
-    # Right arm (always present)
-    raw_buffer_right   = deque(maxlen=buffer_len)
-    warmup_right       = FILTER_WARMUP == 0
-    pending_right      = 0
+    pending_right = 0
     pred_history_right = deque(maxlen=max(1, SMOOTHING))
+    pending_left = 0
+    pred_history_left = deque(maxlen=max(1, SMOOTHING))
+    if use_stateful_realtime_filter:
+        filtered_buffer_right = deque(maxlen=WINDOW_SIZE)
+        filtered_buffer_left = deque(maxlen=WINDOW_SIZE)
+        filter_state_right = None
+        filter_state_left = None
+    else:
+        buffer_len = WINDOW_SIZE + FILTER_WARMUP
 
-    # Left arm (dual-arm mode only)
-    raw_buffer_left    = deque(maxlen=buffer_len)
-    warmup_left        = FILTER_WARMUP == 0
-    pending_left       = 0
-    pred_history_left  = deque(maxlen=max(1, SMOOTHING))
+        # Right arm (always present)
+        raw_buffer_right = deque(maxlen=buffer_len)
+        warmup_right = FILTER_WARMUP == 0
+
+        # Left arm (dual-arm mode only)
+        raw_buffer_left = deque(maxlen=buffer_len)
+        warmup_left = FILTER_WARMUP == 0
 
     last_output  = None
     last_msg_len = 0
@@ -1653,8 +1723,8 @@ def main(argv=None):
                         if not times:
                             continue
                         fs = _estimate_fs(times)
-                        if fs is not None and filter_obj is None:
-                            filter_obj = define_filters(fs)
+                        if fs is not None:
+                            _ensure_filter_backends()
                             print(f"Estimated fs: {fs:.2f} Hz")
                             break
 
@@ -1684,36 +1754,77 @@ def main(argv=None):
             else:
                 batch_right = _slice_channels(batch_arr, left_arm_start, model_channels)
 
-            # --- old approach: raw rolling buffers + libEMG filtering ---
-            for s in batch_right:
-                raw_buffer_right.append(s)
-                pending_right += 1
-            if not warmup_right and len(raw_buffer_right) >= buffer_len:
-                warmup_right = True
-                pending_right = WINDOW_STEP
+            if use_stateful_realtime_filter:
+                if realtime_filter_spec is None:
+                    continue
+                if filter_state_right is None:
+                    filter_state_right = _make_realtime_filter_state(
+                        realtime_filter_spec,
+                        batch_right.shape[1],
+                    )
+                filtered_batch_right, filter_state_right = _apply_filters_stateful(
+                    realtime_filter_spec,
+                    batch_right,
+                    filter_state_right,
+                )
+                for sample in filtered_batch_right:
+                    filtered_buffer_right.append(sample)
+                pending_right += int(filtered_batch_right.shape[0])
 
-            if dual_arm:
-                for s in batch_left:
-                    raw_buffer_left.append(s)
-                    pending_left += 1
-                if not warmup_left and len(raw_buffer_left) >= buffer_len:
-                    warmup_left = True
-                    pending_left = WINDOW_STEP
-
-            if filter_obj is None:
-                pending_right = min(pending_right, WINDOW_STEP)
                 if dual_arm:
-                    pending_left = min(pending_left, WINDOW_STEP)
-                continue
+                    if filter_state_left is None:
+                        filter_state_left = _make_realtime_filter_state(
+                            realtime_filter_spec,
+                            batch_left.shape[1],
+                        )
+                    filtered_batch_left, filter_state_left = _apply_filters_stateful(
+                        realtime_filter_spec,
+                        batch_left,
+                        filter_state_left,
+                    )
+                    for sample in filtered_batch_left:
+                        filtered_buffer_left.append(sample)
+                    pending_left += int(filtered_batch_left.shape[0])
+            else:
+                # Rolling full-buffer libEMG refiltering. Higher latency, but
+                # kept as a comparison path.
+                for sample in batch_right:
+                    raw_buffer_right.append(sample)
+                    pending_right += 1
+                if not warmup_right and len(raw_buffer_right) >= buffer_len:
+                    warmup_right = True
+                    pending_right = WINDOW_STEP
+
+                if dual_arm:
+                    for sample in batch_left:
+                        raw_buffer_left.append(sample)
+                        pending_left += 1
+                    if not warmup_left and len(raw_buffer_left) >= buffer_len:
+                        warmup_left = True
+                        pending_left = WINDOW_STEP
+
+                if filter_obj is None:
+                    pending_right = min(pending_right, WINDOW_STEP)
+                    if dual_arm:
+                        pending_left = min(pending_left, WINDOW_STEP)
+                    continue
 
             # --- inference: right arm ---
             inference_ran = False
             label_right = LOW_CONFIDENCE_LABEL
             conf_right  = 0.0
-            if warmup_right and pending_right >= WINDOW_STEP and len(raw_buffer_right) >= WINDOW_SIZE:
-                raw = np.asarray(raw_buffer_right, dtype=float)
-                filtered_full = apply_filters(filter_obj, raw)
-                filtered = filtered_full[-WINDOW_SIZE:]
+            if use_stateful_realtime_filter:
+                right_ready = pending_right >= WINDOW_STEP and len(filtered_buffer_right) == WINDOW_SIZE
+            else:
+                right_ready = warmup_right and pending_right >= WINDOW_STEP and len(raw_buffer_right) >= WINDOW_SIZE
+
+            if right_ready:
+                if use_stateful_realtime_filter:
+                    filtered = np.asarray(filtered_buffer_right, dtype=float)
+                else:
+                    raw = np.asarray(raw_buffer_right, dtype=float)
+                    filtered_full = apply_filters(filter_obj, raw)
+                    filtered = filtered_full[-WINDOW_SIZE:]
                 if neutral_mean_right is not None and mvc_scale_right is not None:
                     neutral_mean_right, mvc_scale_right = _align_calibration_vectors(
                         neutral_mean_right, mvc_scale_right, filtered.shape[1], "right"
@@ -1753,10 +1864,18 @@ def main(argv=None):
             conf_left  = 0.0
             if dual_arm:
                 assert bundle_left is not None
-                if warmup_left and pending_left >= WINDOW_STEP and len(raw_buffer_left) >= WINDOW_SIZE:
-                    raw = np.asarray(raw_buffer_left, dtype=float)
-                    filtered_full = apply_filters(filter_obj, raw)
-                    filtered = filtered_full[-WINDOW_SIZE:]
+                if use_stateful_realtime_filter:
+                    left_ready = pending_left >= WINDOW_STEP and len(filtered_buffer_left) == WINDOW_SIZE
+                else:
+                    left_ready = warmup_left and pending_left >= WINDOW_STEP and len(raw_buffer_left) >= WINDOW_SIZE
+
+                if left_ready:
+                    if use_stateful_realtime_filter:
+                        filtered = np.asarray(filtered_buffer_left, dtype=float)
+                    else:
+                        raw = np.asarray(raw_buffer_left, dtype=float)
+                        filtered_full = apply_filters(filter_obj, raw)
+                        filtered = filtered_full[-WINDOW_SIZE:]
                     if neutral_mean_left is not None and mvc_scale_left is not None:
                         neutral_mean_left, mvc_scale_left = _align_calibration_vectors(
                             neutral_mean_left, mvc_scale_left, filtered.shape[1], "left"

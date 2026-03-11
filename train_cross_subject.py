@@ -8,7 +8,7 @@ Usage:
     python train_cross_subject.py
 
 To run realtime inference with the cross-subject model:
-    python realtime_gesture_cnn.py --model models/cross_subject/right/gesture_cnn_v3_m2_excl05_label_smoothing005.pt
+    python realtime_gesture_cnn.py --model models/strict/cross_subject/right/gesture_cnn_v3_3_gestures.pt
 
 DQ note: subject05 is excluded by default (EXCLUDED_SUBJECTS below).
 All 4 sessions show MVC/neutral ratio <= 1.8x — the MVC calibration failed,
@@ -40,12 +40,13 @@ from emg.strict_layout import (
     strict_channel_count_for_arm,
     strict_layout_bundle_metadata,
 )
+from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_root
 
 
 # ======== Config ========
 ARM        = "right"            # ← set to "right" or "left" before running, lowercase l
-DATA_ROOT  = Path("data_resampled") / f"{ARM} arm"
-MODEL_OUT  = Path("models/cross_subject") / ARM / "gesture_cnn_v3_3_gestures.pt"
+DATA_ROOT  = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
+MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "gesture_cnn_v3_3_gestures.pt"
 PATTERN    = "*_filtered.npz"
 
 WINDOW_SIZE = 200

@@ -1,6 +1,13 @@
 import numpy as np
 from pathlib import Path
+import sys
 from libemg import filtering as libemg_filter
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from project_paths import STRICT_RESAMPLED_ROOT
 
 
 def _coerce_scalar_fs(value):
@@ -74,7 +81,7 @@ def define_filters(fs):
     - Bandpass filter 20-450 Hz, order 6
 
     IMPORTANT: after changing any parameter here you must:
-      1. Delete all data/**/*_filtered.npz files
+      1. Delete all data_resampled_strict/**/*_filtered.npz files
       2. python emg/filtering.py          (re-filter raw data + calibration)
       3. python tools/recalibrate.py --apply
       4. Retrain both models
@@ -116,7 +123,7 @@ def destination_for_filtered(raw_path: Path) -> Path:
 
 
 if __name__ == "__main__":
-    root = Path("data_resampled")
+    root = STRICT_RESAMPLED_ROOT
 
     for fp in root.rglob("*_raw.npz"):
         out_path = destination_for_filtered(fp)

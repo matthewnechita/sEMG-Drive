@@ -16,6 +16,7 @@ from DataCollector.CollectDataController import *
 import tkinter as tk
 from tkinter import filedialog
 import numpy as np
+from project_paths import STRICT_DATA_ROOT, strict_raw_dir
 
 from DataCollector.CollectionMetricsManagement import CollectionMetricsManagement
 from Plotter import GenericPlot as gp
@@ -682,8 +683,7 @@ class CollectDataWindow(QWidget):
             calibration_min_ratio=2.0,
         )
 
-        base_dir = Path.cwd() / "data" / f"{config.arm} arm" / config.subject
-        raw_dir = base_dir / "raw"
+        raw_dir = strict_raw_dir(STRICT_DATA_ROOT, config.arm, config.subject)
         raw_dir.mkdir(parents=True, exist_ok=True)
         output_path = raw_dir / f"{config.subject}_session{config.session}_raw.npz"
 
@@ -974,6 +974,8 @@ class CollectDataWindow(QWidget):
             "subject": config.subject,
             "arm":     config.arm,
             "session": config.session,
+            "data_root": str(STRICT_DATA_ROOT),
+            "layout_mode": "strict",
             "gestures": config.gestures,
             "gesture_duration_s": config.gesture_duration,
             "neutral_duration_s": config.neutral_duration,

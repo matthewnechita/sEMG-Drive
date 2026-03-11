@@ -62,24 +62,25 @@ Strict collection workflow
 
 Data separation rule
 - Do not mix strict recollection with the older salvage-era files.
-- Keep strict data in a dedicated folder/root.
-- If the GUI still writes into the normal `data/...` tree, move or copy the new strict sessions into a dedicated strict root before training.
+- Keep strict raw data under `data_strict/...`.
+- Keep strict resampled/filtered data under `data_resampled_strict/...`.
+- Keep strict trained bundles under `models/strict/...`.
 
 Preprocessing order
 1. `python tools/resample_raw_dataset.py`
 2. `python emg/filtering.py`
-3. `python tools/recalibrate.py --data-root <strict_resampled_root>`
-4. If needed: `python tools/recalibrate.py --data-root <strict_resampled_root> --apply`
+3. `python tools/recalibrate.py --data-root data_resampled_strict`
+4. If needed: `python tools/recalibrate.py --data-root data_resampled_strict --apply`
 
 Training workflow
 Per-subject:
 1. Edit `ARM`, `TARGET_SUBJECT`, `DATA_ROOT`, and `MODEL_OUT` in `train_per_subject.py`.
-2. Point `DATA_ROOT` at the strict recollection root.
+2. Default `DATA_ROOT` is the strict recollection root under `data_resampled_strict/...`.
 3. Run `python train_per_subject.py`.
 
 Cross-subject:
 1. Edit `ARM`, `DATA_ROOT`, and `MODEL_OUT` in `train_cross_subject.py`.
-2. Point `DATA_ROOT` at a strict recollection root only.
+2. Default `DATA_ROOT` is the strict recollection root under `data_resampled_strict/...`.
 3. Run `python train_cross_subject.py`.
 
 Realtime workflow
@@ -107,3 +108,10 @@ If something goes wrong
 Bottom line
 - You do not run `strict_layout.py` yourself.
 - You pair sensors correctly, place each numbered sensor in the same exact spot each time, collect clean arm-specific data, and the training/realtime code handles strict validation and channel reordering automatically.
+
+  1 slots (starting at 9) occupied by sensor 78725 with sticker number 9
+  1 slots (starting at 3) occupied by sensor 87899 with sticker number 3
+  1 slots (starting at 2) occupied by sensor 87890 with sticker number 2
+  1 slots (starting at 11) occupied by sensor 91572 with sticker number 11
+  1 slots (starting at 7) occupied by sensor 83724 with sticker number 7
+  1 slots (starting at 1) occupied by sensor 87913 with sticker number 1

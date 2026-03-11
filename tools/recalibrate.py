@@ -24,7 +24,13 @@ from pathlib import Path
 
 import numpy as np
 
-DATA_ROOT  = Path("data_resampled")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from project_paths import STRICT_RESAMPLED_ROOT
+
+DATA_ROOT  = STRICT_RESAMPLED_ROOT
 PATTERN    = "*_filtered.npz"
 PERCENTILE = 95.0
 

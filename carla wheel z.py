@@ -113,6 +113,27 @@ try:
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
 
+# Gesture/CARLA timing diagnostics.
+# Frame rate does not need to match EMG sample rate; this only controls how
+# often CARLA polls and applies the latest gesture label.
+DEFAULT_CLIENT_FPS_LIMIT = 30
+CLIENT_FPS_LIMIT = DEFAULT_CLIENT_FPS_LIMIT
+CLIENT_USE_BUSY_LOOP = False
+GESTURE_TIMING_DEBUG = True
+GESTURE_TIMING_WARN_MS = 200.0
+DEFAULT_LOW_GRAPHICS_MODE = True
+LOW_GRAPHICS_MODE = DEFAULT_LOW_GRAPHICS_MODE
+DEFAULT_LOW_GRAPHICS_NO_RENDERING = False  # True = lowest possible GPU use, but no camera view.
+LOW_GRAPHICS_NO_RENDERING = DEFAULT_LOW_GRAPHICS_NO_RENDERING
+DEFAULT_CLIENT_RES = '640x360'
+DEFAULT_CAMERA_RES = '640x360'
+DEFAULT_CAMERA_FPS = 10.0
+CAMERA_IMAGE_WIDTH = 640
+CAMERA_IMAGE_HEIGHT = 360
+CAMERA_SENSOR_TICK_S = 1.0 / DEFAULT_CAMERA_FPS
+DEFAULT_HUD_VISIBLE = False
+HUD_VISIBLE_BY_DEFAULT = DEFAULT_HUD_VISIBLE
+
 
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
@@ -129,6 +150,18 @@ def find_weather_presets():
 def get_actor_display_name(actor, truncate=250):
     name = ' '.join(actor.type_id.replace('_', '.').title().split('.')[1:])
     return (name[:truncate - 1] + u'\u2026') if len(name) > truncate else name
+
+
+def parse_resolution(value):
+    try:
+        width_str, height_str = value.lower().split('x', 1)
+        width = int(width_str)
+        height = int(height_str)
+    except ValueError as exc:
+        raise ValueError('resolution must look like WIDTHxHEIGHT') from exc
+    if width <= 0 or height <= 0:
+        raise ValueError('resolution values must be positive')
+    return width, height
 
 
 # ==============================================================================
@@ -148,8 +181,20 @@ class World(object):
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
         self._actor_filter = actor_filter
+        self._apply_runtime_world_settings()
         self.restart()
         self.world.on_tick(hud.on_world_tick)
+
+    def _apply_runtime_world_settings(self):
+        if not LOW_GRAPHICS_MODE:
+            return
+        settings = self.world.get_settings()
+        changed = False
+        if settings.no_rendering_mode != bool(LOW_GRAPHICS_NO_RENDERING):
+            settings.no_rendering_mode = bool(LOW_GRAPHICS_NO_RENDERING)
+            changed = True
+        if changed:
+            self.world.apply_settings(settings)
 
     def restart(self):
         # Keep same camera config if the camera manager exists.
@@ -257,6 +302,9 @@ class DualControl(object):
         
         # Gesture freshness (optional safety: ignore stale labels)
         self._gesture_max_age = 0.75
+        self._client_fps = 0.0
+        self._last_applied_gesture = None
+        self._last_gesture_debug_t = 0.0
         
         # Gestures -> steering only (NO throttle/brake from gestures)
         self._gesture_to_steer = {
@@ -272,6 +320,7 @@ class DualControl(object):
         self._start_gesture_thread()
 
     def parse_events(self, world, clock):
+        self._client_fps = float(clock.get_fps())
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return True
@@ -408,8 +457,36 @@ class DualControl(object):
             return
     
         label, age = realtime_gesture.get_latest_gesture()
+        age_ms = float(age * 1000.0)
+        now = time.time()
         if age > self._gesture_max_age:
+            if GESTURE_TIMING_DEBUG and now - self._last_gesture_debug_t >= 1.0:
+                print(
+                    "[gesture->carla] stale label ignored "
+                    f"label={label} age_ms={age_ms:.0f} "
+                    f"client_fps={self._client_fps:.1f} "
+                    f"server_fps={getattr(self._hud, 'server_fps', 0.0):.1f}"
+                )
+                self._last_gesture_debug_t = now
             return
+
+        if GESTURE_TIMING_DEBUG:
+            should_log = (
+                label != self._last_applied_gesture
+                or (
+                    age_ms >= GESTURE_TIMING_WARN_MS
+                    and now - self._last_gesture_debug_t >= 0.5
+                )
+            )
+            if should_log:
+                print(
+                    "[gesture->carla] apply "
+                    f"label={label} age_ms={age_ms:.0f} "
+                    f"client_fps={self._client_fps:.1f} "
+                    f"server_fps={getattr(self._hud, 'server_fps', 0.0):.1f}"
+                )
+                self._last_gesture_debug_t = now
+        self._last_applied_gesture = label
     
         # --- Steering gestures ---
         if label in self._gesture_to_steer:
@@ -492,7 +569,7 @@ class HUD(object):
         self.server_fps = 0
         self.frame = 0
         self.simulation_time = 0
-        self._show_info = True
+        self._show_info = bool(HUD_VISIBLE_BY_DEFAULT) if LOW_GRAPHICS_MODE else True
         self._info_text = []
         self._server_clock = pygame.time.Clock()
 
@@ -790,10 +867,18 @@ class CameraManager(object):
         for item in self.sensors:
             bp = bp_library.find(item[0])
             if item[0].startswith('sensor.camera'):
-                bp.set_attribute('image_size_x', str(hud.dim[0]))
-                bp.set_attribute('image_size_y', str(hud.dim[1]))
+                if LOW_GRAPHICS_MODE:
+                    bp.set_attribute('image_size_x', str(CAMERA_IMAGE_WIDTH))
+                    bp.set_attribute('image_size_y', str(CAMERA_IMAGE_HEIGHT))
+                    if bp.has_attribute('sensor_tick'):
+                        bp.set_attribute('sensor_tick', str(CAMERA_SENSOR_TICK_S))
+                    if bp.has_attribute('enable_postprocess_effects'):
+                        bp.set_attribute('enable_postprocess_effects', 'False')
+                else:
+                    bp.set_attribute('image_size_x', str(hud.dim[0]))
+                    bp.set_attribute('image_size_y', str(hud.dim[1]))
             elif item[0].startswith('sensor.lidar'):
-                bp.set_attribute('range', '50')
+                bp.set_attribute('range', '15' if LOW_GRAPHICS_MODE else '50')
             item.append(bp)
         self.index = None
 
@@ -885,7 +970,10 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
         while True:
-            clock.tick_busy_loop(60)
+            if CLIENT_USE_BUSY_LOOP:
+                clock.tick_busy_loop(CLIENT_FPS_LIMIT)
+            else:
+                clock.tick(CLIENT_FPS_LIMIT)
             if controller.parse_events(world, clock):
                 return
             world.tick(clock)
@@ -938,9 +1026,70 @@ def main():
         metavar='PATTERN',
         default='vehicle.*',
         help='actor filter (default: "vehicle.*")')
+    argparser.add_argument(
+        '--graphics',
+        choices=['low', 'normal'],
+        default='low' if DEFAULT_LOW_GRAPHICS_MODE else 'normal',
+        help='client graphics preset (default: low)')
+    argparser.add_argument(
+        '--camera-res',
+        metavar='WIDTHxHEIGHT',
+        default=DEFAULT_CAMERA_RES,
+        help='camera sensor resolution in low mode (default: %s)' % DEFAULT_CAMERA_RES)
+    argparser.add_argument(
+        '--camera-fps',
+        metavar='FPS',
+        default=DEFAULT_CAMERA_FPS,
+        type=float,
+        help='camera sensor FPS in low mode (default: %.1f)' % DEFAULT_CAMERA_FPS)
+    argparser.add_argument(
+        '--client-fps',
+        metavar='FPS',
+        default=DEFAULT_CLIENT_FPS_LIMIT,
+        type=int,
+        help='client loop FPS cap (default: %d)' % DEFAULT_CLIENT_FPS_LIMIT)
+    argparser.add_argument(
+        '--no-rendering',
+        action='store_true',
+        help='disable server rendering entirely; camera feeds will stop updating')
+    argparser.add_argument(
+        '--show-hud',
+        action='store_true',
+        help='show the HUD on startup')
+    argparser.add_argument(
+        '--hide-hud',
+        action='store_true',
+        help='hide the HUD on startup')
     args = argparser.parse_args()
 
-    args.width, args.height = [int(x) for x in args.res.split('x')]
+    if args.show_hud and args.hide_hud:
+        argparser.error('use only one of --show-hud or --hide-hud')
+
+    global CLIENT_FPS_LIMIT
+    global LOW_GRAPHICS_MODE
+    global LOW_GRAPHICS_NO_RENDERING
+    global CAMERA_IMAGE_WIDTH
+    global CAMERA_IMAGE_HEIGHT
+    global CAMERA_SENSOR_TICK_S
+    global HUD_VISIBLE_BY_DEFAULT
+
+    try:
+        args.width, args.height = parse_resolution(args.res)
+        CAMERA_IMAGE_WIDTH, CAMERA_IMAGE_HEIGHT = parse_resolution(args.camera_res)
+    except ValueError as exc:
+        argparser.error(str(exc))
+
+    LOW_GRAPHICS_MODE = args.graphics == 'low'
+    LOW_GRAPHICS_NO_RENDERING = bool(args.no_rendering)
+    CLIENT_FPS_LIMIT = max(1, int(args.client_fps))
+    CAMERA_SENSOR_TICK_S = 1.0 / max(1.0, float(args.camera_fps))
+
+    if args.show_hud:
+        HUD_VISIBLE_BY_DEFAULT = True
+    elif args.hide_hud:
+        HUD_VISIBLE_BY_DEFAULT = False
+    else:
+        HUD_VISIBLE_BY_DEFAULT = DEFAULT_HUD_VISIBLE if LOW_GRAPHICS_MODE else True
 
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(format='%(levelname)s: %(message)s', level=log_level)

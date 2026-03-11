@@ -31,13 +31,20 @@ from __future__ import annotations
 
 import datetime as dt
 from pathlib import Path
+import sys
 
 import numpy as np
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from project_paths import STRICT_DATA_ROOT, STRICT_RESAMPLED_ROOT
+
 
 # ======== Config (edit in code) ========
-DATA_ROOT = Path("data")
-OUTPUT_ROOT = Path("data_resampled")
+DATA_ROOT = STRICT_DATA_ROOT
+OUTPUT_ROOT = STRICT_RESAMPLED_ROOT
 RAW_PATTERN = "*_raw.npz"
 TARGET_FS_HZ = 2000.0
 OVERWRITE = False

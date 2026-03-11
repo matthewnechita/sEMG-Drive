@@ -3,9 +3,9 @@
 Project context
 - The active stack is the CNN workflow driven by `DelsysPythonGUI.py`, `train_per_subject.py`, `train_cross_subject.py`, and `realtime_gesture_cnn.py`.
 - The collection GUI entrypoint is `python DelsysPythonGUI.py`; it uses `DataCollector/CollectDataWindow.py`.
-- Raw GUI collections are stored under `data/<arm> arm/<subject>/raw/*.npz`.
-- The recommended preprocessing/training root is `data_resampled/<arm> arm/<subject>/{raw,filtered}`.
-- Legacy filtered files may still exist under `data/.../filtered`, but the current CNN trainers default to `data_resampled/...`.
+- Raw GUI strict collections are stored under `data_strict/<arm> arm/<subject>/raw/*.npz`.
+- The recommended preprocessing/training root is `data_resampled_strict/<arm> arm/<subject>/{raw,filtered}`.
+- Legacy raw/filtered files may still exist under `data/...` and `data_resampled/...`, but the active strict workflow should stay on the dedicated strict roots.
 - Expected environment is the `capstone-emg` conda env with `torch` and `libemg`.
 
 Label contract
@@ -28,6 +28,7 @@ Strict sensor placement workflow
 - Default trainer mode is `CHANNEL_LAYOUT_MODE = "strict"` in both `train_per_subject.py` and `train_cross_subject.py`.
 - Strict mode requires fresh collection files with `metadata.emg_channel_labels`, which are saved by `CollectDataWindow.py`.
 - Strict mode must use clean recollected data kept separate from old mixed-layout sessions.
+- Default strict roots on this branch are `data_strict/`, `data_resampled_strict/`, and `models/strict/`.
 - Strict placement is sensor-number-specific, not just sensor-type-specific: each numbered sensor must stay on the same arm and in the same physical location every session.
 - Strict collection should be one arm at a time with the other arm disconnected.
 - Fixed pair-to-slot contract:
@@ -64,9 +65,9 @@ Common commands
 - Filter resampled data:
   - `python emg/filtering.py`
 - Recalibration dry run:
-  - `python tools/recalibrate.py --data-root data_resampled`
+  - `python tools/recalibrate.py --data-root data_resampled_strict`
 - Recalibration apply:
-  - `python tools/recalibrate.py --data-root data_resampled --apply`
+  - `python tools/recalibrate.py --data-root data_resampled_strict --apply`
 - Train a per-subject CNN:
   - Edit `ARM`, `TARGET_SUBJECT`, `DATA_ROOT`, and `MODEL_OUT` in `train_per_subject.py`
   - Run `python train_per_subject.py`
