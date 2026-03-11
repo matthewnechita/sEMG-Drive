@@ -22,6 +22,12 @@ from libemg import filtering as libemg_filter
 from emg.channel_layout import infer_channel_layout
 from emg.gesture_model_cnn import load_cnn_bundle, quick_finetune
 from emg.prototype_classifier import PrototypeClassifier
+from emg.strict_layout import (
+    parse_pair_number as parse_strict_pair_number,
+    resolve_strict_channel_indices,
+    strict_channel_count_for_arm,
+    strict_pair_numbers_for_arm,
+)
 
 
 # ======== Config (edit as needed) ========
@@ -62,18 +68,13 @@ MVC_PERCENTILE = 95.0
 MVC_MIN_RATIO = 1.5        # allow normalization unless calibration is clearly weak
 
 # ======== Dual-arm config ========
-# Right arm channels come first in the Delsys stream (pair right arm sensors first).
-# Left arm channels follow immediately after; inferred from bundle_left.channel_count at load time.
-RIGHT_ARM_CHANNELS = 17   # fixed: 6 right arm sensors → 17 channels
-# Optional explicit arm mapping by sensor pair number from scan output.
-# Example: RIGHT_ARM_PAIR_NUMBERS = {1,2,3,4,5,6}
-# Locked from current scan/mapping output to avoid runtime auto-swap drift.
-RIGHT_ARM_PAIR_NUMBERS = {2, 3, 5, 7, 9, 11}
-LEFT_ARM_PAIR_NUMBERS = {1, 4, 6, 8, 10}
-# Canonical within-arm sensor order used to build model input columns.
-# Realtime will reorder channels to this sequence when possible.
-RIGHT_ARM_PAIR_ORDER = []
-LEFT_ARM_PAIR_ORDER = []
+# Strict layout uses fixed pair identities; pairing/scan order may vary.
+RIGHT_ARM_CHANNELS = strict_channel_count_for_arm("right")
+RIGHT_ARM_PAIR_NUMBERS = set(strict_pair_numbers_for_arm("right"))
+LEFT_ARM_PAIR_NUMBERS = set(strict_pair_numbers_for_arm("left"))
+# Canonical within-arm pair order used to build model input columns.
+RIGHT_ARM_PAIR_ORDER = list(strict_pair_numbers_for_arm("right"))
+LEFT_ARM_PAIR_ORDER = list(strict_pair_numbers_for_arm("left"))
 AUTO_DUAL_ARM_CHANNEL_MAPPING = True
 # Left arm uses 5 sensors → 16 channels (one fewer sensor than right arm)
 # =================================
@@ -244,6 +245,15 @@ def _bundle_channel_layout_meta(bundle):
     return layout_meta if isinstance(layout_meta, dict) else {}
 
 
+def _bundle_layout_mode(bundle):
+    value = _bundle_channel_layout_meta(bundle).get("layout_mode")
+    return str(value).strip().lower() if value is not None else ""
+
+
+def _bundle_uses_strict_layout(bundle):
+    return _bundle_layout_mode(bundle) == "strict"
+
+
 def _bundle_uses_type_layout(bundle):
     return bool(_bundle_channel_layout_meta(bundle).get("type_canonicalization_enabled"))
 
@@ -259,6 +269,41 @@ def _bundle_expected_kind_counts(bundle):
         except (TypeError, ValueError):
             continue
     return out
+
+
+def _ordered_indices_from_strict_layout(channel_labels, bundle, arm_label):
+    if not _bundle_uses_strict_layout(bundle):
+        return None
+
+    layout_meta = _bundle_channel_layout_meta(bundle)
+    expected_arm = str(layout_meta.get("arm") or arm_label).strip().lower()
+    try:
+        resolved = resolve_strict_channel_indices(channel_labels, arm=expected_arm)
+    except Exception as exc:
+        raise RuntimeError(f"[gesture:{arm_label}] strict layout validation failed: {exc}") from exc
+
+    if resolved.ordered_indices.size != int(bundle.channel_count):
+        raise RuntimeError(
+            f"[gesture:{arm_label}] strict layout resolved {resolved.ordered_indices.size} channels, "
+            f"but model expects {bundle.channel_count}."
+        )
+
+    expected_pairs = layout_meta.get("pair_order")
+    if isinstance(expected_pairs, (list, tuple)):
+        expected_pairs = [int(value) for value in expected_pairs]
+        if list(resolved.pair_numbers) != expected_pairs:
+            raise RuntimeError(
+                f"[gesture:{arm_label}] strict pair order mismatch: "
+                f"live={list(resolved.pair_numbers)} bundle={expected_pairs}"
+            )
+
+    print(f"[gesture] {arm_label}-arm strict slots: {list(resolved.slot_names)}")
+    print(f"[gesture] {arm_label}-arm strict pairs: {list(resolved.pair_numbers)}")
+    print(
+        f"[gesture] {arm_label}-arm strict indices ({len(resolved.ordered_indices)}): "
+        f"{resolved.ordered_indices.tolist()}"
+    )
+    return resolved.ordered_indices
 
 
 def _ordered_indices_from_type_layout(
@@ -741,9 +786,7 @@ def _slice_channels_by_indices(batch_arr, indices, target_channels):
 
 
 def _parse_pair_number(channel_label):
-    text = str(channel_label).strip()
-    m = re.match(r"^\((\d+)\)", text)
-    return int(m.group(1)) if m else None
+    return parse_strict_pair_number(channel_label)
 
 
 def _build_pair_groups(channel_labels):
@@ -901,6 +944,7 @@ def main(argv=None):
 
     print("[gesture] right arm model:", model_right_path)
     bundle_right = load_cnn_bundle(model_right_path, device=device)
+    use_strict_layout_right = _bundle_uses_strict_layout(bundle_right)
 
     model_channels = bundle_right.channel_count   # kept for single-arm compat
     index_to_label_right = _canonical_label_map(bundle_right.index_to_label)
@@ -914,10 +958,12 @@ def main(argv=None):
     index_to_label_left = {}
     allowed_labels_left = set()
     allowed_indices_left = set()
+    use_strict_layout_left = False
     if dual_arm:
         print("[gesture] left arm model:", model_left_path)
         bundle_left   = load_cnn_bundle(model_left_path, device=device)
         left_channels = bundle_left.channel_count
+        use_strict_layout_left = _bundle_uses_strict_layout(bundle_left)
         index_to_label_left = _canonical_label_map(bundle_left.index_to_label)
         allowed_labels_left, allowed_indices_left = _resolve_allowed_labels(
             index_to_label_left, "left"
@@ -925,6 +971,10 @@ def main(argv=None):
         print(f"[gesture] dual-arm mode | right={RIGHT_ARM_CHANNELS}ch left={left_channels}ch")
     else:
         print("[gesture] single-arm mode")
+    if dual_arm and use_strict_layout_right != use_strict_layout_left:
+        raise RuntimeError(
+            "Dual-arm strict layout mismatch: right/left bundles must both use strict mode or both avoid it."
+        )
 
     use_prototype_classifier = bool(USE_PROTOTYPE_CLASSIFIER)
     if use_prototype_classifier and (not CALIBRATE or not GESTURE_CALIB):
@@ -1010,9 +1060,16 @@ def main(argv=None):
         min(RIGHT_ARM_CHANNELS + left_channels, stream_channels),
         dtype=int,
     )
+    strict_dual_layout = dual_arm and use_strict_layout_right and use_strict_layout_left
     if not dual_arm:
         pair_order_fallback = False
-        if _bundle_uses_type_layout(bundle_right):
+        if use_strict_layout_right:
+            single_arm_channel_indices = _ordered_indices_from_strict_layout(
+                channel_labels,
+                bundle_right,
+                MODE,
+            )
+        elif _bundle_uses_type_layout(bundle_right):
             if stream_channels == model_channels:
                 single_arm_channel_indices = _ordered_indices_from_type_layout(
                     channel_labels,
@@ -1049,7 +1106,19 @@ def main(argv=None):
                 if pair is not None:
                     ordered_pairs.append(int(pair))
             print(f"[gesture] {MODE}-arm ordered pairs: {sorted(set(ordered_pairs))}")
-    if not dual_arm and MODE == "left":
+    elif strict_dual_layout:
+        assert bundle_left is not None
+        right_channel_indices = _ordered_indices_from_strict_layout(
+            channel_labels,
+            bundle_right,
+            "right",
+        )
+        left_channel_indices = _ordered_indices_from_strict_layout(
+            channel_labels,
+            bundle_left,
+            "left",
+        )
+    if not dual_arm and MODE == "left" and single_arm_channel_indices is None:
         if stream_channels >= RIGHT_ARM_CHANNELS + model_channels:
             left_arm_start = RIGHT_ARM_CHANNELS
             print(
@@ -1060,19 +1129,22 @@ def main(argv=None):
             print(f"[gesture] left-arm sensors only; using channels 0–{model_channels - 1}")
 
     if dual_arm:
-        expected_total = RIGHT_ARM_CHANNELS + left_channels
-        if stream_channels < expected_total:
-            raise RuntimeError(
-                f"Dual-arm requires {expected_total} stream channels "
-                f"({RIGHT_ARM_CHANNELS} right + {left_channels} left) "
-                f"but stream only has {stream_channels}. "
-                "Pair right arm sensors first, then left arm sensors, before scanning."
-            )
-        if stream_channels > expected_total:
-            print(
-                f"[gesture] stream has {stream_channels} channels; "
-                f"dual models use {expected_total}. Extra channels may be ignored."
-            )
+        if strict_dual_layout:
+            print("[gesture] dual-arm strict layout active; pairing/scan order is ignored after pair resolution.")
+        else:
+            expected_total = RIGHT_ARM_CHANNELS + left_channels
+            if stream_channels < expected_total:
+                raise RuntimeError(
+                    f"Dual-arm requires {expected_total} stream channels "
+                    f"({RIGHT_ARM_CHANNELS} right + {left_channels} left) "
+                    f"but stream only has {stream_channels}. "
+                    "Pair right arm sensors first, then left arm sensors, before scanning."
+                )
+            if stream_channels > expected_total:
+                print(
+                    f"[gesture] stream has {stream_channels} channels; "
+                    f"dual models use {expected_total}. Extra channels may be ignored."
+                )
     else:
         required = left_arm_start + model_channels
         if stream_channels < required:
@@ -1285,7 +1357,25 @@ def main(argv=None):
 
     if CALIBRATE:
         if dual_arm:
-            if AUTO_DUAL_ARM_CHANNEL_MAPPING:
+            if strict_dual_layout:
+                right_neutral_f, right_mvc_f = _collect_calibration_full("right")
+                left_neutral_f, left_mvc_f = _collect_calibration_full("left")
+                if (
+                    right_neutral_f is None or right_mvc_f is None
+                    or left_neutral_f is None or left_mvc_f is None
+                ):
+                    print("[gesture] dual-arm calibration unavailable; MVC normalization disabled.")
+                    neutral_mean_right = mvc_scale_right = None
+                    neutral_mean_left = mvc_scale_left = None
+                else:
+                    _print_dual_channel_mapping(right_channel_indices, left_channel_indices)
+                    neutral_mean_right, mvc_scale_right = _finalize_calibration_from_indices(
+                        "right", right_neutral_f, right_mvc_f, right_channel_indices
+                    )
+                    neutral_mean_left, mvc_scale_left = _finalize_calibration_from_indices(
+                        "left", left_neutral_f, left_mvc_f, left_channel_indices
+                    )
+            elif AUTO_DUAL_ARM_CHANNEL_MAPPING:
                 right_neutral_f, right_mvc_f = _collect_calibration_full("right")
                 left_neutral_f, left_mvc_f = _collect_calibration_full("left")
                 if (

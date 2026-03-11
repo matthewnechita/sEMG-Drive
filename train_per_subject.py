@@ -32,6 +32,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from libemg.utils import get_windows
 from emg.channel_layout import CANONICAL_BLOCK_ORDER, infer_channel_layout, reorder_by_layout
 from emg.gesture_model_cnn import GestureCNNv2
+from emg.strict_layout import (
+    resolve_strict_indices_from_metadata,
+    strict_channel_count_for_arm,
+    strict_layout_bundle_metadata,
+)
 
 
 # ======== Config ========
@@ -62,8 +67,9 @@ LABEL_SMOOTHING = 0.05
 USE_AUGMENTATION = True
 AMP_RANGE = (0.7, 1.4)
 AUG_PROB = 0.4
-USE_SENSOR_TYPE_CANONICALIZATION = True
-USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION = True
+CHANNEL_LAYOUT_MODE = "strict"  # "strict", "salvage", or "none"
+USE_SENSOR_TYPE_CANONICALIZATION = CHANNEL_LAYOUT_MODE == "salvage"
+USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION = CHANNEL_LAYOUT_MODE == "salvage"
 
 EXCLUDED_SUBJECTS: list[str] = []  # Keep empty for Matthew-only runs unless you need to blacklist a subject.
 INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn"}  # Example subset: {"neutral", "left_turn", "right_turn"}.
@@ -298,7 +304,16 @@ def load_windows_from_file(path):
     timestamps = np.asarray(data["timestamps"], dtype=float) if "timestamps" in data.files else None
     metadata = data.get("metadata")
     layout = None
-    if USE_SENSOR_TYPE_CANONICALIZATION:
+    strict_layout = None
+    if CHANNEL_LAYOUT_MODE == "strict":
+        strict_layout = resolve_strict_indices_from_metadata(metadata, arm=ARM)
+        if emg.shape[1] != strict_layout.ordered_indices.size:
+            raise ValueError(
+                f"{path.name}: strict layout resolved {strict_layout.ordered_indices.size} channels "
+                f"for {ARM}, but file has {emg.shape[1]}."
+            )
+        emg = emg[:, strict_layout.ordered_indices]
+    elif USE_SENSOR_TYPE_CANONICALIZATION:
         layout = infer_channel_layout(
             metadata=metadata,
             channel_count=emg.shape[1],
@@ -312,7 +327,10 @@ def load_windows_from_file(path):
         if calib_neutral is not None and calib_mvc is not None:
             calib_neutral = np.asarray(calib_neutral, dtype=float)
             calib_mvc = np.asarray(calib_mvc, dtype=float)
-            if layout is not None:
+            if strict_layout is not None:
+                calib_neutral = calib_neutral[:, strict_layout.ordered_indices]
+                calib_mvc = calib_mvc[:, strict_layout.ordered_indices]
+            elif layout is not None:
                 calib_neutral = reorder_by_layout(calib_neutral, layout)
                 calib_mvc = reorder_by_layout(calib_mvc, layout)
             neutral_mean, mvc_scale = compute_calibration(
@@ -346,7 +364,7 @@ def load_windows_from_file(path):
 
     if windows.size == 0:
         return None
-    return windows.astype(np.float32), window_labels, layout
+    return windows.astype(np.float32), window_labels, layout, strict_layout
 
 
 def load_dataset(target_subject: str):
@@ -375,17 +393,37 @@ def load_dataset(target_subject: str):
     permutation_groups = None
     layout_sources: dict[str, int] = {}
     layout_kind_counts = None
+    strict_pair_order = None
+    strict_slot_order = None
+    strict_channel_counts = None
     for fp in files:
         result = load_windows_from_file(fp)
         if result is None:
             continue
-        windows, labels, layout = result
+        windows, labels, layout, strict_layout = result
         X_list.append(windows)
         y_list.append(labels)
         groups_list.append(np.array([str(fp)] * len(labels), dtype=object))
         subjects_list.append(np.array([subject_from_path(fp)] * len(labels), dtype=object))
         channel_counts.append(int(windows.shape[1]))
-        if layout is not None:
+        if CHANNEL_LAYOUT_MODE == "strict":
+            if strict_layout is None:
+                raise ValueError(f"{fp.name}: strict layout resolution failed unexpectedly.")
+            layout_sources["emg_channel_labels"] = layout_sources.get("emg_channel_labels", 0) + 1
+            if strict_pair_order is None:
+                strict_pair_order = tuple(strict_layout.pair_numbers)
+                strict_slot_order = tuple(strict_layout.slot_names)
+                strict_channel_counts = tuple(strict_layout.channel_counts)
+            elif (
+                tuple(strict_layout.pair_numbers) != strict_pair_order
+                or tuple(strict_layout.slot_names) != strict_slot_order
+                or tuple(strict_layout.channel_counts) != strict_channel_counts
+            ):
+                raise ValueError(
+                    f"Inconsistent strict slot mapping while loading {fp.name}: "
+                    f"pairs={tuple(strict_layout.pair_numbers)}"
+                )
+        elif layout is not None:
             layout_sources[layout.source] = layout_sources.get(layout.source, 0) + 1
             layout_groups = [list(group) for group in layout.permutation_groups]
             if permutation_groups is None and layout_groups:
@@ -772,16 +810,29 @@ def _train_and_save(
                 "enabled": bool(USE_MIN_LABEL_CONFIDENCE),
                 "min_label_confidence": float(MIN_LABEL_CONFIDENCE),
             },
-            "channel_layout": {
-                "type_canonicalization_enabled": bool(USE_SENSOR_TYPE_CANONICALIZATION),
-                "canonical_block_order": list(CANONICAL_BLOCK_ORDER),
-                "permutation_groups": [list(group) for group in permutation_groups],
-                "permutation_augmentation_enabled": bool(
-                    USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION
-                ),
-                "layout_inference_sources": dict(layout_sources),
-                "kind_counts": dict(layout_kind_counts),
-            },
+            "channel_layout": (
+                {
+                    **strict_layout_bundle_metadata(ARM),
+                    "type_canonicalization_enabled": False,
+                    "canonical_block_order": [],
+                    "permutation_groups": [],
+                    "permutation_augmentation_enabled": False,
+                    "layout_inference_sources": dict(layout_sources),
+                    "kind_counts": {},
+                }
+                if CHANNEL_LAYOUT_MODE == "strict"
+                else {
+                    "layout_mode": CHANNEL_LAYOUT_MODE,
+                    "type_canonicalization_enabled": bool(USE_SENSOR_TYPE_CANONICALIZATION),
+                    "canonical_block_order": list(CANONICAL_BLOCK_ORDER),
+                    "permutation_groups": [list(group) for group in permutation_groups],
+                    "permutation_augmentation_enabled": bool(
+                        USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION
+                    ),
+                    "layout_inference_sources": dict(layout_sources),
+                    "kind_counts": dict(layout_kind_counts),
+                }
+            ),
             "training": {
                 "epochs": int(EPOCHS),
                 "batch_size": int(BATCH_SIZE),
@@ -829,6 +880,10 @@ def _train_and_save(
 def main():
     if ARM not in ("right", "left"):
         raise ValueError(f"ARM must be 'right' or 'left', got {ARM!r}")
+    if CHANNEL_LAYOUT_MODE not in ("strict", "salvage", "none"):
+        raise ValueError(
+            f"CHANNEL_LAYOUT_MODE must be 'strict', 'salvage', or 'none', got {CHANNEL_LAYOUT_MODE!r}"
+        )
 
     confirm = input(
         f"Training {ARM} arm single-subject model for '{TARGET_SUBJECT}' - continue? [y/N] "
@@ -849,7 +904,16 @@ def main():
         f"{len(np.unique(y))} classes, {len(unique_subjects)} subject(s): "
         f"{unique_subjects}"
     )
-    if USE_SENSOR_TYPE_CANONICALIZATION:
+    if CHANNEL_LAYOUT_MODE == "strict":
+        expected_channels = strict_channel_count_for_arm(ARM)
+        if channel_count != expected_channels:
+            raise ValueError(
+                f"Strict layout for {ARM} expects {expected_channels} channels, got {channel_count}."
+            )
+        print(
+            f"Channel layout mode: STRICT ({ARM}) | pairs={strict_layout_bundle_metadata(ARM)['pair_order']}"
+        )
+    elif USE_SENSOR_TYPE_CANONICALIZATION:
         source_parts = ", ".join(
             f"{key}={value}" for key, value in sorted(layout_sources.items())
         ) or "none"
@@ -858,6 +922,8 @@ def main():
             print(f"Canonical channel kind counts: {layout_kind_counts}")
         if permutation_groups:
             print(f"Exchangeable channel groups: {permutation_groups}")
+    else:
+        print("Channel layout mode: NONE")
 
     labels = sorted({str(lbl) for lbl in np.unique(y)})
     label_to_index = {label: idx for idx, label in enumerate(labels)}

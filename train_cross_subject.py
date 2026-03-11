@@ -35,6 +35,11 @@ from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from libemg.utils import get_windows
 from emg.gesture_model_cnn import GestureCNNv2
+from emg.strict_layout import (
+    resolve_strict_indices_from_metadata,
+    strict_channel_count_for_arm,
+    strict_layout_bundle_metadata,
+)
 
 
 # ======== Config ========
@@ -71,6 +76,7 @@ LABEL_SMOOTHING = 0.05
 USE_AUGMENTATION = True
 AMP_RANGE = (0.5, 2.0)   # wide inter-subject amplitude variance range
 AUG_PROB  = 0.5
+CHANNEL_LAYOUT_MODE = "strict"  # "strict" or "none"
 
 # Subjects with failed MVC calibration or other DQ issues.
 # subject05: all 4 sessions have mvc_ratio <= 1.8x (MVC barely > neutral).
@@ -314,11 +320,26 @@ def load_windows_from_file(path):
     if "emg" not in data.files or "y" not in data.files:
         return None
     emg = np.asarray(data["emg"], dtype=float)
+    metadata = data.get("metadata")
+    strict_layout = None
+    if CHANNEL_LAYOUT_MODE == "strict":
+        strict_layout = resolve_strict_indices_from_metadata(metadata, arm=ARM)
+        if emg.shape[1] != strict_layout.ordered_indices.size:
+            raise ValueError(
+                f"{path.name}: strict layout resolved {strict_layout.ordered_indices.size} channels "
+                f"for {ARM}, but file has {emg.shape[1]}."
+            )
+        emg = emg[:, strict_layout.ordered_indices]
 
     if USE_CALIBRATION:
         calib_neutral = data.get("calib_neutral_emg")
         calib_mvc     = data.get("calib_mvc_emg")
         if calib_neutral is not None and calib_mvc is not None:
+            calib_neutral = np.asarray(calib_neutral, dtype=float)
+            calib_mvc = np.asarray(calib_mvc, dtype=float)
+            if strict_layout is not None:
+                calib_neutral = calib_neutral[:, strict_layout.ordered_indices]
+                calib_mvc = calib_mvc[:, strict_layout.ordered_indices]
             neutral_mean, mvc_scale = compute_calibration(
                 calib_neutral, calib_mvc, MVC_PERCENTILE
             )
@@ -350,7 +371,7 @@ def load_windows_from_file(path):
 
     if windows.size == 0:
         return None
-    return windows.astype(np.float32), window_labels
+    return windows.astype(np.float32), window_labels, strict_layout
 
 
 def load_dataset():
@@ -369,16 +390,37 @@ def load_dataset():
         validate_calibration_data(files)
 
     X_list, y_list, groups_list, subjects_list, channel_counts = [], [], [], [], []
+    layout_sources: dict[str, int] = {}
+    strict_pair_order = None
+    strict_slot_order = None
+    strict_channel_counts = None
     for fp in files:
         result = load_windows_from_file(fp)
         if result is None:
             continue
-        windows, labels = result
+        windows, labels, strict_layout = result
         X_list.append(windows)
         y_list.append(labels)
         groups_list.append(np.array([str(fp)] * len(labels), dtype=object))
         subjects_list.append(np.array([subject_from_path(fp)] * len(labels), dtype=object))
         channel_counts.append(int(windows.shape[1]))
+        if CHANNEL_LAYOUT_MODE == "strict":
+            if strict_layout is None:
+                raise ValueError(f"{fp.name}: strict layout resolution failed unexpectedly.")
+            layout_sources["emg_channel_labels"] = layout_sources.get("emg_channel_labels", 0) + 1
+            if strict_pair_order is None:
+                strict_pair_order = tuple(strict_layout.pair_numbers)
+                strict_slot_order = tuple(strict_layout.slot_names)
+                strict_channel_counts = tuple(strict_layout.channel_counts)
+            elif (
+                tuple(strict_layout.pair_numbers) != strict_pair_order
+                or tuple(strict_layout.slot_names) != strict_slot_order
+                or tuple(strict_layout.channel_counts) != strict_channel_counts
+            ):
+                raise ValueError(
+                    f"Inconsistent strict slot mapping while loading {fp.name}: "
+                    f"pairs={tuple(strict_layout.pair_numbers)}"
+                )
 
     if not X_list:
         raise ValueError("No labeled windows found in filtered files.")
@@ -393,6 +435,7 @@ def load_dataset():
         np.concatenate(groups_list),
         np.concatenate(subjects_list),
         unique_counts[0],
+        layout_sources,
     )
 
 
@@ -727,8 +770,21 @@ def _build_bundle(
         "metadata": metadata,
     }
 
-def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
-                    labels, label_to_index, index_to_label, channel_count, model_out):
+def _train_and_save(
+    X,
+    y_idx,
+    groups,
+    subjects,
+    channels,
+    num_classes,
+    device,
+    labels,
+    label_to_index,
+    index_to_label,
+    channel_count,
+    model_out,
+    layout_sources,
+):
     unique_groups = np.unique(groups)
     print(f"{X.shape[0]} windows across {len(unique_groups)} session file(s).")
 
@@ -831,68 +887,34 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
             mask = test_subjects == subj
             print(f"  {subj}: {accuracy_score(y_test[mask], y_pred[mask]):.3f}  ({mask.sum()} windows)")
 
-    bundle = {
-        "model_state": model.state_dict(),
-        "normalization": {"mean": mean.tolist(), "std": std.tolist()},
-        "label_to_index": label_to_index,
-        "index_to_label": index_to_label,
-        "architecture": {
-            "type": "GestureCNNv2",
-            "in_channels": int(channel_count),
-            "dropout": float(DROPOUT),
-        },
-        "metadata": {
-            "created_at": dt.datetime.now().isoformat(),
-            "stream": "cross_subject",
-            "subject": None,
-            "excluded_subjects": list(EXCLUDED_SUBJECTS),
-            "included_gestures": sorted(INCLUDED_GESTURES) if INCLUDED_GESTURES is not None else None,
-            "window_size_samples": WINDOW_SIZE,
-            "window_step_samples": WINDOW_STEP,
-            "channel_count": int(channel_count),
-            "labels": labels,
-            "split_mode": split_mode,
-            "test_size": float(TEST_SIZE),
-            "calibration_used": bool(USE_CALIBRATION),
-            "calibration_mvc_percentile": float(MVC_PERCENTILE),
-            "use_instance_norm_input": True,
-            "label_confidence_filter": {
-                "enabled": bool(USE_MIN_LABEL_CONFIDENCE),
-                "min_label_confidence": float(MIN_LABEL_CONFIDENCE),
-            },
-            "training": {
-                "epochs": int(EPOCHS),
-                "batch_size": int(BATCH_SIZE),
-                "lr": float(LR),
-                "amp_range": list(AMP_RANGE),
-                "use_augmentation": bool(USE_AUGMENTATION),
-                "use_balanced_sampling": True,
-                "label_smoothing": float(LABEL_SMOOTHING),
-                "use_mixup": False,
-            },
-            "metrics": {
-                "test_accuracy": test_accuracy,
-                "balanced_accuracy": eval_artifacts["balanced_accuracy"],
-                "macro_precision": eval_artifacts["macro_precision"],
-                "macro_recall": eval_artifacts["macro_recall"],
-                "macro_f1": eval_artifacts["macro_f1"],
-                "weighted_precision": eval_artifacts["weighted_precision"],
-                "weighted_recall": eval_artifacts["weighted_recall"],
-                "weighted_f1": eval_artifacts["weighted_f1"],
-                "worst_class_recall_label": eval_artifacts["worst_class_recall_label"],
-                "worst_class_recall": eval_artifacts["worst_class_recall"],
-                "max_precision_recall_gap_label": eval_artifacts["max_pr_gap_label"],
-                "max_precision_recall_gap": eval_artifacts["max_pr_gap"],
-                "confusion_to_neutral_rate": eval_artifacts["confusion_to_neutral_rate"],
-                "neutral_prediction_fp_rate": eval_artifacts["neutral_prediction_fp_rate"],
-                "confusion_matrix_counts": eval_artifacts["confusion_matrix_counts"].tolist(),
-                "confusion_matrix_row_norm": eval_artifacts["confusion_matrix_row_norm"].tolist(),
-                "confusion_matrix_col_norm": eval_artifacts["confusion_matrix_col_norm"].tolist(),
-            },
-            "train_files": [Path(f).name for f in train_files],
-            "test_files":  [Path(f).name for f in test_files],
-        },
-    }
+    extra_metadata = None
+    if CHANNEL_LAYOUT_MODE == "strict":
+        extra_metadata = {
+            "channel_layout": {
+                **strict_layout_bundle_metadata(ARM),
+                "type_canonicalization_enabled": False,
+                "canonical_block_order": [],
+                "permutation_groups": [],
+                "permutation_augmentation_enabled": False,
+                "layout_inference_sources": dict(layout_sources),
+                "kind_counts": {},
+            }
+        }
+
+    bundle = _build_bundle(
+        model=model,
+        mean=mean,
+        std=std,
+        label_to_index=label_to_index,
+        index_to_label=index_to_label,
+        labels=labels,
+        channel_count=channel_count,
+        split_mode=split_mode,
+        train_files=train_files,
+        test_files=test_files,
+        eval_artifacts=eval_artifacts,
+        extra_metadata=extra_metadata,
+    )
 
     model_out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, model_out)
@@ -904,6 +926,10 @@ def _train_and_save(X, y_idx, groups, subjects, channels, num_classes, device,
 def main():
     if ARM not in ("right", "left"):
         raise ValueError(f"ARM must be 'right' or 'left', got {ARM!r}")
+    if CHANNEL_LAYOUT_MODE not in ("strict", "none"):
+        raise ValueError(
+            f"CHANNEL_LAYOUT_MODE must be 'strict' or 'none', got {CHANNEL_LAYOUT_MODE!r}"
+        )
     confirm = input(f"Training {ARM} arm cross-subject model — continue? [y/N] ").strip().lower()
     if confirm != "y":
         print("Aborted.")
@@ -912,13 +938,22 @@ def main():
     np.random.seed(RANDOM_STATE)
     torch.manual_seed(RANDOM_STATE)
 
-    X, y, groups, subjects, channel_count = load_dataset()
+    X, y, groups, subjects, channel_count, layout_sources = load_dataset()
     unique_subjects = sorted(np.unique(subjects))
     print(
         f"Loaded {X.shape[0]} windows, {channel_count} channels, "
         f"{len(np.unique(y))} classes, {len(unique_subjects)} subject(s): "
         f"{unique_subjects}"
     )
+    if CHANNEL_LAYOUT_MODE == "strict":
+        expected_channels = strict_channel_count_for_arm(ARM)
+        if channel_count != expected_channels:
+            raise ValueError(
+                f"Strict layout for {ARM} expects {expected_channels} channels, got {channel_count}."
+            )
+        print(
+            f"Channel layout mode: STRICT ({ARM}) | pairs={strict_layout_bundle_metadata(ARM)['pair_order']}"
+        )
 
     labels         = sorted({str(lbl) for lbl in np.unique(y)})
     if INCLUDED_GESTURES is not None:
@@ -945,6 +980,7 @@ def main():
         channels, num_classes, device,
         labels, label_to_index, index_to_label, channel_count,
         model_out=MODEL_OUT,
+        layout_sources=layout_sources,
     )
 
     print(f"\n{'=' * 55}")

@@ -1,0 +1,109 @@
+Strict Run / Connect Process
+Date: March 11, 2026
+
+Purpose
+- This is the practical checklist for the strict fixed-position workflow.
+- Goal: keep sensor identity and physical placement consistent so training and realtime always see the same layout.
+
+Important clarification
+- You do NOT manually run `emg/strict_layout.py`.
+- `strict_layout.py` is used automatically by:
+  - `train_per_subject.py`
+  - `train_cross_subject.py`
+  - `realtime_gesture_cnn.py`
+- It does not pair sensors and it does not collect data by itself.
+- Its job is to validate and reorder channels by the strict pair mapping.
+
+Strict sensor contract
+- Right arm:
+  - pair 1 = R_Avanti_1
+  - pair 2 = R_Avanti_2
+  - pair 3 = R_Avanti_3
+  - pair 7 = R_Maize
+  - pair 9 = R_Galileo
+  - pair 11 = R_Mini
+- Left arm:
+  - pair 4 = L_Avanti_1
+  - pair 5 = L_Avanti_2
+  - pair 6 = L_Avanti_3
+  - pair 8 = L_Maize
+  - pair 10 = L_Galileo
+
+Hard rules
+- Each numbered sensor must stay on the same arm every session.
+- Each numbered sensor must stay in the same physical spot every session.
+- Do NOT swap same-type sensors just because they are both Avanti.
+- Pairing order in the Delsys GUI does NOT matter.
+- Pair number DOES matter.
+- For strict data collection, collect one arm at a time with the other arm disconnected.
+
+Before a strict session
+1. Decide which arm you are collecting: right or left.
+2. Only take out the sensors for that arm.
+3. Make sure each physical sensor still has the correct sticker number.
+4. In the Delsys pairing GUI, assign the pair number to match the physical sticker number.
+5. Put each numbered sensor in its permanent physical location for that arm.
+
+Pairing / connection notes
+- You do not need to pair in a special order.
+- Examples that should all be fine:
+  - all right first
+  - all left first
+  - mixed order like 1, 4, 3, 5, 2, 6
+- What matters is the final pair number assigned to each physical sensor.
+- If a sensor fails to pair, re-pair that one sensor to its correct number before continuing.
+
+Strict collection workflow
+1. Pair the sensors in `DelsysPythonGUI.py`.
+2. Verify the correct arm-only sensor set is connected.
+3. Verify the numbered sensors are in their permanent physical locations.
+4. Collect the session in the GUI.
+5. Keep these strict sessions separate from the old mixed-layout sessions.
+
+Data separation rule
+- Do not mix strict recollection with the older salvage-era files.
+- Keep strict data in a dedicated folder/root.
+- If the GUI still writes into the normal `data/...` tree, move or copy the new strict sessions into a dedicated strict root before training.
+
+Preprocessing order
+1. `python tools/resample_raw_dataset.py`
+2. `python emg/filtering.py`
+3. `python tools/recalibrate.py --data-root <strict_resampled_root>`
+4. If needed: `python tools/recalibrate.py --data-root <strict_resampled_root> --apply`
+
+Training workflow
+Per-subject:
+1. Edit `ARM`, `TARGET_SUBJECT`, `DATA_ROOT`, and `MODEL_OUT` in `train_per_subject.py`.
+2. Point `DATA_ROOT` at the strict recollection root.
+3. Run `python train_per_subject.py`.
+
+Cross-subject:
+1. Edit `ARM`, `DATA_ROOT`, and `MODEL_OUT` in `train_cross_subject.py`.
+2. Point `DATA_ROOT` at a strict recollection root only.
+3. Run `python train_cross_subject.py`.
+
+Realtime workflow
+Single-arm:
+1. Pair only that arm's sensors.
+2. Run `python realtime_gesture_cnn.py --model <bundle_path>`.
+3. The strict code will validate and reorder channels automatically.
+
+Dual-arm:
+1. Pair all required right and left sensors.
+2. Connection order can be mixed.
+3. Run `python realtime_gesture_cnn.py --model-right <right_bundle> --model-left <left_bundle>`.
+4. The strict code will resolve right/left channels by pair number, not by stream order.
+
+If something goes wrong
+- Missing required pair number:
+  - stop and fix pairing
+- Wrong numbered sensor on the arm:
+  - stop and replace it in the correct physical spot
+- Sensor disconnects during use:
+  - stop, reconnect/re-pair it to the correct pair number, then restart
+- Old unlabeled or mixed-layout data included in training:
+  - remove it from the strict training root
+
+Bottom line
+- You do not run `strict_layout.py` yourself.
+- You pair sensors correctly, place each numbered sensor in the same exact spot each time, collect clean arm-specific data, and the training/realtime code handles strict validation and channel reordering automatically.
