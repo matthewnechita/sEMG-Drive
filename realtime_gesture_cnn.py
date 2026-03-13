@@ -2,6 +2,7 @@ import argparse
 import re
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
 import os
@@ -55,7 +56,38 @@ HYSTERESIS_ENTER_CONFIRM_FRAMES = 2
 HYSTERESIS_SWITCH_CONFIRM_FRAMES = 2
 HYSTERESIS_NEUTRAL_CONFIRM_FRAMES = 2
 
+
+@dataclass(frozen=True)
+class ArmGestureState:
+    label: str = LOW_CONFIDENCE_LABEL
+    confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class PublishedGesture:
+    arm: str = "right"
+    label: str = LOW_CONFIDENCE_LABEL
+    confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class PublishedGestureOutput:
+    mode: str = "single"
+    gestures: tuple[PublishedGesture, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class DualGestureState:
+    mode: str = "right"
+    right: ArmGestureState = field(default_factory=ArmGestureState)
+    left: ArmGestureState = field(default_factory=ArmGestureState)
+    combined: ArmGestureState = field(default_factory=ArmGestureState)
+    published: PublishedGestureOutput = field(default_factory=PublishedGestureOutput)
+    timestamp: float = 0.0
+
+
 LATEST_LOCK = threading.Lock()
+LATEST_STATE = DualGestureState()
 LATEST_GESTURE = LOW_CONFIDENCE_LABEL
 LATEST_TIMESTAMP = 0.0
 
@@ -117,7 +149,7 @@ GESTURE_INSTRUCTIONS = {
 # Set MODE to control which arm(s) run inference:
 #   "right" - right arm only  (pair right arm sensors first in Delsys)
 #   "left"  - left arm only   (pair left arm sensors first in Delsys)
-#   "dual"  - both arms fused (pair right first, then left in Delsys)
+#   "dual"  - both arms inferred separately (legacy accessor still exposes one combined label)
 MODE        = "right"
 # Default to Matthew strict per-subject bundles. Override with CLI flags as needed.
 MODEL_RIGHT = os.path.join(
@@ -512,11 +544,77 @@ def control_hook(gesture: str) -> None:
     set_latest_gesture(gesture)
     return
 
-def set_latest_gesture(label: str) -> None:
-    global LATEST_GESTURE, LATEST_TIMESTAMP
+
+def set_latest_dual_state(
+    *,
+    mode: str,
+    right_label: str,
+    right_confidence: float,
+    left_label: str = LOW_CONFIDENCE_LABEL,
+    left_confidence: float = 0.0,
+    combined_label: str | None = None,
+    combined_confidence: float | None = None,
+    published: PublishedGestureOutput | None = None,
+) -> DualGestureState:
+    """Publish the latest per-arm gesture state.
+
+    `combined_*` is retained only for callers that still consume the legacy
+    single-label interface via `get_latest_gesture()`.
+    """
+    global LATEST_STATE, LATEST_GESTURE, LATEST_TIMESTAMP
+
+    mode_name = str(mode)
+    right_state = ArmGestureState(str(right_label), float(right_confidence))
+    left_state = ArmGestureState(str(left_label), float(left_confidence))
+    if combined_label is None:
+        combined_label = right_state.label if mode_name != "dual" else LOW_CONFIDENCE_LABEL
+    if combined_confidence is None:
+        combined_confidence = right_state.confidence if mode_name != "dual" else 0.0
+    combined_state = ArmGestureState(str(combined_label), float(combined_confidence))
+    if published is None:
+        active_arm = mode_name if mode_name in {"right", "left"} else "right"
+        published = PublishedGestureOutput(
+            mode="single",
+            gestures=(PublishedGesture(active_arm, combined_state.label, combined_state.confidence),),
+        )
+    timestamp = time.time()
+    state = DualGestureState(
+        mode=mode_name,
+        right=right_state,
+        left=left_state,
+        combined=combined_state,
+        published=published,
+        timestamp=timestamp,
+    )
     with LATEST_LOCK:
-        LATEST_GESTURE = str(label)
-        LATEST_TIMESTAMP = time.time()
+        LATEST_STATE = state
+        LATEST_GESTURE = combined_state.label
+        LATEST_TIMESTAMP = timestamp
+    return state
+
+
+def set_latest_gesture(label: str) -> None:
+    set_latest_dual_state(
+        mode="legacy",
+        right_label=str(label),
+        right_confidence=0.0,
+        combined_label=str(label),
+        combined_confidence=0.0,
+    )
+
+
+def get_latest_dual_state() -> tuple[DualGestureState, float]:
+    with LATEST_LOCK:
+        state = LATEST_STATE
+        ts = LATEST_TIMESTAMP if LATEST_TIMESTAMP else state.timestamp
+        age = (time.time() - ts) if ts else float('inf')
+        return state, age
+
+
+def get_latest_published_gestures() -> tuple[PublishedGestureOutput, float]:
+    state, age = get_latest_dual_state()
+    return state.published, age
+
 
 def get_latest_gesture(default: str = LOW_CONFIDENCE_LABEL):
     with LATEST_LOCK:
@@ -524,6 +622,60 @@ def get_latest_gesture(default: str = LOW_CONFIDENCE_LABEL):
         ts = LATEST_TIMESTAMP
         age = (time.time() - ts) if ts else float('inf')
         return label, age
+
+
+def resolve_published_gesture_output(
+    mode: str,
+    right: ArmGestureState,
+    left: ArmGestureState,
+    combined: ArmGestureState,
+) -> PublishedGestureOutput:
+    mode_name = str(mode)
+    if mode_name != "dual":
+        active_arm = mode_name if mode_name in {"right", "left"} else "right"
+        return PublishedGestureOutput(
+            mode="single",
+            gestures=(PublishedGesture(active_arm, combined.label, combined.confidence),),
+        )
+
+    if right.label == left.label:
+        return PublishedGestureOutput(
+            mode="single",
+            gestures=(PublishedGesture("dual", combined.label, combined.confidence),),
+        )
+
+    return PublishedGestureOutput(
+        mode="split",
+        gestures=(
+            PublishedGesture("right", right.label, right.confidence),
+            PublishedGesture("left", left.label, left.confidence),
+        ),
+    )
+
+
+def format_published_gesture_output(output: PublishedGestureOutput) -> str:
+    gestures = tuple(output.gestures)
+    if not gestures:
+        return f"Gesture: {LOW_CONFIDENCE_LABEL} (conf 0.00)"
+
+    if output.mode == "split":
+        parts = [
+            f"{gesture.arm}={gesture.label} ({gesture.confidence:.2f})"
+            for gesture in gestures
+        ]
+        return "Gesture: " + " | ".join(parts)
+
+    gesture = gestures[0]
+    return f"Gesture: {gesture.label} (conf {gesture.confidence:.2f})"
+
+
+def published_gesture_signature(output: PublishedGestureOutput):
+    gestures = tuple(
+        (str(gesture.arm), str(gesture.label))
+        for gesture in output.gestures
+    )
+    return (str(output.mode), gestures)
+
 
 def fuse_predictions(label_r, conf_r, label_l, conf_l):
     """Combine right and left arm predictions into one fused label.
@@ -1680,7 +1832,12 @@ def main(argv=None):
 
     last_output  = None
     last_msg_len = 0
-    output_hysteresis = _OutputHysteresis()
+    output_hysteresis_right = _OutputHysteresis()
+    output_hysteresis_left = _OutputHysteresis()
+    current_right_label = LOW_CONFIDENCE_LABEL
+    current_right_conf = 0.0
+    current_left_label = LOW_CONFIDENCE_LABEL
+    current_left_conf = 0.0
     # === LATENCY MEASURE START ===
     # Comment out this whole block (and other LATENCY blocks below) after measuring.
     # Measures end-to-end latency from "data available in this process" to prediction time.
@@ -1853,6 +2010,9 @@ def main(argv=None):
                     label_right, conf_right, _ = _apply_prototype_reject_gate(
                         label_right, conf_right, -1, probs
                     )
+                current_right_label, current_right_conf = output_hysteresis_right.update(
+                    label_right, conf_right
+                )
 
                 inference_ran = True
                 # We intentionally keep only the newest inference point and
@@ -1904,6 +2064,9 @@ def main(argv=None):
                         label_left, conf_left, _ = _apply_prototype_reject_gate(
                             label_left, conf_left, -1, probs
                         )
+                    current_left_label, current_left_conf = output_hysteresis_left.update(
+                        label_left, conf_left
+                    )
 
                     inference_ran = True
                     # Same backlog policy as right arm: latest window only.
@@ -1913,43 +2076,52 @@ def main(argv=None):
             if inference_ran:
                 if dual_arm:
                     label, confidence = fuse_predictions(
-                        label_right, conf_right, label_left, conf_left
+                        current_right_label,
+                        current_right_conf,
+                        current_left_label,
+                        current_left_conf,
                     )
                 else:
-                    label, confidence = label_right, conf_right
-                label, confidence = output_hysteresis.update(label, confidence)
+                    label, confidence = current_right_label, current_right_conf
 
-                if label != LOW_CONFIDENCE_LABEL or last_output != LOW_CONFIDENCE_LABEL:
-                    control_hook(label)
+                combined_state = ArmGestureState(label, confidence)
+                published_output = resolve_published_gesture_output(
+                    "dual" if dual_arm else MODE,
+                    ArmGestureState(current_right_label, current_right_conf),
+                    ArmGestureState(
+                        current_left_label if dual_arm else LOW_CONFIDENCE_LABEL,
+                        current_left_conf if dual_arm else 0.0,
+                    ),
+                    combined_state,
+                )
 
-    #             # === LATENCY MEASURE START ===
-    #             if latency_enabled:
-    #                 t1 = time.time()
-    #                 proc_ms.append((t1 - t0) * 1000.0)
-    #                 latest_ts = time_buffer[-1] if time_buffer else None
-    #                 if latest_ts is not None:
-    #                     latency_ms.append((t1 - latest_ts) * 1000.0)
-    #                 preds += 1
-    #                 if latency_print_every > 0 and preds % latency_print_every == 0:
-    #                     if latency_ms:
-    #                         print(
-    #                             f"latency_ms={latency_ms[-1]:.1f} "
-    #                             f"proc_ms={proc_ms[-1]:.1f}",
-    #                             end="\r",
-    #                             flush=True,
-    #                         )
-    #                 if latency_max_preds > 0 and preds >= latency_max_preds:
-    #                     raise KeyboardInterrupt
-    #             # === LATENCY MEASURE END ===
+                set_latest_dual_state(
+                    mode="dual" if dual_arm else MODE,
+                    right_label=current_right_label,
+                    right_confidence=current_right_conf,
+                    left_label=current_left_label if dual_arm else LOW_CONFIDENCE_LABEL,
+                    left_confidence=current_left_conf if dual_arm else 0.0,
+                    combined_label=label,
+                    combined_confidence=confidence,
+                    published=published_output,
+                )
 
-                    if label != last_output:
-                        msg = f"Gesture: {label} (conf {confidence:.2f})"
+                output_signature = published_gesture_signature(published_output)
+                is_neutral_only = all(
+                    gesture.label == LOW_CONFIDENCE_LABEL
+                    for gesture in published_output.gestures
+                )
+                if not published_output.gestures:
+                    is_neutral_only = True
+                if (not is_neutral_only) or (last_output is not None):
+                    if output_signature != last_output:
+                        msg = format_published_gesture_output(published_output)
                         if len(msg) < last_msg_len:
                             msg = msg.ljust(last_msg_len)
                         else:
                             last_msg_len = len(msg)
                         print(msg, end="\r", flush=True)
-                        last_output = label
+                        last_output = output_signature
     except KeyboardInterrupt:
         print("\nStopping stream...")
     finally:
