@@ -308,9 +308,11 @@ class DualControl(object):
         
         # Gestures -> steering only (NO throttle/brake from gestures)
         self._gesture_to_steer = {
-            "left_turn":  -0.5,
-            "right_turn":  0.5,
-            "neutral":     0.0,
+            "left": -0.5,
+            "right": 0.5,
+            "left_strong": -0.9,
+            "right_strong": 0.9,
+            "neutral": 0.0,
         }
         
         # Track signals so they behave like a real car (stay on until changed/canceled)
@@ -452,66 +454,103 @@ class DualControl(object):
         self._gesture_thread = threading.Thread(target=_runner, daemon=True)
         self._gesture_thread.start()
 
+    def _resolve_dual_arm_actions(self, left_label: str, right_label: str):
+        """
+        Returns:
+            steer_key: "left", "right", "left_strong", "right_strong", or "neutral"
+            signal_state: "left", "right", or "off"
+            horn_on: bool
+        """
+    
+        labels = {str(left_label), str(right_label)}
+    
+        # --- horn ---
+        horn_on = "horn" in labels
+    
+        # --- signal ---
+        has_signal_left = "signal_left" in labels
+        has_signal_right = "signal_right" in labels
+    
+        if has_signal_left and has_signal_right:
+            signal_state = "off"
+        elif has_signal_left:
+            signal_state = "left"
+        elif has_signal_right:
+            signal_state = "right"
+        else:
+            signal_state = "off"
+    
+        # --- steer ---
+        has_left_turn = "left_turn" in labels
+        has_right_turn = "right_turn" in labels
+    
+        if has_left_turn and has_right_turn:
+            steer_key = "neutral"
+        elif left_label == "left_turn" and right_label == "left_turn":
+            steer_key = "left_strong"
+        elif left_label == "right_turn" and right_label == "right_turn":
+            steer_key = "right_strong"
+        elif has_left_turn:
+            steer_key = "left"
+        elif has_right_turn:
+            steer_key = "right"
+        else:
+            steer_key = "neutral"
+
+        return steer_key, signal_state, horn_on
+
     def _apply_gesture_override(self):
         if realtime_gesture is None:
             return
     
-        label, age = realtime_gesture.get_latest_gesture()
-        age_ms = float(age * 1000.0)
-        now = time.time()
+        # Read the new published dual-arm output from realtime_gesture_cnn.py
+        published, age = realtime_gesture.get_latest_published_gestures()
         if age > self._gesture_max_age:
-            if GESTURE_TIMING_DEBUG and now - self._last_gesture_debug_t >= 1.0:
-                print(
-                    "[gesture->carla] stale label ignored "
-                    f"label={label} age_ms={age_ms:.0f} "
-                    f"client_fps={self._client_fps:.1f} "
-                    f"server_fps={getattr(self._hud, 'server_fps', 0.0):.1f}"
-                )
-                self._last_gesture_debug_t = now
-            return
-
-        if GESTURE_TIMING_DEBUG:
-            should_log = (
-                label != self._last_applied_gesture
-                or (
-                    age_ms >= GESTURE_TIMING_WARN_MS
-                    and now - self._last_gesture_debug_t >= 0.5
-                )
-            )
-            if should_log:
-                print(
-                    "[gesture->carla] apply "
-                    f"label={label} age_ms={age_ms:.0f} "
-                    f"client_fps={self._client_fps:.1f} "
-                    f"server_fps={getattr(self._hud, 'server_fps', 0.0):.1f}"
-                )
-                self._last_gesture_debug_t = now
-        self._last_applied_gesture = label
-    
-        # --- Steering gestures ---
-        if label in self._gesture_to_steer:
-            self._control.steer = float(self._gesture_to_steer[label])
-    
-            # Optional: cancel signals when returning to neutral (you can remove if you want)
-            if label == "neutral" and self._signal_state != "off":
-                self._set_turn_signal("off")
             return
     
-        # --- Signal gestures ---
-        if label == "signal_left":
-            if self._signal_state != "left":
-                self._set_turn_signal("left")
-            return
+        left_label = "neutral"
+        right_label = "neutral"
     
-        if label == "signal_right":
-            if self._signal_state != "right":
-                self._set_turn_signal("right")
-            return
+        gestures = tuple(getattr(published, "gestures", ()))
     
-        # --- Horn gesture ---
-        if label == "horn":
+        if getattr(published, "mode", "single") == "split":
+            for gesture in gestures:
+                arm = str(getattr(gesture, "arm", "")).lower()
+                label = str(getattr(gesture, "label", "neutral"))
+                if arm == "left":
+                    left_label = label
+                elif arm == "right":
+                    right_label = label
+        else:
+            # single output means both arms agreed, or only one arm is active/published
+            if gestures:
+                label = str(getattr(gestures[0], "label", "neutral"))
+                arm = str(getattr(gestures[0], "arm", "")).lower()
+    
+                if arm == "left":
+                    left_label = label
+                elif arm == "right":
+                    right_label = label
+                elif arm == "dual":
+                    left_label = label
+                    right_label = label
+                else:
+                    # safe fallback
+                    left_label = label
+                    right_label = label
+    
+        steer_key, signal_state, horn_on = self._resolve_dual_arm_actions(left_label, right_label)
+    
+        # Apply steering
+        self._control.steer = float(self._gesture_to_steer[steer_key])
+    
+        # Apply turn signal
+        if signal_state != self._signal_state:
+            self._set_turn_signal(signal_state)
+    
+        # Apply horn
+        if horn_on:
             self._honk()
-            return
 
     @staticmethod
     def _is_quit_shortcut(key):
