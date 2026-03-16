@@ -30,11 +30,6 @@ import glob
 import os
 import sys
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-SRC_DIR = os.path.join(PROJECT_ROOT, 'src')
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
-
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
         sys.version_info.major,
@@ -55,14 +50,12 @@ from carla import ColorConverter as cc
 
 import argparse
 import collections
-import csv
 import datetime
 import logging
 import math
 import random
 import re
 import weakref
-from pathlib import Path
 
 if sys.version_info >= (3, 0):
 
@@ -105,95 +98,9 @@ except ImportError:
     raise RuntimeError('cannot import pygame, make sure pygame package is installed')
 
 try:
-    import realtime_gesture_cnn as realtime_gesture
-except Exception:
-    realtime_gesture = None
-import threading
-import time
-try:
     import numpy as np
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
-
-# Gesture/CARLA timing diagnostics.
-# Frame rate does not need to match EMG sample rate; this only controls how
-# often CARLA polls and applies the latest gesture label.
-DEFAULT_CLIENT_FPS_LIMIT = 30
-CLIENT_FPS_LIMIT = DEFAULT_CLIENT_FPS_LIMIT
-CLIENT_USE_BUSY_LOOP = False
-GESTURE_TIMING_DEBUG = True
-GESTURE_TIMING_WARN_MS = 200.0
-DEFAULT_LOW_GRAPHICS_MODE = True
-LOW_GRAPHICS_MODE = DEFAULT_LOW_GRAPHICS_MODE
-DEFAULT_LOW_GRAPHICS_NO_RENDERING = False  # True = lowest possible GPU use, but no camera view.
-LOW_GRAPHICS_NO_RENDERING = DEFAULT_LOW_GRAPHICS_NO_RENDERING
-DEFAULT_CLIENT_RES = '640x360'
-DEFAULT_CAMERA_RES = '640x360'
-DEFAULT_CAMERA_FPS = 10.0
-CAMERA_IMAGE_WIDTH = 640
-CAMERA_IMAGE_HEIGHT = 360
-CAMERA_SENSOR_TICK_S = 1.0 / DEFAULT_CAMERA_FPS
-DEFAULT_HUD_VISIBLE = False
-HUD_VISIBLE_BY_DEFAULT = DEFAULT_HUD_VISIBLE
-
-
-def _now_stamp():
-    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-class DriveCSVLogger(object):
-    def __init__(self, path):
-        self.path = str(path)
-        out_path = Path(self.path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = out_path.open('w', newline='', encoding='utf-8')
-        self._fieldnames = [
-            'timestamp',
-            'wall_time_s',
-            'control_apply_ts',
-            'simulation_time',
-            'frame',
-            'prediction_seq',
-            'window_end_ts',
-            'prediction_ts',
-            'publish_ts',
-            'gesture_age_s',
-            'gesture_fresh',
-            'published_mode',
-            'pred_label',
-            'pred_conf',
-            'right_label',
-            'right_conf',
-            'left_label',
-            'left_conf',
-            'steer_key',
-            'signal_state',
-            'horn_on',
-            'steer',
-            'throttle',
-            'brake',
-            'reverse',
-            'hand_brake',
-            'vehicle_x',
-            'vehicle_y',
-            'vehicle_z',
-            'speed_mps',
-            'lane_error_m',
-            'lane_invasion_event',
-            'lane_invasion_count_total',
-            'collision_event',
-            'collision_count_total',
-            'published_labels',
-        ]
-        self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames)
-        self._writer.writeheader()
-
-    def write_row(self, row):
-        self._writer.writerow(row)
-        self._file.flush()
-
-    def close(self):
-        self._file.close()
 
 
 # ==============================================================================
@@ -213,18 +120,6 @@ def get_actor_display_name(actor, truncate=250):
     return (name[:truncate - 1] + u'\u2026') if len(name) > truncate else name
 
 
-def parse_resolution(value):
-    try:
-        width_str, height_str = value.lower().split('x', 1)
-        width = int(width_str)
-        height = int(height_str)
-    except ValueError as exc:
-        raise ValueError('resolution must look like WIDTHxHEIGHT') from exc
-    if width <= 0 or height <= 0:
-        raise ValueError('resolution values must be positive')
-    return width, height
-
-
 # ==============================================================================
 # -- World ---------------------------------------------------------------------
 # ==============================================================================
@@ -242,20 +137,8 @@ class World(object):
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
         self._actor_filter = actor_filter
-        self._apply_runtime_world_settings()
         self.restart()
         self.world.on_tick(hud.on_world_tick)
-
-    def _apply_runtime_world_settings(self):
-        if not LOW_GRAPHICS_MODE:
-            return
-        settings = self.world.get_settings()
-        changed = False
-        if settings.no_rendering_mode != bool(LOW_GRAPHICS_NO_RENDERING):
-            settings.no_rendering_mode = bool(LOW_GRAPHICS_NO_RENDERING)
-            changed = True
-        if changed:
-            self.world.apply_settings(settings)
 
     def restart(self):
         # Keep same camera config if the camera manager exists.
@@ -322,7 +205,7 @@ class World(object):
 
 
 class DualControl(object):
-    def __init__(self, world, start_in_autopilot, carla_log_path='', realtime_log_path=''):
+    def __init__(self, world, start_in_autopilot):
         self._autopilot_enabled = start_in_autopilot
         if isinstance(world.player, carla.Vehicle):
             self._control = carla.VehicleControl()
@@ -356,55 +239,8 @@ class DualControl(object):
         self._reverse_idx = int(self._parser.get('G29 Racing Wheel', 'reverse'))
         self._handbrake_idx = int(
             self._parser.get('G29 Racing Wheel', 'handbrake'))
-        
-        # Store references so gesture actions can affect vehicle + HUD
-        self._player = world.player
-        self._hud = world.hud
-        
-        # Gesture freshness (optional safety: ignore stale labels)
-        self._gesture_max_age = 0.75
-        self._client_fps = 0.0
-        self._last_applied_gesture = None
-        self._last_gesture_debug_t = 0.0
-        self._latest_published = None
-        self._latest_gesture_age = float('inf')
-        self._latest_right_label = "neutral"
-        self._latest_right_conf = 0.0
-        self._latest_left_label = "neutral"
-        self._latest_left_conf = 0.0
-        self._latest_pred_label = "neutral"
-        self._latest_pred_conf = 0.0
-        self._latest_steer_key = "neutral"
-        self._latest_signal_state = "off"
-        self._latest_horn_on = False
-        self._latest_gesture_fresh = False
-        self._last_lane_invasion_count = 0
-        self._last_collision_count = 0
-        self._drive_logger = DriveCSVLogger(carla_log_path) if carla_log_path else None
-        self._realtime_log_path = str(realtime_log_path or '').strip()
-        
-        # Gestures -> steering only (NO throttle/brake from gestures)
-        self._gesture_to_steer = {
-            "left": -0.5,
-            "right": 0.5,
-            "left_strong": -0.9,
-            "right_strong": 0.9,
-            "neutral": 0.0,
-        }
-        
-        # Track signals so they behave like a real car (stay on until changed/canceled)
-        self._signal_state = "off"  # "off" | "left" | "right"
-        
-        self._gesture_thread = None
-        self._start_gesture_thread()
-
-    def close(self):
-        if self._drive_logger is not None:
-            self._drive_logger.close()
-            self._drive_logger = None
 
     def parse_events(self, world, clock):
-        self._client_fps = float(clock.get_fps())
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return True
@@ -464,15 +300,22 @@ class DualControl(object):
             if isinstance(self._control, carla.VehicleControl):
                 self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
                 self._parse_vehicle_wheel()
-                self._apply_gesture_override()
                 self._control.reverse = self._control.gear < 0
             elif isinstance(self._control, carla.WalkerControl):
                 self._parse_walker_keys(pygame.key.get_pressed(), clock.get_time())
             world.player.apply_control(self._control)
-            self._log_drive_step(world)
 
     def _parse_vehicle_keys(self, keys, milliseconds):
         self._control.throttle = 1.0 if keys[K_UP] or keys[K_w] else 0.0
+        steer_increment = 5e-4 * milliseconds
+        if keys[K_LEFT] or keys[K_a]:
+            self._steer_cache -= steer_increment
+        elif keys[K_RIGHT] or keys[K_d]:
+            self._steer_cache += steer_increment
+        else:
+            self._steer_cache = 0.0
+        self._steer_cache = min(0.7, max(-0.7, self._steer_cache))
+        self._control.steer = round(self._steer_cache, 1)
         self._control.brake = 1.0 if keys[K_DOWN] or keys[K_s] else 0.0
         self._control.hand_brake = keys[K_SPACE]
 
@@ -483,7 +326,11 @@ class DualControl(object):
         jsButtons = [float(self._joystick.get_button(i)) for i in
                      range(self._joystick.get_numbuttons())]
 
-        
+        # Custom function to map range of inputs [1, -1] to outputs [0, 1] i.e 1 from inputs means nothing is pressed
+        # For the steering, it seems fine as it is
+        K1 = 1.0  # 0.55
+        steerCmd = K1 * math.tan(1.1 * jsInputs[self._steer_idx])
+
         K2 = 1.6  # 1.6
         throttleCmd = K2 + (2.05 * math.log10(
             -0.7 * jsInputs[self._throttle_idx] + 1.4) - 1.2) / 0.92
@@ -499,6 +346,7 @@ class DualControl(object):
         elif brakeCmd > 1:
             brakeCmd = 1
 
+        self._control.steer = steerCmd
         self._control.brake = brakeCmd
         self._control.throttle = throttleCmd
 
@@ -522,274 +370,9 @@ class DualControl(object):
         self._rotation.yaw = round(self._rotation.yaw, 1)
         self._control.direction = self._rotation.get_forward_vector()
 
-    def _start_gesture_thread(self):
-        if realtime_gesture is None:
-            return
-        if self._gesture_thread is not None and self._gesture_thread.is_alive():
-            return
-        
-        def _runner():
-            try:
-                rt_args = []
-                if self._realtime_log_path:
-                    rt_args.extend(["--prediction-log", self._realtime_log_path])
-                realtime_gesture.main(rt_args)
-            except Exception as e:
-                print("[gesture] thread stopped:", e)
-
-        self._gesture_thread = threading.Thread(target=_runner, daemon=True)
-        self._gesture_thread.start()
-
-    def _resolve_dual_arm_actions(self, left_label: str, right_label: str):
-        """
-        Returns:
-            steer_key: "left", "right", "left_strong", "right_strong", or "neutral"
-            signal_state: "left", "right", or "off"
-            horn_on: bool
-        """
-    
-        labels = {str(left_label), str(right_label)}
-    
-        # --- horn ---
-        horn_on = "horn" in labels
-    
-        # --- signal ---
-        has_signal_left = "signal_left" in labels
-        has_signal_right = "signal_right" in labels
-    
-        if has_signal_left and has_signal_right:
-            signal_state = "off"
-        elif has_signal_left:
-            signal_state = "left"
-        elif has_signal_right:
-            signal_state = "right"
-        else:
-            signal_state = "off"
-    
-        # --- steer ---
-        has_left_turn = "left_turn" in labels
-        has_right_turn = "right_turn" in labels
-    
-        if has_left_turn and has_right_turn:
-            steer_key = "neutral"
-        elif left_label == "left_turn" and right_label == "left_turn":
-            steer_key = "left_strong"
-        elif left_label == "right_turn" and right_label == "right_turn":
-            steer_key = "right_strong"
-        elif has_left_turn:
-            steer_key = "left"
-        elif has_right_turn:
-            steer_key = "right"
-        else:
-            steer_key = "neutral"
-
-        return steer_key, signal_state, horn_on
-
-    def _apply_gesture_override(self):
-        if realtime_gesture is None:
-            self._latest_gesture_fresh = False
-            return
-    
-        # Read the new published dual-arm output from realtime_gesture_cnn.py
-        published, age = realtime_gesture.get_latest_published_gestures()
-        self._latest_published = published
-        self._latest_gesture_age = float(age)
-        if age > self._gesture_max_age:
-            self._latest_gesture_fresh = False
-            return
-    
-        left_label = "neutral"
-        right_label = "neutral"
-        left_conf = 0.0
-        right_conf = 0.0
-    
-        gestures = tuple(getattr(published, "gestures", ()))
-    
-        if getattr(published, "mode", "single") == "split":
-            for gesture in gestures:
-                arm = str(getattr(gesture, "arm", "")).lower()
-                label = str(getattr(gesture, "label", "neutral"))
-                confidence = float(getattr(gesture, "confidence", 0.0))
-                if arm == "left":
-                    left_label = label
-                    left_conf = confidence
-                elif arm == "right":
-                    right_label = label
-                    right_conf = confidence
-        else:
-            # single output means both arms agreed, or only one arm is active/published
-            if gestures:
-                label = str(getattr(gestures[0], "label", "neutral"))
-                arm = str(getattr(gestures[0], "arm", "")).lower()
-                confidence = float(getattr(gestures[0], "confidence", 0.0))
-    
-                if arm == "left":
-                    left_label = label
-                    left_conf = confidence
-                elif arm == "right":
-                    right_label = label
-                    right_conf = confidence
-                elif arm == "dual":
-                    left_label = label
-                    right_label = label
-                    left_conf = confidence
-                    right_conf = confidence
-                else:
-                    # safe fallback
-                    left_label = label
-                    right_label = label
-                    left_conf = confidence
-                    right_conf = confidence
-
-        self._latest_left_label = left_label
-        self._latest_left_conf = left_conf
-        self._latest_right_label = right_label
-        self._latest_right_conf = right_conf
-    
-        steer_key, signal_state, horn_on = self._resolve_dual_arm_actions(left_label, right_label)
-        self._latest_steer_key = steer_key
-        self._latest_signal_state = signal_state
-        self._latest_horn_on = bool(horn_on)
-        self._latest_pred_label = "split" if getattr(published, "mode", "single") == "split" else (
-            left_label if left_label == right_label else right_label
-        )
-        self._latest_pred_conf = max(left_conf, right_conf)
-        self._latest_gesture_fresh = True
-    
-        # Apply steering
-        self._control.steer = float(self._gesture_to_steer[steer_key])
-    
-        # Apply turn signal
-        if signal_state != self._signal_state:
-            self._set_turn_signal(signal_state)
-    
-        # Apply horn
-        if horn_on:
-            self._honk()
-
-    def _estimate_lane_error_m(self, world):
-        try:
-            waypoint = world.world.get_map().get_waypoint(
-                world.player.get_location(),
-                project_to_road=True,
-                lane_type=carla.LaneType.Driving,
-            )
-        except RuntimeError:
-            return None
-        if waypoint is None:
-            return None
-        vehicle_location = world.player.get_location()
-        wp_location = waypoint.transform.location
-        return math.hypot(vehicle_location.x - wp_location.x, vehicle_location.y - wp_location.y)
-
-    def _log_drive_step(self, world):
-        if self._drive_logger is None:
-            return
-        published = self._latest_published
-        if published is None:
-            published = getattr(realtime_gesture, "PublishedGestureOutput", None)
-            published = published() if callable(published) else None
-        transform = world.player.get_transform()
-        velocity = world.player.get_velocity()
-        speed_mps = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
-        lane_invasion_count = int(getattr(world.lane_invasion_sensor, "event_count", 0))
-        collision_count = int(getattr(world.collision_sensor, "event_count", 0))
-        lane_invasion_event = lane_invasion_count > self._last_lane_invasion_count
-        collision_event = collision_count > self._last_collision_count
-        self._last_lane_invasion_count = lane_invasion_count
-        self._last_collision_count = collision_count
-
-        gestures = tuple(getattr(published, "gestures", ())) if published is not None else ()
-        if gestures:
-            published_labels = "|".join(
-                f"{getattr(gesture, 'arm', '')}:{getattr(gesture, 'label', '')}"
-                for gesture in gestures
-            )
-        else:
-            published_labels = ""
-
-        if str(getattr(published, "mode", "single")) == "single" and gestures:
-            self._latest_pred_label = str(getattr(gestures[0], "label", self._latest_pred_label))
-            self._latest_pred_conf = float(getattr(gestures[0], "confidence", self._latest_pred_conf))
-        elif str(getattr(published, "mode", "single")) == "split":
-            self._latest_pred_label = "split"
-            self._latest_pred_conf = max(self._latest_left_conf, self._latest_right_conf)
-
-        apply_ts = time.time()
-        row = {
-            'timestamp': datetime.datetime.now().isoformat(),
-            'wall_time_s': apply_ts,
-            'control_apply_ts': apply_ts,
-            'simulation_time': float(getattr(world.hud, 'simulation_time', 0.0)),
-            'frame': int(getattr(world.hud, 'frame', 0)),
-            'prediction_seq': int(getattr(published, 'prediction_seq', 0)) if published is not None else 0,
-            'window_end_ts': float(getattr(published, 'window_end_ts', 0.0)) if published is not None else 0.0,
-            'prediction_ts': float(getattr(published, 'prediction_ts', 0.0)) if published is not None else 0.0,
-            'publish_ts': float(getattr(published, 'publish_ts', 0.0)) if published is not None else 0.0,
-            'gesture_age_s': float(self._latest_gesture_age),
-            'gesture_fresh': bool(self._latest_gesture_fresh),
-            'published_mode': str(getattr(published, 'mode', 'single')) if published is not None else '',
-            'pred_label': str(self._latest_pred_label),
-            'pred_conf': float(self._latest_pred_conf),
-            'right_label': str(self._latest_right_label),
-            'right_conf': float(self._latest_right_conf),
-            'left_label': str(self._latest_left_label),
-            'left_conf': float(self._latest_left_conf),
-            'steer_key': str(self._latest_steer_key),
-            'signal_state': str(self._latest_signal_state),
-            'horn_on': bool(self._latest_horn_on),
-            'steer': float(getattr(self._control, 'steer', 0.0)),
-            'throttle': float(getattr(self._control, 'throttle', 0.0)),
-            'brake': float(getattr(self._control, 'brake', 0.0)),
-            'reverse': bool(getattr(self._control, 'reverse', False)),
-            'hand_brake': bool(getattr(self._control, 'hand_brake', False)),
-            'vehicle_x': float(transform.location.x),
-            'vehicle_y': float(transform.location.y),
-            'vehicle_z': float(transform.location.z),
-            'speed_mps': float(speed_mps),
-            'lane_error_m': self._estimate_lane_error_m(world),
-            'lane_invasion_event': bool(lane_invasion_event),
-            'lane_invasion_count_total': lane_invasion_count,
-            'collision_event': bool(collision_event),
-            'collision_count_total': collision_count,
-            'published_labels': published_labels,
-        }
-        self._drive_logger.write_row(row)
-
     @staticmethod
     def _is_quit_shortcut(key):
         return (key == K_ESCAPE) or (key == K_q and pygame.key.get_mods() & KMOD_CTRL)
-
-    def _set_turn_signal(self, side: str):
-        """
-        side: "off" | "left" | "right"
-        """
-        if not isinstance(self._player, carla.Vehicle):
-            return
-    
-        # Preserve any existing lights, but replace blinker bits.
-        current = int(self._player.get_light_state())
-        left_bit = int(carla.VehicleLightState.LeftBlinker)
-        right_bit = int(carla.VehicleLightState.RightBlinker)
-        mask = left_bit | right_bit
-    
-        new_bits = 0
-        if side == "left":
-            new_bits = left_bit
-        elif side == "right":
-            new_bits = right_bit
-    
-        new_state = (current & ~mask) | new_bits
-        self._player.set_light_state(carla.VehicleLightState(new_state))
-        self._signal_state = side
-    
-    def _honk(self):
-        # CARLA doesn't have a built-in horn actuator for standard vehicles,
-        # so we simulate it with a HUD notification (and optional sound if you add one).
-        if hasattr(self, "_hud") and self._hud is not None:
-            self._hud.notification("HORN!", seconds=0.2)
-        else:
-            print("HORN!")
 
 
 # ==============================================================================
@@ -812,7 +395,7 @@ class HUD(object):
         self.server_fps = 0
         self.frame = 0
         self.simulation_time = 0
-        self._show_info = bool(HUD_VISIBLE_BY_DEFAULT) if LOW_GRAPHICS_MODE else True
+        self._show_info = True
         self._info_text = []
         self._server_clock = pygame.time.Clock()
 
@@ -995,7 +578,6 @@ class CollisionSensor(object):
     def __init__(self, parent_actor, hud):
         self.sensor = None
         self.history = []
-        self.event_count = 0
         self._parent = parent_actor
         self.hud = hud
         world = self._parent.get_world()
@@ -1017,7 +599,6 @@ class CollisionSensor(object):
         self = weak_self()
         if not self:
             return
-        self.event_count += 1
         actor_type = get_actor_display_name(event.other_actor)
         self.hud.notification('Collision with %r' % actor_type)
         impulse = event.normal_impulse
@@ -1035,7 +616,6 @@ class CollisionSensor(object):
 class LaneInvasionSensor(object):
     def __init__(self, parent_actor, hud):
         self.sensor = None
-        self.event_count = 0
         self._parent = parent_actor
         self.hud = hud
         world = self._parent.get_world()
@@ -1051,7 +631,6 @@ class LaneInvasionSensor(object):
         self = weak_self()
         if not self:
             return
-        self.event_count += 1
         lane_types = set(x.type for x in event.crossed_lane_markings)
         text = ['%r' % str(x).split()[-1] for x in lane_types]
         self.hud.notification('Crossed line %s' % ' and '.join(text))
@@ -1114,18 +693,10 @@ class CameraManager(object):
         for item in self.sensors:
             bp = bp_library.find(item[0])
             if item[0].startswith('sensor.camera'):
-                if LOW_GRAPHICS_MODE:
-                    bp.set_attribute('image_size_x', str(CAMERA_IMAGE_WIDTH))
-                    bp.set_attribute('image_size_y', str(CAMERA_IMAGE_HEIGHT))
-                    if bp.has_attribute('sensor_tick'):
-                        bp.set_attribute('sensor_tick', str(CAMERA_SENSOR_TICK_S))
-                    if bp.has_attribute('enable_postprocess_effects'):
-                        bp.set_attribute('enable_postprocess_effects', 'False')
-                else:
-                    bp.set_attribute('image_size_x', str(hud.dim[0]))
-                    bp.set_attribute('image_size_y', str(hud.dim[1]))
+                bp.set_attribute('image_size_x', str(hud.dim[0]))
+                bp.set_attribute('image_size_y', str(hud.dim[1]))
             elif item[0].startswith('sensor.lidar'):
-                bp.set_attribute('range', '15' if LOW_GRAPHICS_MODE else '50')
+                bp.set_attribute('range', '50')
             item.append(bp)
         self.index = None
 
@@ -1202,7 +773,6 @@ def game_loop(args):
     pygame.init()
     pygame.font.init()
     world = None
-    controller = None
 
     try:
         client = carla.Client(args.host, args.port)
@@ -1214,19 +784,11 @@ def game_loop(args):
 
         hud = HUD(args.width, args.height)
         world = World(client.get_world(), hud, args.filter)
-        controller = DualControl(
-            world,
-            args.autopilot,
-            carla_log_path=getattr(args, 'carla_log', ''),
-            realtime_log_path=getattr(args, 'realtime_log', ''),
-        )
+        controller = DualControl(world, args.autopilot)
 
         clock = pygame.time.Clock()
         while True:
-            if CLIENT_USE_BUSY_LOOP:
-                clock.tick_busy_loop(CLIENT_FPS_LIMIT)
-            else:
-                clock.tick(CLIENT_FPS_LIMIT)
+            clock.tick_busy_loop(60)
             if controller.parse_events(world, clock):
                 return
             world.tick(clock)
@@ -1234,8 +796,6 @@ def game_loop(args):
             pygame.display.flip()
 
     finally:
-        if controller is not None:
-            controller.close()
 
         if world is not None:
             world.destroy()
@@ -1281,96 +841,9 @@ def main():
         metavar='PATTERN',
         default='vehicle.*',
         help='actor filter (default: "vehicle.*")')
-    argparser.add_argument(
-        '--graphics',
-        choices=['low', 'normal'],
-        default='low' if DEFAULT_LOW_GRAPHICS_MODE else 'normal',
-        help='client graphics preset (default: low)')
-    argparser.add_argument(
-        '--camera-res',
-        metavar='WIDTHxHEIGHT',
-        default=DEFAULT_CAMERA_RES,
-        help='camera sensor resolution in low mode (default: %s)' % DEFAULT_CAMERA_RES)
-    argparser.add_argument(
-        '--camera-fps',
-        metavar='FPS',
-        default=DEFAULT_CAMERA_FPS,
-        type=float,
-        help='camera sensor FPS in low mode (default: %.1f)' % DEFAULT_CAMERA_FPS)
-    argparser.add_argument(
-        '--client-fps',
-        metavar='FPS',
-        default=DEFAULT_CLIENT_FPS_LIMIT,
-        type=int,
-        help='client loop FPS cap (default: %d)' % DEFAULT_CLIENT_FPS_LIMIT)
-    argparser.add_argument(
-        '--no-rendering',
-        action='store_true',
-        help='disable server rendering entirely; camera feeds will stop updating')
-    argparser.add_argument(
-        '--show-hud',
-        action='store_true',
-        help='show the HUD on startup')
-    argparser.add_argument(
-        '--hide-hud',
-        action='store_true',
-        help='hide the HUD on startup')
-    argparser.add_argument(
-        '--eval-log-dir',
-        default='',
-        help='Directory for evaluation CSV logs. If set, default CARLA and realtime log files are created there.')
-    argparser.add_argument(
-        '--carla-log',
-        default='',
-        help='Optional CSV path for per-tick CARLA drive logging.')
-    argparser.add_argument(
-        '--realtime-log',
-        default='',
-        help='Optional CSV path passed to realtime_gesture_cnn.py for per-prediction logging.')
     args = argparser.parse_args()
 
-    if args.show_hud and args.hide_hud:
-        argparser.error('use only one of --show-hud or --hide-hud')
-
-    global CLIENT_FPS_LIMIT
-    global LOW_GRAPHICS_MODE
-    global LOW_GRAPHICS_NO_RENDERING
-    global CAMERA_IMAGE_WIDTH
-    global CAMERA_IMAGE_HEIGHT
-    global CAMERA_SENSOR_TICK_S
-    global HUD_VISIBLE_BY_DEFAULT
-
-    try:
-        args.width, args.height = parse_resolution(args.res)
-        CAMERA_IMAGE_WIDTH, CAMERA_IMAGE_HEIGHT = parse_resolution(args.camera_res)
-    except ValueError as exc:
-        argparser.error(str(exc))
-
-    LOW_GRAPHICS_MODE = args.graphics == 'low'
-    LOW_GRAPHICS_NO_RENDERING = bool(args.no_rendering)
-    CLIENT_FPS_LIMIT = max(1, int(args.client_fps))
-    CAMERA_SENSOR_TICK_S = 1.0 / max(1.0, float(args.camera_fps))
-
-    eval_log_dir = str(getattr(args, 'eval_log_dir', '') or '').strip()
-    carla_log = str(getattr(args, 'carla_log', '') or '').strip()
-    realtime_log = str(getattr(args, 'realtime_log', '') or '').strip()
-    if eval_log_dir:
-        eval_dir = Path(eval_log_dir)
-        eval_dir.mkdir(parents=True, exist_ok=True)
-        stamp = _now_stamp()
-        if not carla_log:
-            carla_log = str(eval_dir / ('carla_drive_%s.csv' % stamp))
-        if not realtime_log:
-            realtime_log = str(eval_dir / ('realtime_predictions_%s.csv' % stamp))
-    args.carla_log = carla_log
-    args.realtime_log = realtime_log
-
-    if args.show_hud:
-        HUD_VISIBLE_BY_DEFAULT = True
-    elif args.hide_hud:
-        HUD_VISIBLE_BY_DEFAULT = False
-    else:
-        HUD_VISIBLE_BY_DEFAULT = DEFAULT_HUD_VISIBLE if LOW_GRAPHICS_MODE else True
+    args.width, args.height = [int(x) for x in args.res.split('x')]
 
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(format='%(levelname)s: %(message)s', level=log_level)

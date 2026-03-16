@@ -2,6 +2,9 @@
 
 Project context
 - The active stack is the CNN workflow driven by `DelsysPythonGUI.py`, `train_per_subject.py`, `train_cross_subject.py`, and `realtime_gesture_cnn.py`.
+- The repo copy of `carla wheel z.py` is the current CARLA integration reference for EMG-driven control testing.
+- `carla_integration/` is the repo-owned CARLA workspace for tracked Python-side integration files and reference upstream examples.
+- `carla_integration/manual_control_emg.py` is currently a copy of `carla wheel z.py`; keep those aligned until one canonical CARLA entrypoint is chosen.
 - The collection GUI entrypoint is `python DelsysPythonGUI.py`; it uses `DataCollector/CollectDataWindow.py`.
 - Raw GUI strict collections are stored under `data_strict/<arm> arm/<subject>/raw/*.npz`.
 - The recommended preprocessing/training root is `data_resampled_strict/<arm> arm/<subject>/{raw,filtered}`.
@@ -79,11 +82,33 @@ Common commands
   - Run `python realtime_gesture_cnn.py --model <bundle_path>`
 - Run live dual-arm CNN inference:
   - `python realtime_gesture_cnn.py --model-right <right_bundle> --model-left <left_bundle>`
+- Build evaluation tables from harvested metrics and JSON summaries:
+  - `python eval_metrics/build_eval_tables.py --manifest eval_metrics/table_manifest.csv`
+
+Evaluation workflow
+- Evaluation scripts now live under `eval_metrics/`.
+- Core scripts there include:
+  - `harvest_model_metrics.py`
+  - `realtime_behavior_metrics.py`
+  - `analyze_latency.py`
+  - `analyze_drive_metrics.py`
+  - `build_eval_tables.py`
+- The consolidated planning/tracking note is `project_notes/evaluation_execution_checklist_2026-03-15.md`.
 
 Realtime notes
 - `realtime_gesture_cnn.py` is the source of truth for live strict-layout behavior.
 - `AUTO_DUAL_ARM_CHANNEL_MAPPING` does not override strict dual-arm mapping when both bundles advertise strict layout.
-- The current realtime file defaults are tuned for strict 3-gesture testing; check `MODE`, `INCLUDED_GESTURES`, smoothing, and confidence thresholds before a run.
+- Dual-arm realtime now keeps per-arm state internally and exposes:
+  - `get_latest_dual_state()` for full left/right arm state plus compatibility combined state.
+  - `get_latest_published_gestures()` for the testing/CARLA-facing published output contract.
+  - Legacy `get_latest_gesture()` only for single-label compatibility with older callers.
+- Published dual-arm output semantics:
+  - If both arms agree, the published output is one gesture (`mode="single"`, arm `"dual"`).
+  - If the arms differ, the published output is split (`mode="split"`) with separate left/right gestures.
+- The repo copy of `carla wheel z.py` already reads `get_latest_published_gestures()` and resolves split-or-single dual-arm outputs into CARLA steering/signal/horn actions.
+- `realtime_gesture_cnn.py` can now emit per-prediction timing CSVs with `--prediction-log` for evaluation work.
+- The CARLA integration can now emit per-tick drive logs and forward realtime prediction logs for latency analysis.
+- The current realtime file defaults are still tuned for strict 3-gesture testing; check `MODE`, `INCLUDED_GESTURES`, smoothing, confidence thresholds, and `OUTPUT_HYSTERESIS` before a run.
 - `realtime_confidence_analysis.py` still uses older pair-membership logic and is not the source of truth for strict-layout validation.
 - Bundles are loaded with `torch.load(weights_only=False)` for PyTorch 2.6+ compatibility.
 

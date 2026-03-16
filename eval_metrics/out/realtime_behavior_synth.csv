@@ -1,0 +1,8 @@
+timestamp,elapsed_s,prompt_label,mode,pred_label,pred_conf,fused_left_turn,fused_right_turn
+2026-03-15T00:00:00,0.0,left_turn,right,neutral,0.40,0.30,
+2026-03-15T00:00:01,1.0,left_turn,right,left_turn,0.70,0.75,
+2026-03-15T00:00:02,2.0,left_turn,right,left_turn,0.80,0.85,
+2026-03-15T00:00:03,3.0,right_turn,right,left_turn,0.65,,0.20
+2026-03-15T00:00:04,4.0,right_turn,right,neutral,0.55,,0.30
+2026-03-15T00:00:05,5.0,right_turn,right,right_turn,0.90,,0.92
+2026-03-15T00:00:06,6.0,right_turn,right,right_turn,0.88,,0.91

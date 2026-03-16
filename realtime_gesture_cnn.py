@@ -1,8 +1,10 @@
 import argparse
+import csv
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 import os
@@ -74,6 +76,10 @@ class PublishedGesture:
 class PublishedGestureOutput:
     mode: str = "single"
     gestures: tuple[PublishedGesture, ...] = field(default_factory=tuple)
+    prediction_seq: int = 0
+    window_end_ts: float = 0.0
+    prediction_ts: float = 0.0
+    publish_ts: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,9 @@ class DualGestureState:
     left: ArmGestureState = field(default_factory=ArmGestureState)
     combined: ArmGestureState = field(default_factory=ArmGestureState)
     published: PublishedGestureOutput = field(default_factory=PublishedGestureOutput)
+    prediction_seq: int = 0
+    window_end_ts: float = 0.0
+    prediction_ts: float = 0.0
     timestamp: float = 0.0
 
 
@@ -90,6 +99,58 @@ LATEST_LOCK = threading.Lock()
 LATEST_STATE = DualGestureState()
 LATEST_GESTURE = LOW_CONFIDENCE_LABEL
 LATEST_TIMESTAMP = 0.0
+LATEST_PREDICTION_SEQ = 0
+
+
+class PredictionCSVLogger:
+    def __init__(self, path: str):
+        self.path = str(path)
+        out_path = Path(self.path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = out_path.open("w", newline="", encoding="utf-8")
+        self._fieldnames = [
+            "prediction_seq",
+            "window_end_ts",
+            "prediction_ts",
+            "publish_ts",
+            "mode",
+            "published_mode",
+            "pred_label",
+            "pred_conf",
+            "right_label",
+            "right_conf",
+            "left_label",
+            "left_conf",
+            "published_labels",
+        ]
+        self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames)
+        self._writer.writeheader()
+
+    def write_state(self, state: DualGestureState) -> None:
+        published = state.published
+        row = {
+            "prediction_seq": int(getattr(published, "prediction_seq", 0)),
+            "window_end_ts": float(getattr(published, "window_end_ts", 0.0)),
+            "prediction_ts": float(getattr(published, "prediction_ts", 0.0)),
+            "publish_ts": float(getattr(published, "publish_ts", state.timestamp)),
+            "mode": str(state.mode),
+            "published_mode": str(getattr(published, "mode", "")),
+            "pred_label": str(state.combined.label),
+            "pred_conf": float(state.combined.confidence),
+            "right_label": str(state.right.label),
+            "right_conf": float(state.right.confidence),
+            "left_label": str(state.left.label),
+            "left_conf": float(state.left.confidence),
+            "published_labels": "|".join(
+                f"{gesture.arm}:{gesture.label}"
+                for gesture in getattr(published, "gestures", ())
+            ),
+        }
+        self._writer.writerow(row)
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
 
 CALIBRATE = True
 CALIB_NEUTRAL_S = 5.0
@@ -555,13 +616,15 @@ def set_latest_dual_state(
     combined_label: str | None = None,
     combined_confidence: float | None = None,
     published: PublishedGestureOutput | None = None,
+    window_end_ts: float = 0.0,
+    prediction_ts: float = 0.0,
 ) -> DualGestureState:
     """Publish the latest per-arm gesture state.
 
     `combined_*` is retained only for callers that still consume the legacy
     single-label interface via `get_latest_gesture()`.
     """
-    global LATEST_STATE, LATEST_GESTURE, LATEST_TIMESTAMP
+    global LATEST_STATE, LATEST_GESTURE, LATEST_TIMESTAMP, LATEST_PREDICTION_SEQ
 
     mode_name = str(mode)
     right_state = ArmGestureState(str(right_label), float(right_confidence))
@@ -571,19 +634,36 @@ def set_latest_dual_state(
     if combined_confidence is None:
         combined_confidence = right_state.confidence if mode_name != "dual" else 0.0
     combined_state = ArmGestureState(str(combined_label), float(combined_confidence))
+    LATEST_PREDICTION_SEQ += 1
+    prediction_seq = int(LATEST_PREDICTION_SEQ)
+    timestamp = time.time()
     if published is None:
         active_arm = mode_name if mode_name in {"right", "left"} else "right"
         published = PublishedGestureOutput(
             mode="single",
             gestures=(PublishedGesture(active_arm, combined_state.label, combined_state.confidence),),
+            prediction_seq=prediction_seq,
+            window_end_ts=float(window_end_ts),
+            prediction_ts=float(prediction_ts),
+            publish_ts=float(timestamp),
         )
-    timestamp = time.time()
+    else:
+        published = replace(
+            published,
+            prediction_seq=prediction_seq,
+            window_end_ts=float(window_end_ts),
+            prediction_ts=float(prediction_ts),
+            publish_ts=float(timestamp),
+        )
     state = DualGestureState(
         mode=mode_name,
         right=right_state,
         left=left_state,
         combined=combined_state,
         published=published,
+        prediction_seq=prediction_seq,
+        window_end_ts=float(window_end_ts),
+        prediction_ts=float(prediction_ts),
         timestamp=timestamp,
     )
     with LATEST_LOCK:
@@ -1122,12 +1202,18 @@ def main(argv=None):
                         help="Right arm model alias; overrides --model if both given.")
     parser.add_argument("--model-left",  default=_config_left,
                         help="Left arm model. Set automatically from MODE=dual; overrides config.")
+    parser.add_argument(
+        "--prediction-log",
+        default="",
+        help="Optional CSV path for per-prediction timing/state logging.",
+    )
     args = parser.parse_args(argv)
 
     # --model-right overrides --model so either flag works
     model_right_path = args.model_right if args.model_right else args.model
     model_left_path = args.model_left   # None -> single-arm mode
     dual_arm = model_left_path is not None
+    prediction_logger = PredictionCSVLogger(args.prediction_log) if args.prediction_log else None
 
     print("[gesture] cwd:", os.getcwd())
 
@@ -2085,6 +2171,7 @@ def main(argv=None):
                     label, confidence = current_right_label, current_right_conf
 
                 combined_state = ArmGestureState(label, confidence)
+                prediction_wall_time = time.time()
                 published_output = resolve_published_gesture_output(
                     "dual" if dual_arm else MODE,
                     ArmGestureState(current_right_label, current_right_conf),
@@ -2095,7 +2182,7 @@ def main(argv=None):
                     combined_state,
                 )
 
-                set_latest_dual_state(
+                state = set_latest_dual_state(
                     mode="dual" if dual_arm else MODE,
                     right_label=current_right_label,
                     right_confidence=current_right_conf,
@@ -2104,7 +2191,11 @@ def main(argv=None):
                     combined_label=label,
                     combined_confidence=confidence,
                     published=published_output,
+                    window_end_ts=batch_wall_time,
+                    prediction_ts=prediction_wall_time,
                 )
+                if prediction_logger is not None:
+                    prediction_logger.write_state(state)
 
                 output_signature = published_gesture_signature(published_output)
                 is_neutral_only = all(
@@ -2126,6 +2217,8 @@ def main(argv=None):
         print("\nStopping stream...")
     finally:
         base.Stop_Callback()
+        if prediction_logger is not None:
+            prediction_logger.close()
         # === LATENCY MEASURE START ===
         # if latency_enabled and latency_ms:
         #     lat = np.asarray(latency_ms, dtype=float)
