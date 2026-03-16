@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "C:\Users\igdal\Desktop\zs-armbands-capstone\CARLA_0.9.16\PythonAPI\examples\vehicle_gallery.py", line 51, in <module>
+    main()
+  File "C:\Users\igdal\Desktop\zs-armbands-capstone\CARLA_0.9.16\PythonAPI\examples\vehicle_gallery.py", line 24, in main
+    world = client.get_world()
+            ^^^^^^^^^^^^^^^^^^
+RuntimeError: time-out of 2000ms while waiting for the simulator, make sure the simulator is ready and connected to localhost:2000
+command: C:\Users\igdal\anaconda3\envs\capstone-emg\python.exe C:\Users\igdal\Desktop\zs-armbands-capstone\CARLA_0.9.16\PythonAPI\examples\vehicle_gallery.py
+

@@ -30,8 +30,8 @@ import glob
 import os
 import sys
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-SRC_DIR = os.path.join(PROJECT_ROOT, 'src')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
@@ -106,7 +106,8 @@ except ImportError:
 
 try:
     import realtime_gesture_cnn as realtime_gesture
-except Exception:
+except Exception as exc:
+    print("[gesture] failed to import realtime_gesture_cnn:", exc)
     realtime_gesture = None
 import threading
 import time
@@ -347,7 +348,8 @@ class DualControl(object):
         self._joystick.init()
 
         self._parser = ConfigParser()
-        self._parser.read('wheel_config.ini')
+        wheel_config_path = os.path.join(SCRIPT_DIR, 'wheel_config.ini')
+        self._parser.read(wheel_config_path)
         self._steer_idx = int(
             self._parser.get('G29 Racing Wheel', 'steering_wheel'))
         self._throttle_idx = int(
@@ -385,10 +387,10 @@ class DualControl(object):
         
         # Gestures -> steering only (NO throttle/brake from gestures)
         self._gesture_to_steer = {
-            "left": -0.5,
-            "right": 0.5,
-            "left_strong": -0.9,
-            "right_strong": 0.9,
+            "left": -0.08,
+            "right": 0.08,
+            "left_strong": -0.4,
+            "right_strong": 0.4,
             "neutral": 0.0,
         }
         

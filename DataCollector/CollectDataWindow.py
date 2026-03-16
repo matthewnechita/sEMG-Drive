@@ -56,11 +56,18 @@ def resolve_rest_label_trim(
 
 class CollectDataWindow(QWidget):
     plot_enabled = False
+    DEFAULT_WINDOW_SIZE = QSize(1280, 720)
+    MINIMUM_WINDOW_SIZE = QSize(980, 660)
+    SCREEN_MARGIN = 24
 
     def __init__(self, controller):
         QWidget.__init__(self)
         self.pipelinetext = "Off"
         self.controller = controller
+        self._geometry_adjustment_pending = False
+        self._geometry_adjustment_active = False
+        self._pending_center_adjust = False
+        self._initial_geometry_applied = False
         # Default identifiers for saving data; editable in UI
         self.default_subject = "subject01"
         self.default_session = "01"
@@ -97,11 +104,92 @@ class CollectDataWindow(QWidget):
         self.setStyleSheet("background-color:#3d4c51;")
         self.setLayout(self.grid)
         self.setWindowTitle("Collect Data GUI")
-        self.setMinimumSize(1550, 820)
+        self.resize(self.DEFAULT_WINDOW_SIZE)
+        self.setMinimumSize(self.MINIMUM_WINDOW_SIZE)
         self.pairing = False
         self.selectedSensor = None
         self.protocol_running = False
         self.protocol_abort = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._schedule_window_fit(center=not self._initial_geometry_applied)
+        self._initial_geometry_applied = True
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._schedule_window_fit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._schedule_window_fit()
+
+    def _schedule_window_fit(self, center: bool = False):
+        if not self.isVisible() or self.isMaximized() or self.isFullScreen():
+            return
+        if self._geometry_adjustment_active:
+            self._pending_center_adjust = self._pending_center_adjust or center
+            return
+        if self._geometry_adjustment_pending:
+            self._pending_center_adjust = self._pending_center_adjust or center
+            return
+
+        self._geometry_adjustment_pending = True
+        self._pending_center_adjust = center
+        QTimer.singleShot(0, self._fit_window_to_screen)
+
+    def _available_screen_geometry(self):
+        screen = self.screen()
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return None
+        return screen.availableGeometry().adjusted(
+            self.SCREEN_MARGIN,
+            self.SCREEN_MARGIN,
+            -self.SCREEN_MARGIN,
+            -self.SCREEN_MARGIN,
+        )
+
+    def _fit_window_to_screen(self):
+        self._geometry_adjustment_pending = False
+
+        if not self.isVisible() or self.isMaximized() or self.isFullScreen():
+            self._pending_center_adjust = False
+            return
+
+        available = self._available_screen_geometry()
+        if available is None:
+            self._pending_center_adjust = False
+            return
+
+        target_width = min(self.width(), available.width())
+        target_height = min(self.height(), available.height())
+
+        self._geometry_adjustment_active = True
+        try:
+            if target_width != self.width() or target_height != self.height():
+                self.resize(target_width, target_height)
+
+            if self._pending_center_adjust:
+                centered = QStyle.alignedRect(
+                    Qt.LayoutDirection.LeftToRight,
+                    Qt.AlignmentFlag.AlignCenter,
+                    self.size(),
+                    available,
+                )
+                self.move(centered.topLeft())
+            else:
+                geometry = self.geometry()
+                max_x = available.x() + max(0, available.width() - geometry.width())
+                max_y = available.y() + max(0, available.height() - geometry.height())
+                clamped_x = min(max(geometry.x(), available.x()), max_x)
+                clamped_y = min(max(geometry.y(), available.y()), max_y)
+                if clamped_x != geometry.x() or clamped_y != geometry.y():
+                    self.move(clamped_x, clamped_y)
+        finally:
+            self._geometry_adjustment_active = False
+            self._pending_center_adjust = False
 
     def AddPlotPanel(self):
         self.plotPanel = self.Plotter()
@@ -119,6 +207,8 @@ class CollectDataWindow(QWidget):
         buttonPanel = QWidget()
         buttonPanel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         buttonLayout = QVBoxLayout()
+        buttonLayout.setContentsMargins(0, 0, 0, 0)
+        buttonLayout.setSpacing(8)
         findSensor_layout = QHBoxLayout()
         # ---- Pair Button
         self.pair_button = QPushButton('Pair', self)
@@ -276,7 +366,7 @@ class CollectDataWindow(QWidget):
         self.SensorListBox.setStyleSheet('QListWidget {color: white;background:#848482}')
         self.SensorListBox.itemClicked.connect(self.sensorList_callback)
         self.SensorListBox.setMinimumWidth(360)
-        self.SensorListBox.setMinimumHeight(350)
+        self.SensorListBox.setMinimumHeight(260)
         self.SensorListBox.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.SensorListBox.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         buttonLayout.addWidget(self.SensorListBox)

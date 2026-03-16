@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import re
 import time
 from collections import deque
@@ -44,7 +45,7 @@ REALTIME_RESAMPLE = True
 REALTIME_TARGET_FS_HZ = 2000.0
 
 SMOOTHING = 1
-MIN_CONFIDENCE = 0.90
+MIN_CONFIDENCE = 0.80
 DUAL_ARM_AGREE_THRESHOLD  = 0.55
 DUAL_ARM_SINGLE_THRESHOLD = MIN_CONFIDENCE
 LOW_CONFIDENCE_LABEL = "neutral"
@@ -54,9 +55,9 @@ HYSTERESIS_ACTIVE_ENTER_THRESHOLD = 0.85
 HYSTERESIS_ACTIVE_EXIT_THRESHOLD = 0.60
 HYSTERESIS_ACTIVE_SWITCH_THRESHOLD = 0.88
 HYSTERESIS_NEUTRAL_ENTER_THRESHOLD = 0.75
-HYSTERESIS_ENTER_CONFIRM_FRAMES = 2
-HYSTERESIS_SWITCH_CONFIRM_FRAMES = 2
-HYSTERESIS_NEUTRAL_CONFIRM_FRAMES = 2
+HYSTERESIS_ENTER_CONFIRM_FRAMES = 1
+HYSTERESIS_SWITCH_CONFIRM_FRAMES = 1
+HYSTERESIS_NEUTRAL_CONFIRM_FRAMES = 1
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,7 @@ LATEST_STATE = DualGestureState()
 LATEST_GESTURE = LOW_CONFIDENCE_LABEL
 LATEST_TIMESTAMP = 0.0
 LATEST_PREDICTION_SEQ = 0
+PUBLISH_FILE_PATH = None
 
 
 class PredictionCSVLogger:
@@ -211,7 +213,7 @@ GESTURE_INSTRUCTIONS = {
 #   "right" - right arm only  (pair right arm sensors first in Delsys)
 #   "left"  - left arm only   (pair left arm sensors first in Delsys)
 #   "dual"  - both arms inferred separately (legacy accessor still exposes one combined label)
-MODE        = "right"
+MODE        = "left"
 # Default to Matthew strict per-subject bundles. Override with CLI flags as needed.
 MODEL_RIGHT = os.path.join(
     BASE_DIR,
@@ -219,7 +221,7 @@ MODEL_RIGHT = os.path.join(
     "strict",
     "per_subject",
     "right",
-    "Matthew_3_gesture.pt",
+    "Matthew_3_gesture_15.pt",
 )
 
 MODEL_LEFT = os.path.join(
@@ -228,7 +230,7 @@ MODEL_LEFT = os.path.join(
     "strict",
     "per_subject",
     "left",
-    "Matthew_3_gesture.pt",
+    "Matthew_all_gesture_15.pt",
 )
 # ================================
 
@@ -606,6 +608,61 @@ def control_hook(gesture: str) -> None:
     return
 
 
+def _published_output_to_dict(output: PublishedGestureOutput) -> dict[str, Any]:
+    return {
+        "mode": str(output.mode),
+        "prediction_seq": int(output.prediction_seq),
+        "window_end_ts": float(output.window_end_ts),
+        "prediction_ts": float(output.prediction_ts),
+        "publish_ts": float(output.publish_ts),
+        "gestures": [
+            {
+                "arm": str(gesture.arm),
+                "label": str(gesture.label),
+                "confidence": float(gesture.confidence),
+            }
+            for gesture in output.gestures
+        ],
+    }
+
+
+def _write_latest_state_file(state: DualGestureState) -> None:
+    if not PUBLISH_FILE_PATH:
+        return
+
+    payload = {
+        "timestamp": float(state.timestamp),
+        "prediction_seq": int(state.prediction_seq),
+        "window_end_ts": float(state.window_end_ts),
+        "prediction_ts": float(state.prediction_ts),
+        "mode": str(state.mode),
+        "right": {
+            "label": str(state.right.label),
+            "confidence": float(state.right.confidence),
+        },
+        "left": {
+            "label": str(state.left.label),
+            "confidence": float(state.left.confidence),
+        },
+        "combined": {
+            "label": str(state.combined.label),
+            "confidence": float(state.combined.confidence),
+        },
+        "published": _published_output_to_dict(state.published),
+    }
+
+    tmp_path = f"{PUBLISH_FILE_PATH}.tmp"
+    try:
+        parent = os.path.dirname(PUBLISH_FILE_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp_path, PUBLISH_FILE_PATH)
+    except OSError:
+        pass
+
+
 def set_latest_dual_state(
     *,
     mode: str,
@@ -670,6 +727,7 @@ def set_latest_dual_state(
         LATEST_STATE = state
         LATEST_GESTURE = combined_state.label
         LATEST_TIMESTAMP = timestamp
+    _write_latest_state_file(state)
     return state
 
 
@@ -1207,6 +1265,17 @@ def main(argv=None):
         default="",
         help="Optional CSV path for per-prediction timing/state logging.",
     )
+    parser.add_argument(
+        "--publish-file",
+        default=None,
+        help="Optional JSON path for publishing the latest gesture state.",
+    )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Inference device (default: auto).",
+    )
     args = parser.parse_args(argv)
 
     # --model-right overrides --model so either flag works
@@ -1214,10 +1283,17 @@ def main(argv=None):
     model_left_path = args.model_left   # None -> single-arm mode
     dual_arm = model_left_path is not None
     prediction_logger = PredictionCSVLogger(args.prediction_log) if args.prediction_log else None
+    global PUBLISH_FILE_PATH
+    PUBLISH_FILE_PATH = os.path.abspath(args.publish_file) if args.publish_file else None
 
     print("[gesture] cwd:", os.getcwd())
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if args.device == "auto":
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        device = args.device
+        if device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("Requested --device cuda, but CUDA is not available.")
     print('[gesture] device:', device)
 
     print("[gesture] right arm model:", model_right_path)

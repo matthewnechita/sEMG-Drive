@@ -2,9 +2,14 @@
 
 Project context
 - The active stack is the CNN workflow driven by `DelsysPythonGUI.py`, `train_per_subject.py`, `train_cross_subject.py`, and `realtime_gesture_cnn.py`.
-- The repo copy of `carla wheel z.py` is the current CARLA integration reference for EMG-driven control testing.
 - `carla_integration/` is the repo-owned CARLA workspace for tracked Python-side integration files and reference upstream examples.
-- `carla_integration/manual_control_emg.py` is currently a copy of `carla wheel z.py`; keep those aligned until one canonical CARLA entrypoint is chosen.
+- `carla_integration/manual_control_emg.py` is the current canonical CARLA client entrypoint for EMG-driven control testing.
+- Current CARLA launcher copies in use:
+  - `carla_integration/run_manual_control_emg_0_9_16.bat`: existing low-load launcher path.
+  - `carla_integration/start_clean_carla_server_0_9_16.bat`: existing server launcher path.
+  - `carla_integration/test_run_manual_control_emg_0_9_16.bat`: restored-display test copy with HUD shown and 30 FPS client cap.
+  - `carla_integration/test_start_carla_server_0_9_16.bat`: restored-display test server copy.
+- Do not change CARLA map defaults or optimize/swap maps unless the user explicitly requests a specific map name.
 - The collection GUI entrypoint is `python DelsysPythonGUI.py`; it uses `DataCollector/CollectDataWindow.py`.
 - Raw GUI strict collections are stored under `data_strict/<arm> arm/<subject>/raw/*.npz`.
 - The recommended preprocessing/training root is `data_resampled_strict/<arm> arm/<subject>/{raw,filtered}`.
@@ -95,6 +100,19 @@ Evaluation workflow
   - `build_eval_tables.py`
 - The consolidated planning/tracking note is `project_notes/evaluation_execution_checklist_2026-03-15.md`.
 
+Current status
+- As of `2026-03-16`, fresh strict recollection, retraining, and standalone realtime testing are working again with the fixed strict sensor placement workflow.
+- Left-arm, right-arm, and dual-arm realtime runs have all worked with fresh data and updated models when all required strict pairs are present.
+- The current checked-in realtime defaults are focused on 3-gesture strict testing:
+  - `MODE = "left"`
+  - `INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"}`
+  - `MIN_CONFIDENCE = 0.80`
+  - `OUTPUT_HYSTERESIS = False`
+  - hysteresis confirm-frame counts are currently `1`
+- Observed issue during live testing: intermittent Delsys sensor presence/dropout has been seen before inference starts, especially right-arm pairs `2` and `9`; treat this as a hardware/connectivity issue first unless software evidence changes.
+- CARLA integration is running again through `manual_control_emg.py`; the restored-display test launchers are the safer path when checking visuals/HUD without touching the current low-load launchers.
+- Next planned work for the next session is live tuning to reduce `neutral` flicker without making turn control too sticky or too weak.
+
 Realtime notes
 - `realtime_gesture_cnn.py` is the source of truth for live strict-layout behavior.
 - `AUTO_DUAL_ARM_CHANNEL_MAPPING` does not override strict dual-arm mapping when both bundles advertise strict layout.
@@ -105,10 +123,11 @@ Realtime notes
 - Published dual-arm output semantics:
   - If both arms agree, the published output is one gesture (`mode="single"`, arm `"dual"`).
   - If the arms differ, the published output is split (`mode="split"`) with separate left/right gestures.
-- The repo copy of `carla wheel z.py` already reads `get_latest_published_gestures()` and resolves split-or-single dual-arm outputs into CARLA steering/signal/horn actions.
+- `carla_integration/manual_control_emg.py` reads `get_latest_published_gestures()` and resolves split-or-single dual-arm outputs into CARLA steering/signal/horn actions.
 - `realtime_gesture_cnn.py` can now emit per-prediction timing CSVs with `--prediction-log` for evaluation work.
 - The CARLA integration can now emit per-tick drive logs and forward realtime prediction logs for latency analysis.
 - The current realtime file defaults are still tuned for strict 3-gesture testing; check `MODE`, `INCLUDED_GESTURES`, smoothing, confidence thresholds, and `OUTPUT_HYSTERESIS` before a run.
+- `manual_control_emg.py` launches realtime internally; for CARLA testing do not start `realtime_gesture_cnn.py` separately unless explicitly debugging that interface boundary.
 - `realtime_confidence_analysis.py` still uses older pair-membership logic and is not the source of truth for strict-layout validation.
 - Bundles are loaded with `torch.load(weights_only=False)` for PyTorch 2.6+ compatibility.
 

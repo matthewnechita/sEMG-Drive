@@ -46,7 +46,7 @@ TARGET_SUBJECT = "Matthew"
 
 DATA_ROOT = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
 PATTERN = "*_filtered.npz"
-MODEL_OUT = STRICT_MODELS_ROOT / "per_subject" / ARM / f"{TARGET_SUBJECT}_3_gesture.pt"
+MODEL_OUT = STRICT_MODELS_ROOT / "per_subject" / ARM / f"{TARGET_SUBJECT}_all_gesture_15.pt"
 
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
@@ -60,7 +60,7 @@ TEST_SIZE = 0.2
 RANDOM_STATE = 42
 BATCH_SIZE = 512
 
-EPOCHS = 45
+EPOCHS = 60
 LR = 1e-4
 DROPOUT = 0.25
 LABEL_SMOOTHING = 0.05
@@ -73,7 +73,7 @@ USE_SENSOR_TYPE_CANONICALIZATION = CHANNEL_LAYOUT_MODE == "salvage"
 USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION = CHANNEL_LAYOUT_MODE == "salvage"
 
 EXCLUDED_SUBJECTS: list[str] = []  # Keep empty for Matthew-only runs unless you need to blacklist a subject.
-INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn"}  # Example subset: {"neutral", "left_turn", "right_turn"}.
+INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"}  # Example subset: {"neutral", "left_turn", "right_turn"}.
 # ========================
 
 
