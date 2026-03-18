@@ -64,6 +64,8 @@ import re
 import weakref
 from pathlib import Path
 
+from emg.runtime_tuning import get_runtime_tuning_preset
+
 if sys.version_info >= (3, 0):
 
     from configparser import ConfigParser
@@ -116,6 +118,10 @@ try:
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
 
+RUNTIME_TUNING_PRESET = get_runtime_tuning_preset()
+RUNTIME_TUNING_PRESET_NAME = RUNTIME_TUNING_PRESET.name
+CARLA_TUNING = RUNTIME_TUNING_PRESET.carla
+
 # Gesture/CARLA timing diagnostics.
 # Frame rate does not need to match EMG sample rate; this only controls how
 # often CARLA polls and applies the latest gesture label.
@@ -149,6 +155,7 @@ class DriveCSVLogger(object):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         self._file = out_path.open('w', newline='', encoding='utf-8')
         self._fieldnames = [
+            'runtime_preset',
             'timestamp',
             'wall_time_s',
             'control_apply_ts',
@@ -168,6 +175,10 @@ class DriveCSVLogger(object):
             'left_label',
             'left_conf',
             'steer_key',
+            'applied_steer_key',
+            'steer_dwell_pending_key',
+            'steer_dwell_pending_count',
+            'steer_dwell_required',
             'signal_state',
             'horn_on',
             'steer',
@@ -364,7 +375,7 @@ class DualControl(object):
         self._hud = world.hud
         
         # Gesture freshness (optional safety: ignore stale labels)
-        self._gesture_max_age = 0.75
+        self._gesture_max_age = float(CARLA_TUNING.gesture_max_age_s)
         self._client_fps = 0.0
         self._last_applied_gesture = None
         self._last_gesture_debug_t = 0.0
@@ -377,6 +388,10 @@ class DualControl(object):
         self._latest_pred_label = "neutral"
         self._latest_pred_conf = 0.0
         self._latest_steer_key = "neutral"
+        self._latest_applied_steer_key = "neutral"
+        self._latest_steer_dwell_pending_key = ""
+        self._latest_steer_dwell_pending_count = 0
+        self._latest_steer_dwell_required = 1
         self._latest_signal_state = "off"
         self._latest_horn_on = False
         self._latest_gesture_fresh = False
@@ -387,12 +402,23 @@ class DualControl(object):
         
         # Gestures -> steering only (NO throttle/brake from gestures)
         self._gesture_to_steer = {
-            "left": -0.08,
-            "right": 0.08,
-            "left_strong": -0.4,
-            "right_strong": 0.4,
-            "neutral": 0.0,
+            "left": float(CARLA_TUNING.steer_left),
+            "right": float(CARLA_TUNING.steer_right),
+            "left_strong": float(CARLA_TUNING.steer_left_strong),
+            "right_strong": float(CARLA_TUNING.steer_right_strong),
+            "neutral": float(CARLA_TUNING.steer_neutral),
         }
+        self._active_steer_dwell_frames = max(1, int(CARLA_TUNING.active_steer_dwell_frames))
+        self._neutral_steer_dwell_frames = max(1, int(CARLA_TUNING.neutral_steer_dwell_frames))
+        self._applied_steer_key = "neutral"
+        self._pending_steer_key = None
+        self._pending_steer_count = 0
+        print(
+            f"[gesture] runtime preset: {RUNTIME_TUNING_PRESET_NAME} "
+            f"(gesture_max_age={self._gesture_max_age:.2f}s, "
+            f"active_dwell={self._active_steer_dwell_frames}, "
+            f"neutral_dwell={self._neutral_steer_dwell_frames})"
+        )
         
         # Track signals so they behave like a real car (stay on until changed/canceled)
         self._signal_state = "off"  # "off" | "left" | "right"
@@ -587,9 +613,51 @@ class DualControl(object):
 
         return steer_key, signal_state, horn_on
 
+    def _reset_steer_dwell_candidate(self):
+        self._pending_steer_key = None
+        self._pending_steer_count = 0
+
+    def _apply_steer_dwell(self, requested_steer_key: str):
+        requested_steer_key = str(requested_steer_key)
+        applied_steer_key = str(self._applied_steer_key)
+        dwell_required = (
+            self._neutral_steer_dwell_frames
+            if requested_steer_key == "neutral"
+            else self._active_steer_dwell_frames
+        )
+        dwell_required = max(1, int(dwell_required))
+
+        if requested_steer_key == applied_steer_key:
+            self._reset_steer_dwell_candidate()
+            self._latest_steer_dwell_pending_key = ""
+            self._latest_steer_dwell_pending_count = 0
+            self._latest_steer_dwell_required = dwell_required
+            return applied_steer_key
+
+        if self._pending_steer_key == requested_steer_key:
+            self._pending_steer_count += 1
+        else:
+            self._pending_steer_key = requested_steer_key
+            self._pending_steer_count = 1
+
+        self._latest_steer_dwell_pending_key = str(self._pending_steer_key or "")
+        self._latest_steer_dwell_pending_count = int(self._pending_steer_count)
+        self._latest_steer_dwell_required = int(dwell_required)
+
+        if self._pending_steer_count >= dwell_required:
+            self._applied_steer_key = requested_steer_key
+            applied_steer_key = requested_steer_key
+            self._reset_steer_dwell_candidate()
+            self._latest_steer_dwell_pending_key = ""
+            self._latest_steer_dwell_pending_count = 0
+        return applied_steer_key
+
     def _apply_gesture_override(self):
         if realtime_gesture is None:
             self._latest_gesture_fresh = False
+            self._reset_steer_dwell_candidate()
+            self._latest_steer_dwell_pending_key = ""
+            self._latest_steer_dwell_pending_count = 0
             return
     
         # Read the new published dual-arm output from realtime_gesture_cnn.py
@@ -598,6 +666,9 @@ class DualControl(object):
         self._latest_gesture_age = float(age)
         if age > self._gesture_max_age:
             self._latest_gesture_fresh = False
+            self._reset_steer_dwell_candidate()
+            self._latest_steer_dwell_pending_key = ""
+            self._latest_steer_dwell_pending_count = 0
             return
     
         left_label = "neutral"
@@ -650,6 +721,8 @@ class DualControl(object):
     
         steer_key, signal_state, horn_on = self._resolve_dual_arm_actions(left_label, right_label)
         self._latest_steer_key = steer_key
+        applied_steer_key = self._apply_steer_dwell(steer_key)
+        self._latest_applied_steer_key = applied_steer_key
         self._latest_signal_state = signal_state
         self._latest_horn_on = bool(horn_on)
         self._latest_pred_label = "split" if getattr(published, "mode", "single") == "split" else (
@@ -659,7 +732,7 @@ class DualControl(object):
         self._latest_gesture_fresh = True
     
         # Apply steering
-        self._control.steer = float(self._gesture_to_steer[steer_key])
+        self._control.steer = float(self._gesture_to_steer[applied_steer_key])
     
         # Apply turn signal
         if signal_state != self._signal_state:
@@ -719,6 +792,7 @@ class DualControl(object):
 
         apply_ts = time.time()
         row = {
+            'runtime_preset': RUNTIME_TUNING_PRESET_NAME,
             'timestamp': datetime.datetime.now().isoformat(),
             'wall_time_s': apply_ts,
             'control_apply_ts': apply_ts,
@@ -738,6 +812,10 @@ class DualControl(object):
             'left_label': str(self._latest_left_label),
             'left_conf': float(self._latest_left_conf),
             'steer_key': str(self._latest_steer_key),
+            'applied_steer_key': str(self._latest_applied_steer_key),
+            'steer_dwell_pending_key': str(self._latest_steer_dwell_pending_key),
+            'steer_dwell_pending_count': int(self._latest_steer_dwell_pending_count),
+            'steer_dwell_required': int(self._latest_steer_dwell_required),
             'signal_state': str(self._latest_signal_state),
             'horn_on': bool(self._latest_horn_on),
             'steer': float(getattr(self._control, 'steer', 0.0)),

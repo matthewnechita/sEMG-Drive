@@ -30,11 +30,14 @@ class TrialConfig:
     repetitions: int
     subject: str
     session: str
+    protocol_name: str = "standard"
     arm: str = "right"
     prep_duration: float = 3.0
     inter_gesture_rest_s: float = 0.0
     label_trim_s: float = 0.0
     rest_label_trim_s: Optional[float] = None
+    recovery_neutral_lead_trim_s: float = 0.0
+    recovery_neutral_trail_trim_s: float = 0.0
     calibrate: bool = False
     calibration_neutral_s: float = 5.0
     calibration_mvc_s: float = 5.0
@@ -340,6 +343,18 @@ class CollectDataWindow(QWidget):
         self.recordnpz_button.setFixedHeight(50)
         buttonLayout.addWidget(self.recordnpz_button)
 
+        # ---- Neutral Recovery Protocol Button
+        self.neutral_recovery_button = QPushButton('Run Neutral Recovery Protocol', self)
+        self.neutral_recovery_button.setToolTip(
+            'Collect repeated left/right gesture releases into neutral without changing the standard protocol'
+        )
+        self.neutral_recovery_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.neutral_recovery_button.clicked.connect(self.neutral_recovery_protocol_callback)
+        self.neutral_recovery_button.setStyleSheet('QPushButton {color: grey;}')
+        self.neutral_recovery_button.setEnabled(False)
+        self.neutral_recovery_button.setFixedHeight(50)
+        buttonLayout.addWidget(self.neutral_recovery_button)
+
         # ---- Drop-down menu of sensor modes
         self.SensorModeList = QComboBox(self)
         self.SensorModeList.setToolTip('Sensor Modes')
@@ -630,6 +645,8 @@ class CollectDataWindow(QWidget):
             self.stop_button.setStyleSheet("color : white")
             self.recordnpz_button.setEnabled(True)
             self.recordnpz_button.setStyleSheet("color : white")
+            self.neutral_recovery_button.setEnabled(True)
+            self.neutral_recovery_button.setStyleSheet("color : white")
             self.MetricsConnector.sensorsconnected.setText(str(len(sensorList)))
             self.starttriggercheckbox.setEnabled(True)
             self.stoptriggercheckbox.setEnabled(True)
@@ -742,25 +759,21 @@ class CollectDataWindow(QWidget):
 
     # -----------------------------------------------------------------------
     # ---- Labeled protocol runner (with plot)
-    def protocol_callback(self):
-        if not self.CallbackConnector or not hasattr(self, "CallbackConnector"):
-            QMessageBox.critical(self, "Error", "CallbackConnector not ready. Connect and scan first.")
-            return
-
-        # Subject/session inputs are provided inline (no popups)
+    def _protocol_subject_session_arm(self) -> Tuple[str, str, str]:
         subject = self.subject_input.text().strip() or self.default_subject
         session = self.session_input.text().strip() or self.default_session
         arm = "right" if self.arm_right_radio.isChecked() else "left"
+        return subject, session, arm
 
-        # Defaults can be tweaked here
-        # (These could also be exposed via UI fields later)
-        config = TrialConfig(
+    def _build_standard_protocol_config(self, subject: str, session: str, arm: str) -> TrialConfig:
+        return TrialConfig(
             gestures=["left_turn", "right_turn", "neutral", "signal_left", "signal_right", "horn"],
-            gesture_duration=5.0,  # allow time for ramp contractions
+            gesture_duration=5.0,
             neutral_duration=5.0,
             repetitions=5,
             subject=subject.strip(),
             session=session.strip(),
+            protocol_name="standard",
             arm=arm,
             prep_duration=5.0,
             inter_gesture_rest_s=1.0,
@@ -773,9 +786,68 @@ class CollectDataWindow(QWidget):
             calibration_min_ratio=2.0,
         )
 
+    def _build_neutral_recovery_protocol_config(self, subject: str, session: str, arm: str) -> TrialConfig:
+        return TrialConfig(
+            gestures=["left_turn", "right_turn"],
+            gesture_duration=3.0,
+            neutral_duration=5.0,
+            repetitions=6,
+            subject=subject.strip(),
+            session=session.strip(),
+            protocol_name="neutral_recovery",
+            arm=arm,
+            prep_duration=5.0,
+            inter_gesture_rest_s=0.0,
+            label_trim_s=0.5,
+            rest_label_trim_s=None,
+            recovery_neutral_lead_trim_s=1.0,
+            recovery_neutral_trail_trim_s=0.0,
+            calibrate=True,
+            calibration_neutral_s=5.0,
+            calibration_mvc_s=5.0,
+            calibration_mvc_prep_s=2.0,
+            calibration_min_ratio=2.0,
+        )
+
+    def _protocol_output_path(self, config: TrialConfig) -> Path:
         raw_dir = strict_raw_dir(STRICT_DATA_ROOT, config.arm, config.subject)
         raw_dir.mkdir(parents=True, exist_ok=True)
-        output_path = raw_dir / f"{config.subject}_session{config.session}_raw.npz"
+        if config.protocol_name == "standard":
+            filename = f"{config.subject}_session{config.session}_raw.npz"
+        else:
+            filename = f"{config.subject}_session{config.session}_{config.protocol_name}_raw.npz"
+        return raw_dir / filename
+
+    def _total_instruction_steps(self, config: TrialConfig) -> int:
+        if config.protocol_name == "neutral_recovery":
+            return config.repetitions * len(config.gestures) * 2
+        return config.repetitions * len(config.gestures)
+
+    def protocol_callback(self):
+        if not self.CallbackConnector or not hasattr(self, "CallbackConnector"):
+            QMessageBox.critical(self, "Error", "CallbackConnector not ready. Connect and scan first.")
+            return
+
+        subject, session, arm = self._protocol_subject_session_arm()
+        config = self._build_standard_protocol_config(subject, session, arm)
+        output_path = self._protocol_output_path(config)
+
+        try:
+            self.run_protocol_with_plot(config, output_path)
+            QMessageBox.information(self, "Saved", f"Saved to {output_path}")
+            self.exportcsv_button.setEnabled(False)
+            self.exportcsv_button.setStyleSheet("color : gray")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def neutral_recovery_protocol_callback(self):
+        if not self.CallbackConnector or not hasattr(self, "CallbackConnector"):
+            QMessageBox.critical(self, "Error", "CallbackConnector not ready. Connect and scan first.")
+            return
+
+        subject, session, arm = self._protocol_subject_session_arm()
+        config = self._build_neutral_recovery_protocol_config(subject, session, arm)
+        output_path = self._protocol_output_path(config)
 
         try:
             self.run_protocol_with_plot(config, output_path)
@@ -820,12 +892,13 @@ class CollectDataWindow(QWidget):
         calib_neutral_x: List[List[float]] = []
         calib_mvc_ts: List[List[float]] = []
         calib_mvc_x: List[List[float]] = []
+        total_steps = self._total_instruction_steps(config)
 
         try:
             if config.prep_duration > 0:
                 events.append({"event": "prep_start", "t_wall": time.time(), "duration_s": config.prep_duration})
                 next_label = config.gestures[0] if config.gestures else None
-                self.update_instruction("Get ready", next_label, config.repetitions * len(config.gestures), config.prep_duration)
+                self.update_instruction("Get ready", next_label, total_steps, config.prep_duration)
                 self.run_prep_buffer(config.prep_duration)
 
             if config.calibrate and not self.protocol_abort:
@@ -833,7 +906,7 @@ class CollectDataWindow(QWidget):
                 self.update_instruction(
                     f"Calibration: neutral rest",
                     "max contraction",
-                    config.repetitions * len(config.gestures),
+                    total_steps,
                     config.calibration_neutral_s,
                 )
                 seg_ts, seg_x, _ = self.collect_segment_with_plot(
@@ -856,7 +929,7 @@ class CollectDataWindow(QWidget):
                     self.update_instruction(
                         "Prepare: SQUEEZE AS HARD AS POSSIBLE in...",
                         "max contraction",
-                        config.repetitions * len(config.gestures),
+                        total_steps,
                         config.calibration_mvc_prep_s,
                     )
                     self.run_prep_buffer(config.calibration_mvc_prep_s)
@@ -865,7 +938,7 @@ class CollectDataWindow(QWidget):
                 self.update_instruction(
                     "SQUEEZE AS HARD AS POSSIBLE — all arm/wrist muscles!",
                     config.gestures[0] if config.gestures else None,
-                    config.repetitions * len(config.gestures),
+                    total_steps,
                     config.calibration_mvc_s,
                 )
                 seg_ts, seg_x, _ = self.collect_segment_with_plot(
@@ -923,7 +996,7 @@ class CollectDataWindow(QWidget):
                         self.update_instruction(
                             f"WARNING: Weak calibration ({median_ratio:.1f}x). Squeeze much harder next session.",
                             config.gestures[0] if config.gestures else None,
-                            config.repetitions * len(config.gestures),
+                            total_steps,
                             0,
                         )
                         QMessageBox.warning(
@@ -942,7 +1015,7 @@ class CollectDataWindow(QWidget):
                         self.update_instruction(
                             f"Calibration OK ({median_ratio:.1f}x). Starting protocol...",
                             config.gestures[0] if config.gestures else None,
-                            config.repetitions * len(config.gestures),
+                            total_steps,
                             0,
                         )
                 if self.protocol_abort:
@@ -953,7 +1026,7 @@ class CollectDataWindow(QWidget):
                     self.update_instruction(
                         "Post-calibration rest: neutral buffer",
                         config.gestures[0] if config.gestures else None,
-                        config.repetitions * len(config.gestures),
+                        total_steps,
                         rest_duration,
                     )
                     events.append(
@@ -980,63 +1053,44 @@ class CollectDataWindow(QWidget):
                         events.append({"event": "session_abort", "t_wall": time.time()})
                         return
 
-            for rep in range(config.repetitions):
-                for idx, gesture in enumerate(config.gestures):
-                    if self.protocol_abort:
-                        break
-                    if idx + 1 < len(config.gestures):
-                        next_gesture = config.gestures[idx + 1]
-                    elif rep + 1 < config.repetitions:
-                        next_gesture = config.gestures[0]
-                    else:
-                        next_gesture = None
+            if config.protocol_name == "neutral_recovery":
+                for rep in range(config.repetitions):
+                    for idx, gesture in enumerate(config.gestures):
+                        if self.protocol_abort:
+                            break
+                        if idx + 1 < len(config.gestures):
+                            next_gesture = config.gestures[idx + 1]
+                        elif rep + 1 < config.repetitions:
+                            next_gesture = config.gestures[0]
+                        else:
+                            next_gesture = None
 
-                    duration = config.neutral_duration if gesture == "neutral" else config.gesture_duration
-                    reps_left = (config.repetitions - rep - 1) * len(config.gestures) + (len(config.gestures) - idx - 1)
-                    self.update_instruction(f"Do: {gesture}", next_gesture, reps_left, duration)
-                    events.append({"event": f"{gesture}_start", "t_wall": time.time(), "rep": rep + 1})
-                    seg_ts, seg_x, seg_labels = self.collect_segment_with_plot(
-                        self.CallbackConnector.DataHandler,
-                        gesture,
-                        duration,
-                        channel_count,
-                        plotter,
-                        emg_idx,
-                        label_trim_s=config.label_trim_s,
-                        stop_flag=self.protocol_abort_requested,
-                    )
-                    all_ts.extend(seg_ts)
-                    all_x.extend(seg_x)
-                    all_labels.extend(seg_labels)
-                    if self.protocol_abort:
-                        break
+                        segment_index = (rep * len(config.gestures) + idx) * 2
+                        gesture_reps_left = max(0, total_steps - segment_index - 1)
+                        recovery_reps_left = max(0, total_steps - segment_index - 2)
 
-                    if config.inter_gesture_rest_s > 0.0 and (
-                        idx + 1 < len(config.gestures) or rep + 1 < config.repetitions
-                    ):
-                        rest_duration = config.inter_gesture_rest_s
                         self.update_instruction(
-                            "Rest: neutral buffer",
-                            next_gesture,
-                            reps_left,
-                            rest_duration,
+                            f"Do: {gesture}",
+                            "neutral",
+                            gesture_reps_left,
+                            config.gesture_duration,
                         )
                         events.append(
                             {
-                                "event": "neutral_rest_start",
+                                "event": f"{gesture}_start",
                                 "t_wall": time.time(),
                                 "rep": rep + 1,
-                                "after": gesture,
+                                "protocol": config.protocol_name,
                             }
                         )
                         seg_ts, seg_x, seg_labels = self.collect_segment_with_plot(
                             self.CallbackConnector.DataHandler,
-                            "neutral_buffer",
-                            rest_duration,
+                            gesture,
+                            config.gesture_duration,
                             channel_count,
                             plotter,
                             emg_idx,
-                            label_trim_s=rest_trim_s or 0.0,
+                            label_trim_s=config.label_trim_s,
                             stop_flag=self.protocol_abort_requested,
                         )
                         all_ts.extend(seg_ts)
@@ -1045,8 +1099,107 @@ class CollectDataWindow(QWidget):
                         if self.protocol_abort:
                             break
 
-                if self.protocol_abort:
-                    break
+                        self.update_instruction(
+                            "Recover: neutral",
+                            next_gesture,
+                            recovery_reps_left,
+                            config.neutral_duration,
+                        )
+                        events.append(
+                            {
+                                "event": "neutral_recovery_start",
+                                "t_wall": time.time(),
+                                "rep": rep + 1,
+                                "after": gesture,
+                                "protocol": config.protocol_name,
+                            }
+                        )
+                        seg_ts, seg_x, seg_labels = self.collect_segment_with_plot(
+                            self.CallbackConnector.DataHandler,
+                            "neutral",
+                            config.neutral_duration,
+                            channel_count,
+                            plotter,
+                            emg_idx,
+                            label_trim_s=0.0,
+                            leading_label_trim_s=config.recovery_neutral_lead_trim_s,
+                            trailing_label_trim_s=config.recovery_neutral_trail_trim_s,
+                            stop_flag=self.protocol_abort_requested,
+                        )
+                        all_ts.extend(seg_ts)
+                        all_x.extend(seg_x)
+                        all_labels.extend(seg_labels)
+                        if self.protocol_abort:
+                            break
+
+                    if self.protocol_abort:
+                        break
+            else:
+                for rep in range(config.repetitions):
+                    for idx, gesture in enumerate(config.gestures):
+                        if self.protocol_abort:
+                            break
+                        if idx + 1 < len(config.gestures):
+                            next_gesture = config.gestures[idx + 1]
+                        elif rep + 1 < config.repetitions:
+                            next_gesture = config.gestures[0]
+                        else:
+                            next_gesture = None
+
+                        duration = config.neutral_duration if gesture == "neutral" else config.gesture_duration
+                        reps_left = (config.repetitions - rep - 1) * len(config.gestures) + (len(config.gestures) - idx - 1)
+                        self.update_instruction(f"Do: {gesture}", next_gesture, reps_left, duration)
+                        events.append({"event": f"{gesture}_start", "t_wall": time.time(), "rep": rep + 1})
+                        seg_ts, seg_x, seg_labels = self.collect_segment_with_plot(
+                            self.CallbackConnector.DataHandler,
+                            gesture,
+                            duration,
+                            channel_count,
+                            plotter,
+                            emg_idx,
+                            label_trim_s=config.label_trim_s,
+                            stop_flag=self.protocol_abort_requested,
+                        )
+                        all_ts.extend(seg_ts)
+                        all_x.extend(seg_x)
+                        all_labels.extend(seg_labels)
+                        if self.protocol_abort:
+                            break
+
+                        if config.inter_gesture_rest_s > 0.0 and (
+                            idx + 1 < len(config.gestures) or rep + 1 < config.repetitions
+                        ):
+                            rest_duration = config.inter_gesture_rest_s
+                            self.update_instruction(
+                                "Rest: neutral buffer",
+                                next_gesture,
+                                reps_left,
+                                rest_duration,
+                            )
+                            events.append(
+                                {
+                                    "event": "neutral_rest_start",
+                                    "t_wall": time.time(),
+                                    "rep": rep + 1,
+                                    "after": gesture,
+                                }
+                            )
+                            seg_ts, seg_x, seg_labels = self.collect_segment_with_plot(
+                                self.CallbackConnector.DataHandler,
+                                "neutral_buffer",
+                                rest_duration,
+                                channel_count,
+                                plotter,
+                                emg_idx,
+                                label_trim_s=rest_trim_s or 0.0,
+                                stop_flag=self.protocol_abort_requested,
+                            )
+                            all_ts.extend(seg_ts)
+                            all_x.extend(seg_x)
+                            all_labels.extend(seg_labels)
+                            if self.protocol_abort:
+                                break
+
             if self.protocol_abort:
                 events.append({"event": "session_abort", "t_wall": time.time()})
         finally:
@@ -1064,6 +1217,7 @@ class CollectDataWindow(QWidget):
             "subject": config.subject,
             "arm":     config.arm,
             "session": config.session,
+            "protocol_name": config.protocol_name,
             "data_root": str(STRICT_DATA_ROOT),
             "layout_mode": "strict",
             "gestures": config.gestures,
@@ -1079,6 +1233,12 @@ class CollectDataWindow(QWidget):
             "ramp_style": "ramp contractions (longer window for non-neutral gestures)",
             "emg_channel_labels": list(getattr(self.CallbackConnector.base, "emgChannelNames", [])),
         }
+        if config.protocol_name == "neutral_recovery":
+            metadata["neutral_recovery"] = {
+                "lead_trim_s": float(config.recovery_neutral_lead_trim_s),
+                "trail_trim_s": float(config.recovery_neutral_trail_trim_s),
+                "sequence": [f"{gesture}->neutral" for gesture in config.gestures],
+            }
         if config.calibrate:
             metadata["calibration"] = {
                 "enabled": True,
@@ -1123,6 +1283,8 @@ class CollectDataWindow(QWidget):
         plotter=None,
         emg_idx: Optional[List[int]] = None,
         label_trim_s: float = 0.0,
+        leading_label_trim_s: Optional[float] = None,
+        trailing_label_trim_s: Optional[float] = None,
         stop_flag=None,
     ) -> Tuple[List[List[float]], List[List[float]], List[Optional[str]]]:
         ts_buffer: List[List[float]] = []
@@ -1130,7 +1292,9 @@ class CollectDataWindow(QWidget):
         labels: List[Optional[str]] = []
         end_time = time.time() + duration_s
         segment_start_ts: Optional[float] = None
-        apply_trim = label_trim_s > 0.0 and duration_s > 2 * label_trim_s
+        lead_trim_s = label_trim_s if leading_label_trim_s is None else max(0.0, float(leading_label_trim_s))
+        trail_trim_s = label_trim_s if trailing_label_trim_s is None else max(0.0, float(trailing_label_trim_s))
+        apply_trim = (lead_trim_s > 0.0 or trail_trim_s > 0.0) and duration_s > (lead_trim_s + trail_trim_s)
 
         while time.time() < end_time:
             if stop_flag and stop_flag():
@@ -1169,7 +1333,7 @@ class CollectDataWindow(QWidget):
                     if segment_start_ts is None:
                         segment_start_ts = channel_times[0][idx]
                     elapsed = channel_times[0][idx] - segment_start_ts
-                    if elapsed < label_trim_s or elapsed > duration_s - label_trim_s:
+                    if elapsed < lead_trim_s or elapsed > duration_s - trail_trim_s:
                         sample_label = None
                 labels.append(sample_label)
 

@@ -25,12 +25,17 @@ from libemg import filtering as libemg_filter
 from emg.channel_layout import infer_channel_layout
 from emg.gesture_model_cnn import load_cnn_bundle, quick_finetune
 from emg.prototype_classifier import PrototypeClassifier
+from emg.runtime_tuning import get_runtime_tuning_preset
 from emg.strict_layout import (
     parse_pair_number as parse_strict_pair_number,
     resolve_strict_channel_indices,
     strict_channel_count_for_arm,
     strict_pair_numbers_for_arm,
 )
+
+RUNTIME_TUNING_PRESET = get_runtime_tuning_preset()
+RUNTIME_TUNING_PRESET_NAME = RUNTIME_TUNING_PRESET.name
+REALTIME_TUNING = RUNTIME_TUNING_PRESET.realtime
 
 
 # ======== Config (edit as needed) ========
@@ -44,26 +49,51 @@ REALTIME_RESAMPLE = True
 # Set to None to use model metadata when available.
 REALTIME_TARGET_FS_HZ = 2000.0
 
-SMOOTHING = 1
-MIN_CONFIDENCE = 0.80
-DUAL_ARM_AGREE_THRESHOLD  = 0.55
-DUAL_ARM_SINGLE_THRESHOLD = MIN_CONFIDENCE
+SMOOTHING = REALTIME_TUNING.smoothing
+MIN_CONFIDENCE = REALTIME_TUNING.min_confidence
+DUAL_ARM_AGREE_THRESHOLD = REALTIME_TUNING.dual_arm_agree_threshold
+DUAL_ARM_SINGLE_THRESHOLD = REALTIME_TUNING.resolved_dual_arm_single_threshold
 LOW_CONFIDENCE_LABEL = "neutral"
 
-OUTPUT_HYSTERESIS = False
-HYSTERESIS_ACTIVE_ENTER_THRESHOLD = 0.85
-HYSTERESIS_ACTIVE_EXIT_THRESHOLD = 0.60
-HYSTERESIS_ACTIVE_SWITCH_THRESHOLD = 0.88
-HYSTERESIS_NEUTRAL_ENTER_THRESHOLD = 0.75
-HYSTERESIS_ENTER_CONFIRM_FRAMES = 1
-HYSTERESIS_SWITCH_CONFIRM_FRAMES = 1
-HYSTERESIS_NEUTRAL_CONFIRM_FRAMES = 1
+OUTPUT_HYSTERESIS = REALTIME_TUNING.output_hysteresis
+HYSTERESIS_ACTIVE_ENTER_THRESHOLD = REALTIME_TUNING.hysteresis_active_enter_threshold
+HYSTERESIS_ACTIVE_EXIT_THRESHOLD = REALTIME_TUNING.hysteresis_active_exit_threshold
+HYSTERESIS_ACTIVE_SWITCH_THRESHOLD = REALTIME_TUNING.hysteresis_active_switch_threshold
+HYSTERESIS_NEUTRAL_ENTER_THRESHOLD = REALTIME_TUNING.hysteresis_neutral_enter_threshold
+HYSTERESIS_ENTER_CONFIRM_FRAMES = REALTIME_TUNING.hysteresis_enter_confirm_frames
+HYSTERESIS_SWITCH_CONFIRM_FRAMES = REALTIME_TUNING.hysteresis_switch_confirm_frames
+HYSTERESIS_NEUTRAL_CONFIRM_FRAMES = REALTIME_TUNING.hysteresis_neutral_confirm_frames
 
 
 @dataclass(frozen=True)
 class ArmGestureState:
     label: str = LOW_CONFIDENCE_LABEL
     confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class ArmPredictionTrace:
+    raw_top_label: str = LOW_CONFIDENCE_LABEL
+    raw_top_confidence: float = 0.0
+    second_label: str = ""
+    second_confidence: float = 0.0
+    margin: float = 0.0
+    gate_label: str = LOW_CONFIDENCE_LABEL
+    gate_confidence: float = 0.0
+    gate_reason: str = ""
+    hysteresis_label: str = LOW_CONFIDENCE_LABEL
+    hysteresis_confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class PredictionRanking:
+    top_idx: int = -1
+    top_label: str = LOW_CONFIDENCE_LABEL
+    top_confidence: float = 0.0
+    second_idx: int = -1
+    second_label: str = ""
+    second_confidence: float = 0.0
+    margin: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -89,6 +119,8 @@ class DualGestureState:
     right: ArmGestureState = field(default_factory=ArmGestureState)
     left: ArmGestureState = field(default_factory=ArmGestureState)
     combined: ArmGestureState = field(default_factory=ArmGestureState)
+    right_trace: ArmPredictionTrace = field(default_factory=ArmPredictionTrace)
+    left_trace: ArmPredictionTrace = field(default_factory=ArmPredictionTrace)
     published: PublishedGestureOutput = field(default_factory=PublishedGestureOutput)
     prediction_seq: int = 0
     window_end_ts: float = 0.0
@@ -111,6 +143,7 @@ class PredictionCSVLogger:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         self._file = out_path.open("w", newline="", encoding="utf-8")
         self._fieldnames = [
+            "runtime_preset",
             "prediction_seq",
             "window_end_ts",
             "prediction_ts",
@@ -119,8 +152,28 @@ class PredictionCSVLogger:
             "published_mode",
             "pred_label",
             "pred_conf",
+            "right_raw_top_label",
+            "right_raw_top_conf",
+            "right_second_label",
+            "right_second_conf",
+            "right_margin",
+            "right_gate_label",
+            "right_gate_conf",
+            "right_gate_reason",
+            "right_hysteresis_label",
+            "right_hysteresis_conf",
             "right_label",
             "right_conf",
+            "left_raw_top_label",
+            "left_raw_top_conf",
+            "left_second_label",
+            "left_second_conf",
+            "left_margin",
+            "left_gate_label",
+            "left_gate_conf",
+            "left_gate_reason",
+            "left_hysteresis_label",
+            "left_hysteresis_conf",
             "left_label",
             "left_conf",
             "published_labels",
@@ -131,6 +184,7 @@ class PredictionCSVLogger:
     def write_state(self, state: DualGestureState) -> None:
         published = state.published
         row = {
+            "runtime_preset": RUNTIME_TUNING_PRESET_NAME,
             "prediction_seq": int(getattr(published, "prediction_seq", 0)),
             "window_end_ts": float(getattr(published, "window_end_ts", 0.0)),
             "prediction_ts": float(getattr(published, "prediction_ts", 0.0)),
@@ -139,8 +193,28 @@ class PredictionCSVLogger:
             "published_mode": str(getattr(published, "mode", "")),
             "pred_label": str(state.combined.label),
             "pred_conf": float(state.combined.confidence),
+            "right_raw_top_label": str(state.right_trace.raw_top_label),
+            "right_raw_top_conf": float(state.right_trace.raw_top_confidence),
+            "right_second_label": str(state.right_trace.second_label),
+            "right_second_conf": float(state.right_trace.second_confidence),
+            "right_margin": float(state.right_trace.margin),
+            "right_gate_label": str(state.right_trace.gate_label),
+            "right_gate_conf": float(state.right_trace.gate_confidence),
+            "right_gate_reason": str(state.right_trace.gate_reason),
+            "right_hysteresis_label": str(state.right_trace.hysteresis_label),
+            "right_hysteresis_conf": float(state.right_trace.hysteresis_confidence),
             "right_label": str(state.right.label),
             "right_conf": float(state.right.confidence),
+            "left_raw_top_label": str(state.left_trace.raw_top_label),
+            "left_raw_top_conf": float(state.left_trace.raw_top_confidence),
+            "left_second_label": str(state.left_trace.second_label),
+            "left_second_conf": float(state.left_trace.second_confidence),
+            "left_margin": float(state.left_trace.margin),
+            "left_gate_label": str(state.left_trace.gate_label),
+            "left_gate_conf": float(state.left_trace.gate_confidence),
+            "left_gate_reason": str(state.left_trace.gate_reason),
+            "left_hysteresis_label": str(state.left_trace.hysteresis_label),
+            "left_hysteresis_conf": float(state.left_trace.hysteresis_confidence),
             "left_label": str(state.left.label),
             "left_conf": float(state.left.confidence),
             "published_labels": "|".join(
@@ -188,8 +262,8 @@ GESTURE_CALIB_PREP_S = 2.0   # countdown pause before each gesture
 USE_PROTOTYPE_CLASSIFIER = False
 PROTOTYPE_L2_NORMALIZE = True
 PROTOTYPE_TEMPERATURE = 0.20
-PROTOTYPE_REJECT_MIN_CONFIDENCE = 0.55
-PROTOTYPE_REJECT_MIN_MARGIN = 0.08
+PROTOTYPE_REJECT_MIN_CONFIDENCE = REALTIME_TUNING.prototype_reject_min_confidence
+PROTOTYPE_REJECT_MIN_MARGIN = REALTIME_TUNING.prototype_reject_min_margin
 
 # Optional runtime gesture filtering (code-only; no CLI flags).
 # Example (3-class mode):
@@ -626,6 +700,21 @@ def _published_output_to_dict(output: PublishedGestureOutput) -> dict[str, Any]:
     }
 
 
+def _prediction_trace_to_dict(trace: ArmPredictionTrace) -> dict[str, Any]:
+    return {
+        "raw_top_label": str(trace.raw_top_label),
+        "raw_top_confidence": float(trace.raw_top_confidence),
+        "second_label": str(trace.second_label),
+        "second_confidence": float(trace.second_confidence),
+        "margin": float(trace.margin),
+        "gate_label": str(trace.gate_label),
+        "gate_confidence": float(trace.gate_confidence),
+        "gate_reason": str(trace.gate_reason),
+        "hysteresis_label": str(trace.hysteresis_label),
+        "hysteresis_confidence": float(trace.hysteresis_confidence),
+    }
+
+
 def _write_latest_state_file(state: DualGestureState) -> None:
     if not PUBLISH_FILE_PATH:
         return
@@ -639,10 +728,12 @@ def _write_latest_state_file(state: DualGestureState) -> None:
         "right": {
             "label": str(state.right.label),
             "confidence": float(state.right.confidence),
+            "trace": _prediction_trace_to_dict(state.right_trace),
         },
         "left": {
             "label": str(state.left.label),
             "confidence": float(state.left.confidence),
+            "trace": _prediction_trace_to_dict(state.left_trace),
         },
         "combined": {
             "label": str(state.combined.label),
@@ -670,6 +761,8 @@ def set_latest_dual_state(
     right_confidence: float,
     left_label: str = LOW_CONFIDENCE_LABEL,
     left_confidence: float = 0.0,
+    right_trace: ArmPredictionTrace | None = None,
+    left_trace: ArmPredictionTrace | None = None,
     combined_label: str | None = None,
     combined_confidence: float | None = None,
     published: PublishedGestureOutput | None = None,
@@ -686,6 +779,20 @@ def set_latest_dual_state(
     mode_name = str(mode)
     right_state = ArmGestureState(str(right_label), float(right_confidence))
     left_state = ArmGestureState(str(left_label), float(left_confidence))
+    if right_trace is None:
+        right_trace = ArmPredictionTrace(
+            gate_label=right_state.label,
+            gate_confidence=right_state.confidence,
+            hysteresis_label=right_state.label,
+            hysteresis_confidence=right_state.confidence,
+        )
+    if left_trace is None:
+        left_trace = ArmPredictionTrace(
+            gate_label=left_state.label,
+            gate_confidence=left_state.confidence,
+            hysteresis_label=left_state.label,
+            hysteresis_confidence=left_state.confidence,
+        )
     if combined_label is None:
         combined_label = right_state.label if mode_name != "dual" else LOW_CONFIDENCE_LABEL
     if combined_confidence is None:
@@ -717,6 +824,8 @@ def set_latest_dual_state(
         right=right_state,
         left=left_state,
         combined=combined_state,
+        right_trace=right_trace,
+        left_trace=left_trace,
         published=published,
         prediction_seq=prediction_seq,
         window_end_ts=float(window_end_ts),
@@ -904,20 +1013,49 @@ def _restrict_probs(probs, allowed_indices):
     return filtered
 
 
-def _decode_prediction(probs, index_to_label):
-    """Decode probs with a single confidence gate."""
+def _rank_prediction_probs(probs, index_to_label):
     probs = np.asarray(probs, dtype=float).reshape(-1)
     if probs.size == 0:
-        return LOW_CONFIDENCE_LABEL, 0.0, -1
+        return PredictionRanking()
 
-    pred_idx = int(np.argmax(probs))
-    pred_label = index_to_label.get(pred_idx, LOW_CONFIDENCE_LABEL)
-    pred_conf = float(probs[pred_idx])
+    order = np.argsort(probs)[::-1]
+    top_idx = int(order[0])
+    top_label = index_to_label.get(top_idx, LOW_CONFIDENCE_LABEL)
+    top_conf = float(probs[top_idx])
+
+    if probs.size > 1:
+        second_idx = int(order[1])
+        second_label = index_to_label.get(second_idx, "")
+        second_conf = float(probs[second_idx])
+    else:
+        second_idx = -1
+        second_label = ""
+        second_conf = 0.0
+
+    return PredictionRanking(
+        top_idx=top_idx,
+        top_label=str(top_label),
+        top_confidence=top_conf,
+        second_idx=second_idx,
+        second_label=str(second_label),
+        second_confidence=second_conf,
+        margin=float(top_conf - second_conf),
+    )
+
+
+def _decode_prediction(probs, index_to_label):
+    """Decode probs with a single confidence gate."""
+    ranking = _rank_prediction_probs(probs, index_to_label)
+    pred_idx = int(ranking.top_idx)
+    pred_label = str(ranking.top_label)
+    pred_conf = float(ranking.top_confidence)
+    gate_reason = ""
 
     if pred_conf < float(MIN_CONFIDENCE):
         pred_label = LOW_CONFIDENCE_LABEL
+        gate_reason = "min_confidence"
 
-    return pred_label, pred_conf, pred_idx
+    return ranking, pred_label, pred_conf, pred_idx, gate_reason
 
 
 class _OutputHysteresis:
@@ -997,26 +1135,27 @@ class _OutputHysteresis:
         return self.current_label, self.current_conf
 
 
-def _apply_prototype_reject_gate(pred_label, pred_conf, pred_idx, probs):
-    """Reject ambiguous prototype decisions to neutral."""
-    probs = np.asarray(probs, dtype=float).reshape(-1)
-    if probs.size == 0:
-        return pred_label, pred_conf, pred_idx
-
-    top_conf = float(np.max(probs))
-    if probs.size > 1:
-        top_two = np.partition(probs, -2)[-2:]
-        second_conf = float(np.min(top_two))
-    else:
-        second_conf = 0.0
-    margin = top_conf - second_conf
+def _apply_softmax_reject_gate(pred_label, pred_conf, pred_idx, ranking):
+    """Reject ambiguous softmax decisions to neutral."""
+    if not REALTIME_TUNING.softmax_reject_enabled:
+        return pred_label, pred_conf, pred_idx, ""
 
     if (
-        top_conf < float(PROTOTYPE_REJECT_MIN_CONFIDENCE)
-        or margin < float(PROTOTYPE_REJECT_MIN_MARGIN)
+        float(ranking.top_confidence) < float(REALTIME_TUNING.softmax_reject_min_confidence)
+        or float(ranking.margin) < float(REALTIME_TUNING.softmax_reject_min_margin)
     ):
-        return LOW_CONFIDENCE_LABEL, top_conf, pred_idx
-    return pred_label, pred_conf, pred_idx
+        return LOW_CONFIDENCE_LABEL, float(ranking.top_confidence), pred_idx, "softmax_margin"
+    return pred_label, pred_conf, pred_idx, ""
+
+
+def _apply_prototype_reject_gate(pred_label, pred_conf, pred_idx, ranking):
+    """Reject ambiguous prototype decisions to neutral."""
+    if (
+        float(ranking.top_confidence) < float(PROTOTYPE_REJECT_MIN_CONFIDENCE)
+        or float(ranking.margin) < float(PROTOTYPE_REJECT_MIN_MARGIN)
+    ):
+        return LOW_CONFIDENCE_LABEL, float(ranking.top_confidence), pred_idx, "prototype_margin"
+    return pred_label, pred_conf, pred_idx, ""
 
 
 def _collect_samples(handler, duration_s, stream_channels, model_channels, poll_sleep):
@@ -1295,6 +1434,11 @@ def main(argv=None):
         if device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("Requested --device cuda, but CUDA is not available.")
     print('[gesture] device:', device)
+    print(
+        f"[gesture] runtime preset: {RUNTIME_TUNING_PRESET_NAME} "
+        f"(smoothing={SMOOTHING}, min_conf={MIN_CONFIDENCE:.2f}, "
+        f"hysteresis={OUTPUT_HYSTERESIS}, softmax_reject={REALTIME_TUNING.softmax_reject_enabled})"
+    )
 
     print("[gesture] right arm model:", model_right_path)
     bundle_right = load_cnn_bundle(model_right_path, device=device)
@@ -2000,6 +2144,8 @@ def main(argv=None):
     current_right_conf = 0.0
     current_left_label = LOW_CONFIDENCE_LABEL
     current_left_conf = 0.0
+    right_trace_state = ArmPredictionTrace()
+    left_trace_state = ArmPredictionTrace()
     # === LATENCY MEASURE START ===
     # Comment out this whole block (and other LATENCY blocks below) after measuring.
     # Measures end-to-end latency from "data available in this process" to prediction time.
@@ -2167,13 +2313,34 @@ def main(argv=None):
                 if SMOOTHING > 1:
                     probs = np.mean(np.stack(pred_history_right, axis=0), axis=0)
 
-                label_right, conf_right, _ = _decode_prediction(probs, index_to_label_right)
-                if use_prototype_classifier and prototype_right is not None:
-                    label_right, conf_right, _ = _apply_prototype_reject_gate(
-                        label_right, conf_right, -1, probs
-                    )
+                ranking_right, label_right, conf_right, pred_idx_right, gate_reason_right = _decode_prediction(
+                    probs, index_to_label_right
+                )
+                if label_right != LOW_CONFIDENCE_LABEL:
+                    if use_prototype_classifier and prototype_right is not None:
+                        label_right, conf_right, pred_idx_right, reject_reason = _apply_prototype_reject_gate(
+                            label_right, conf_right, pred_idx_right, ranking_right
+                        )
+                    else:
+                        label_right, conf_right, pred_idx_right, reject_reason = _apply_softmax_reject_gate(
+                            label_right, conf_right, pred_idx_right, ranking_right
+                        )
+                    if reject_reason:
+                        gate_reason_right = reject_reason
                 current_right_label, current_right_conf = output_hysteresis_right.update(
                     label_right, conf_right
+                )
+                right_trace_state = ArmPredictionTrace(
+                    raw_top_label=ranking_right.top_label,
+                    raw_top_confidence=ranking_right.top_confidence,
+                    second_label=ranking_right.second_label,
+                    second_confidence=ranking_right.second_confidence,
+                    margin=ranking_right.margin,
+                    gate_label=label_right,
+                    gate_confidence=conf_right,
+                    gate_reason=gate_reason_right,
+                    hysteresis_label=current_right_label,
+                    hysteresis_confidence=current_right_conf,
                 )
 
                 inference_ran = True
@@ -2221,13 +2388,34 @@ def main(argv=None):
                     if SMOOTHING > 1:
                         probs = np.mean(np.stack(pred_history_left, axis=0), axis=0)
 
-                    label_left, conf_left, _ = _decode_prediction(probs, index_to_label_left)
-                    if use_prototype_classifier and prototype_left is not None:
-                        label_left, conf_left, _ = _apply_prototype_reject_gate(
-                            label_left, conf_left, -1, probs
-                        )
+                    ranking_left, label_left, conf_left, pred_idx_left, gate_reason_left = _decode_prediction(
+                        probs, index_to_label_left
+                    )
+                    if label_left != LOW_CONFIDENCE_LABEL:
+                        if use_prototype_classifier and prototype_left is not None:
+                            label_left, conf_left, pred_idx_left, reject_reason = _apply_prototype_reject_gate(
+                                label_left, conf_left, pred_idx_left, ranking_left
+                            )
+                        else:
+                            label_left, conf_left, pred_idx_left, reject_reason = _apply_softmax_reject_gate(
+                                label_left, conf_left, pred_idx_left, ranking_left
+                            )
+                        if reject_reason:
+                            gate_reason_left = reject_reason
                     current_left_label, current_left_conf = output_hysteresis_left.update(
                         label_left, conf_left
+                    )
+                    left_trace_state = ArmPredictionTrace(
+                        raw_top_label=ranking_left.top_label,
+                        raw_top_confidence=ranking_left.top_confidence,
+                        second_label=ranking_left.second_label,
+                        second_confidence=ranking_left.second_confidence,
+                        margin=ranking_left.margin,
+                        gate_label=label_left,
+                        gate_confidence=conf_left,
+                        gate_reason=gate_reason_left,
+                        hysteresis_label=current_left_label,
+                        hysteresis_confidence=current_left_conf,
                     )
 
                     inference_ran = True
@@ -2264,6 +2452,8 @@ def main(argv=None):
                     right_confidence=current_right_conf,
                     left_label=current_left_label if dual_arm else LOW_CONFIDENCE_LABEL,
                     left_confidence=current_left_conf if dual_arm else 0.0,
+                    right_trace=right_trace_state,
+                    left_trace=left_trace_state if dual_arm else ArmPredictionTrace(),
                     combined_label=label,
                     combined_confidence=confidence,
                     published=published_output,
