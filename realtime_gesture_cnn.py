@@ -287,7 +287,7 @@ GESTURE_INSTRUCTIONS = {
 #   "right" - right arm only  (pair right arm sensors first in Delsys)
 #   "left"  - left arm only   (pair left arm sensors first in Delsys)
 #   "dual"  - both arms inferred separately (legacy accessor still exposes one combined label)
-MODE        = "left"
+MODE        = "dual"
 # Default to Matthew strict per-subject bundles. Override with CLI flags as needed.
 MODEL_RIGHT = os.path.join(
     BASE_DIR,
@@ -304,7 +304,7 @@ MODEL_LEFT = os.path.join(
     "strict",
     "per_subject",
     "left",
-    "Matthew_all_gesture_15.pt",
+    "Matthew_3_gesture_15.pt",
 )
 # ================================
 

@@ -148,6 +148,35 @@ def _now_stamp():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def _map_basename(map_name):
+    map_text = str(map_name or '').strip()
+    if not map_text:
+        return ''
+    return map_text.rsplit('/', 1)[-1].split('.')[0]
+
+
+def _resolve_world(client, requested_map=''):
+    requested = _map_basename(requested_map)
+    current_world = client.get_world()
+    if not requested:
+        return current_world
+
+    current_name = _map_basename(current_world.get_map().name)
+    if current_name == requested:
+        print(f"[carla] map already loaded: {current_name}")
+        return current_world
+
+    print(f"[carla] loading map: {requested} (current: {current_name})")
+    client.set_timeout(20.0)
+    try:
+        world = client.load_world(requested)
+    finally:
+        client.set_timeout(2.0)
+    loaded_name = _map_basename(world.get_map().name)
+    print(f"[carla] loaded map: {loaded_name}")
+    return world
+
+
 class DriveCSVLogger(object):
     def __init__(self, path):
         self.path = str(path)
@@ -394,6 +423,7 @@ class DualControl(object):
         self._latest_steer_dwell_required = 1
         self._latest_signal_state = "off"
         self._latest_horn_on = False
+        self._gesture_reverse_active = False
         self._latest_gesture_fresh = False
         self._last_lane_invasion_count = 0
         self._last_collision_count = 0
@@ -573,13 +603,13 @@ class DualControl(object):
         Returns:
             steer_key: "left", "right", "left_strong", "right_strong", or "neutral"
             signal_state: "left", "right", or "off"
-            horn_on: bool
+            reverse_requested: bool
         """
     
         labels = {str(left_label), str(right_label)}
     
-        # --- horn ---
-        horn_on = "horn" in labels
+        # --- reverse ---
+        reverse_requested = str(left_label) == "horn" and str(right_label) == "horn"
     
         # --- signal ---
         has_signal_left = "signal_left" in labels
@@ -611,7 +641,7 @@ class DualControl(object):
         else:
             steer_key = "neutral"
 
-        return steer_key, signal_state, horn_on
+        return steer_key, signal_state, reverse_requested
 
     def _reset_steer_dwell_candidate(self):
         self._pending_steer_key = None
@@ -652,12 +682,28 @@ class DualControl(object):
             self._latest_steer_dwell_pending_count = 0
         return applied_steer_key
 
+    def _apply_reverse_override(self, reverse_requested: bool):
+        if not isinstance(self._control, carla.VehicleControl):
+            return
+
+        reverse_requested = bool(reverse_requested)
+        if reverse_requested:
+            if self._control.gear >= 0:
+                self._control.gear = -1
+            self._gesture_reverse_active = True
+            return
+
+        if self._gesture_reverse_active and self._control.gear < 0:
+            self._control.gear = 1
+        self._gesture_reverse_active = False
+
     def _apply_gesture_override(self):
         if realtime_gesture is None:
             self._latest_gesture_fresh = False
             self._reset_steer_dwell_candidate()
             self._latest_steer_dwell_pending_key = ""
             self._latest_steer_dwell_pending_count = 0
+            self._apply_reverse_override(False)
             return
     
         # Read the new published dual-arm output from realtime_gesture_cnn.py
@@ -669,6 +715,7 @@ class DualControl(object):
             self._reset_steer_dwell_candidate()
             self._latest_steer_dwell_pending_key = ""
             self._latest_steer_dwell_pending_count = 0
+            self._apply_reverse_override(False)
             return
     
         left_label = "neutral"
@@ -719,12 +766,12 @@ class DualControl(object):
         self._latest_right_label = right_label
         self._latest_right_conf = right_conf
     
-        steer_key, signal_state, horn_on = self._resolve_dual_arm_actions(left_label, right_label)
+        steer_key, signal_state, reverse_requested = self._resolve_dual_arm_actions(left_label, right_label)
         self._latest_steer_key = steer_key
         applied_steer_key = self._apply_steer_dwell(steer_key)
         self._latest_applied_steer_key = applied_steer_key
         self._latest_signal_state = signal_state
-        self._latest_horn_on = bool(horn_on)
+        self._latest_horn_on = False
         self._latest_pred_label = "split" if getattr(published, "mode", "single") == "split" else (
             left_label if left_label == right_label else right_label
         )
@@ -737,10 +784,9 @@ class DualControl(object):
         # Apply turn signal
         if signal_state != self._signal_state:
             self._set_turn_signal(signal_state)
-    
-        # Apply horn
-        if horn_on:
-            self._honk()
+
+        # Reverse engages only when both arms collapse to horn.
+        self._apply_reverse_override(reverse_requested)
 
     def _estimate_lane_error_m(self, world):
         try:
@@ -1287,13 +1333,14 @@ def game_loop(args):
     try:
         client = carla.Client(args.host, args.port)
         client.set_timeout(2.0)
+        sim_world = _resolve_world(client, getattr(args, 'map', ''))
 
         display = pygame.display.set_mode(
             (args.width, args.height),
             pygame.HWSURFACE | pygame.DOUBLEBUF)
 
         hud = HUD(args.width, args.height)
-        world = World(client.get_world(), hud, args.filter)
+        world = World(sim_world, hud, args.filter)
         controller = DualControl(
             world,
             args.autopilot,
@@ -1361,6 +1408,11 @@ def main():
         metavar='PATTERN',
         default='vehicle.*',
         help='actor filter (default: "vehicle.*")')
+    argparser.add_argument(
+        '--map',
+        metavar='NAME',
+        default='',
+        help='Optional CARLA map name to load via client API before spawning the vehicle.')
     argparser.add_argument(
         '--graphics',
         choices=['low', 'normal'],

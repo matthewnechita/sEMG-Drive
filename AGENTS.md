@@ -7,8 +7,8 @@ Project context
 - Current CARLA launcher copies in use:
   - `carla_integration/run_manual_control_emg_0_9_16.bat`: existing low-load launcher path.
   - `carla_integration/start_clean_carla_server_0_9_16.bat`: existing server launcher path.
-  - `carla_integration/test_run_manual_control_emg_0_9_16.bat`: restored-display test copy with HUD shown and 30 FPS client cap.
-  - `carla_integration/test_start_carla_server_0_9_16.bat`: restored-display test server copy.
+  - `carla_integration/test_run_manual_control_emg_0_9_16.bat`: restored-display test copy with HUD shown, 30 FPS client cap, and client-side `--map Town02_Opt` loading.
+  - `carla_integration/test_start_carla_server_0_9_16.bat`: restored-display test server copy; its exe startup map argument is not the reliable control point on this install.
 - Do not change CARLA map defaults or optimize/swap maps unless the user explicitly requests a specific map name.
 - The collection GUI entrypoint is `python DelsysPythonGUI.py`; it uses `DataCollector/CollectDataWindow.py`.
 - Raw GUI strict collections are stored under `data_strict/<arm> arm/<subject>/raw/*.npz`.
@@ -104,13 +104,14 @@ Current status
 - As of `2026-03-16`, fresh strict recollection, retraining, and standalone realtime testing are working again with the fixed strict sensor placement workflow.
 - Left-arm, right-arm, and dual-arm realtime runs have all worked with fresh data and updated models when all required strict pairs are present.
 - The current checked-in realtime defaults are focused on 3-gesture strict testing:
-  - `MODE = "left"`
+  - `MODE = "dual"`
   - `INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"}`
-  - `MIN_CONFIDENCE = 0.80`
-  - `OUTPUT_HYSTERESIS = False`
-  - hysteresis confirm-frame counts are currently `1`
+  - active runtime preset = `flicker_mild_margin`
+  - current default per-arm bundles = `models/strict/per_subject/<arm>/Matthew_3_gesture_15.pt`
 - Observed issue during live testing: intermittent Delsys sensor presence/dropout has been seen before inference starts, especially right-arm pairs `2` and `9`; treat this as a hardware/connectivity issue first unless software evidence changes.
 - CARLA integration is running again through `manual_control_emg.py`; the restored-display test launchers are the safer path when checking visuals/HUD without touching the current low-load launchers.
+- Current CARLA test runs should rely on client-side map loading through `manual_control_emg.py --map Town02_Opt`; editing the server batch map alone has not been reliable on this local CARLA install.
+- Dual-arm CARLA reverse is now gesture-driven: both arms must publish `horn` at the same time to request reverse, and no horn action is emitted.
 - Next planned work for the next session is live tuning to reduce `neutral` flicker without making turn control too sticky or too weak.
 
 Realtime notes
@@ -123,9 +124,10 @@ Realtime notes
 - Published dual-arm output semantics:
   - If both arms agree, the published output is one gesture (`mode="single"`, arm `"dual"`).
   - If the arms differ, the published output is split (`mode="split"`) with separate left/right gestures.
-- `carla_integration/manual_control_emg.py` reads `get_latest_published_gestures()` and resolves split-or-single dual-arm outputs into CARLA steering/signal/horn actions.
+- `carla_integration/manual_control_emg.py` reads `get_latest_published_gestures()` and resolves split-or-single dual-arm outputs into CARLA steering/signal/reverse actions.
 - `realtime_gesture_cnn.py` can now emit per-prediction timing CSVs with `--prediction-log` for evaluation work.
 - The CARLA integration can now emit per-tick drive logs and forward realtime prediction logs for latency analysis.
+- `manual_control_emg.py` now supports `--map <name>` and uses `client.load_world(...)` before the vehicle/HUD are created.
 - The current realtime file defaults are still tuned for strict 3-gesture testing; check `MODE`, `INCLUDED_GESTURES`, smoothing, confidence thresholds, and `OUTPUT_HYSTERESIS` before a run.
 - `manual_control_emg.py` launches realtime internally; for CARLA testing do not start `realtime_gesture_cnn.py` separately unless explicitly debugging that interface boundary.
 - `realtime_confidence_analysis.py` still uses older pair-membership logic and is not the source of truth for strict-layout validation.

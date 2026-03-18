@@ -20,7 +20,7 @@ if not exist "%PYTHON_EXE%" (
 )
 
 pushd "%SRC_ROOT%"
-"%PYTHON_EXE%" carla_integration\manual_control_emg.py --host 127.0.0.1 --port 2000 --graphics %GRAPHICS_MODE% --client-fps 30 --res 1280x720 --show-hud %*
+"%PYTHON_EXE%" carla_integration\manual_control_emg.py --host 127.0.0.1 --port 2000 --graphics %GRAPHICS_MODE% --client-fps 30 --res 1280x720 --show-hud --map Town02_Opt %*
 set "CLIENT_EXIT=%ERRORLEVEL%"
 popd
 

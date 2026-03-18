@@ -3,7 +3,7 @@ setlocal
 
 set "CARLA_ROOT=%~dp0..\..\CARLA_0.9.16"
 set "CARLA_EXE=%CARLA_ROOT%\CarlaUE4.exe"
-set "MAP_NAME=Town03"
+set "MAP_NAME=Town02_Opt"
 set "QUALITY_LABEL=normal"
 set "QUALITY_ARG="
 

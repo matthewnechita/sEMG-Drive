@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 
 
 # Edit this one name to switch the active runtime tuning preset.
-ACTIVE_RUNTIME_TUNING_PRESET = "baseline"
+ACTIVE_RUNTIME_TUNING_PRESET = "flicker_mild_margin"
 
 
 @dataclass(frozen=True)
