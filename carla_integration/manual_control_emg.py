@@ -64,6 +64,7 @@ import re
 import weakref
 from pathlib import Path
 
+from carla_integration.scenario_presets import get_scenario_preset, scenario_choices
 from emg.runtime_tuning import get_runtime_tuning_preset
 
 if sys.version_info >= (3, 0):
@@ -224,6 +225,22 @@ class DriveCSVLogger(object):
             'lane_invasion_count_total',
             'collision_event',
             'collision_count_total',
+            'scenario_name',
+            'scenario_kind',
+            'scenario_status',
+            'scenario_started',
+            'scenario_finished',
+            'scenario_success',
+            'scenario_failure_reason',
+            'scenario_elapsed_s',
+            'scenario_completion_time_s',
+            'scenario_checkpoint_index',
+            'scenario_checkpoint_count',
+            'scenario_progress_m',
+            'scenario_lead_distance_m',
+            'scenario_lead_gap_m',
+            'scenario_current_lane_id',
+            'scenario_target_lane_id',
             'published_labels',
         ]
         self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames)
@@ -236,6 +253,471 @@ class DriveCSVLogger(object):
     def close(self):
         self._file.close()
 
+
+def _location_distance(a, b):
+    return math.sqrt(
+        (float(a.x) - float(b.x)) ** 2
+        + (float(a.y) - float(b.y)) ** 2
+        + (float(a.z) - float(b.z)) ** 2
+    )
+
+
+def _yaw_delta_deg(lhs, rhs):
+    delta = (float(lhs) - float(rhs) + 180.0) % 360.0 - 180.0
+    return abs(delta)
+
+
+class ScenarioRuntime(object):
+    def __init__(self, preset, traffic_manager):
+        self.preset = preset
+        self._traffic_manager = traffic_manager
+        self._actors = []
+        self._lead_vehicle = None
+        self._route_waypoints = []
+        self._route_progress_m = []
+        self._checkpoint_locations = []
+        self._start_location = None
+        self._finish_location = None
+        self._start_lane_id = None
+        self._start_road_id = None
+        self._status = "idle"
+        self._started = False
+        self._finished = False
+        self._success = False
+        self._failure_reason = ""
+        self._start_sim_time = None
+        self._finish_sim_time = None
+        self._completion_time_s = None
+        self._next_checkpoint_index = 0
+        self._last_progress_m = None
+        self._last_lead_distance_m = None
+        self._last_lead_gap_m = None
+        self._last_current_lane_id = None
+        self._last_sim_time = 0.0
+        self._should_exit = False
+
+    def get_ego_spawn_transform(self, carla_map):
+        spawn_points = list(carla_map.get_spawn_points())
+        if not spawn_points:
+            return carla.Transform()
+        index = int(self.preset.ego_spawn_index) % len(spawn_points)
+        selected = spawn_points[index]
+        return carla.Transform(
+            carla.Location(
+                x=float(selected.location.x),
+                y=float(selected.location.y),
+                z=float(selected.location.z) + 0.2,
+            ),
+            carla.Rotation(
+                pitch=float(selected.rotation.pitch),
+                yaw=float(selected.rotation.yaw),
+                roll=float(selected.rotation.roll),
+            ),
+        )
+
+    def _choose_next_waypoint(self, waypoint, step_m):
+        candidates = list(waypoint.next(float(step_m)))
+        if not candidates:
+            return None
+        current_yaw = float(waypoint.transform.rotation.yaw)
+
+        def _score(candidate):
+            yaw_penalty = _yaw_delta_deg(current_yaw, candidate.transform.rotation.yaw)
+            road_penalty = 0.0 if int(candidate.road_id) == int(waypoint.road_id) else 90.0
+            lane_penalty = abs(int(candidate.lane_id) - int(waypoint.lane_id)) * 10.0
+            return road_penalty + lane_penalty + yaw_penalty
+
+        return min(candidates, key=_score)
+
+    def _build_route(self, start_waypoint):
+        total_length = max(float(self.preset.route_length_m), float(self.preset.start_offset_m) + 20.0)
+        step_m = min(max(float(self.preset.checkpoint_spacing_m) * 0.5, 8.0), 15.0)
+        route_waypoints = [start_waypoint]
+        route_progress = [0.0]
+        current = start_waypoint
+        traveled = 0.0
+
+        while traveled < total_length:
+            nxt = self._choose_next_waypoint(current, step_m)
+            if nxt is None:
+                break
+            step_dist = _location_distance(current.transform.location, nxt.transform.location)
+            if step_dist <= 1e-3:
+                break
+            traveled += step_dist
+            route_waypoints.append(nxt)
+            route_progress.append(traveled)
+            current = nxt
+
+        return route_waypoints, route_progress
+
+    def _progress_to_location(self, target_progress_m):
+        if not self._route_progress_m:
+            return None
+        target = float(target_progress_m)
+        for idx, progress in enumerate(self._route_progress_m):
+            if progress >= target:
+                return self._route_waypoints[idx].transform.location
+        return self._route_waypoints[-1].transform.location
+
+    def _build_checkpoints(self):
+        checkpoints = []
+        next_progress = float(self.preset.start_offset_m)
+        route_end = float(self._route_progress_m[-1]) if self._route_progress_m else 0.0
+        spacing = max(10.0, float(self.preset.checkpoint_spacing_m))
+        while next_progress < route_end:
+            location = self._progress_to_location(next_progress)
+            if location is not None:
+                checkpoints.append(location)
+            next_progress += spacing
+        finish_location = self._progress_to_location(route_end)
+        if finish_location is not None and (
+            not checkpoints or _location_distance(checkpoints[-1], finish_location) > 1.0
+        ):
+            checkpoints.append(finish_location)
+        return checkpoints
+
+    def _project_progress_m(self, location):
+        if not self._route_waypoints:
+            return None
+        best_index = None
+        best_distance = None
+        for idx, waypoint in enumerate(self._route_waypoints):
+            dist = _location_distance(location, waypoint.transform.location)
+            if best_distance is None or dist < best_distance:
+                best_distance = dist
+                best_index = idx
+        if best_index is None:
+            return None
+        return float(self._route_progress_m[best_index])
+
+    def _advance_checkpoints(self, ego_location):
+        radius = float(self.preset.checkpoint_radius_m)
+        while self._next_checkpoint_index < len(self._checkpoint_locations):
+            checkpoint = self._checkpoint_locations[self._next_checkpoint_index]
+            if _location_distance(ego_location, checkpoint) > radius:
+                break
+            self._next_checkpoint_index += 1
+
+    def _spawn_lead_vehicle(self, world):
+        if not self._route_progress_m:
+            return
+        target_progress = min(
+            float(self.preset.lead_spawn_distance_m),
+            float(self._route_progress_m[-1]),
+        )
+        spawn_location = self._progress_to_location(target_progress)
+        if spawn_location is None:
+            return
+        waypoint = world.world.get_map().get_waypoint(
+            spawn_location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+        if waypoint is None:
+            return
+        transform = carla.Transform(
+            carla.Location(
+                x=float(waypoint.transform.location.x),
+                y=float(waypoint.transform.location.y),
+                z=float(waypoint.transform.location.z) + 0.2,
+            ),
+            carla.Rotation(
+                pitch=float(waypoint.transform.rotation.pitch),
+                yaw=float(waypoint.transform.rotation.yaw),
+                roll=float(waypoint.transform.rotation.roll),
+            ),
+        )
+        blueprint = world._resolve_blueprint(self.preset.lead_blueprint_id, 'vehicle.*')
+        blueprint.set_attribute('role_name', 'scenario_lead')
+        if blueprint.has_attribute('color'):
+            colors = list(blueprint.get_attribute('color').recommended_values)
+            if colors:
+                blueprint.set_attribute('color', colors[0])
+        actor = world.world.try_spawn_actor(blueprint, transform)
+        if actor is None:
+            return
+        self._lead_vehicle = actor
+        self._actors.append(actor)
+        if self._traffic_manager is None:
+            return
+        tm_port = int(self._traffic_manager.get_port())
+        actor.set_autopilot(True, tm_port)
+        try:
+            self._traffic_manager.auto_lane_change(actor, False)
+        except RuntimeError:
+            pass
+        try:
+            self._traffic_manager.distance_to_leading_vehicle(actor, 1.0)
+        except RuntimeError:
+            pass
+        try:
+            self._traffic_manager.vehicle_percentage_speed_difference(
+                actor,
+                float(self.preset.lead_speed_reduction_pct),
+            )
+        except RuntimeError:
+            pass
+
+    def destroy(self):
+        for actor in reversed(self._actors):
+            try:
+                if actor is not None and actor.is_alive:
+                    actor.destroy()
+            except RuntimeError:
+                pass
+        self._actors = []
+        self._lead_vehicle = None
+
+    def setup(self, world):
+        self.destroy()
+        self._route_waypoints = []
+        self._route_progress_m = []
+        self._checkpoint_locations = []
+        self._start_location = None
+        self._finish_location = None
+        self._status = "waiting_start"
+        self._started = False
+        self._finished = False
+        self._success = False
+        self._failure_reason = ""
+        self._start_sim_time = None
+        self._finish_sim_time = None
+        self._completion_time_s = None
+        self._next_checkpoint_index = 0
+        self._last_progress_m = None
+        self._last_lead_distance_m = None
+        self._last_lead_gap_m = None
+        self._last_current_lane_id = None
+        self._last_sim_time = 0.0
+        self._should_exit = False
+
+        start_waypoint = world.world.get_map().get_waypoint(
+            world.player.get_location(),
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+        if start_waypoint is None:
+            self._status = "setup_failed"
+            self._failure_reason = "no_start_waypoint"
+            return
+
+        self._start_lane_id = int(start_waypoint.lane_id)
+        self._start_road_id = int(start_waypoint.road_id)
+        self._route_waypoints, self._route_progress_m = self._build_route(start_waypoint)
+        self._checkpoint_locations = self._build_checkpoints()
+        if self._checkpoint_locations:
+            self._start_location = self._checkpoint_locations[0]
+            self._finish_location = self._checkpoint_locations[-1]
+        elif self._route_waypoints:
+            self._start_location = self._route_waypoints[0].transform.location
+            self._finish_location = self._route_waypoints[-1].transform.location
+        else:
+            self._status = "setup_failed"
+            self._failure_reason = "no_route_generated"
+            world.hud.notification("Scenario setup failed: no route", seconds=4.0)
+            print("[scenario] setup failed: no route generated")
+            return
+
+        if self.preset.kind == "overtake":
+            self._spawn_lead_vehicle(world)
+            if self._lead_vehicle is None:
+                self._status = "setup_failed"
+                self._failure_reason = "lead_vehicle_spawn_failed"
+                world.hud.notification("Scenario setup failed: no lead vehicle", seconds=4.0)
+                print("[scenario] setup failed: lead vehicle spawn failed")
+                return
+
+        checkpoint_count = len(self._checkpoint_locations)
+        world.hud.notification(
+            "Scenario: %s (%d checkpoints)" % (self.preset.name, checkpoint_count),
+            seconds=4.0,
+        )
+        print(
+            "[scenario] prepared %s on %s with %d checkpoints" % (
+                self.preset.name,
+                self.preset.map_name,
+                checkpoint_count,
+            )
+        )
+
+    def _finish(self, world, sim_time, success, reason=""):
+        if self._finished:
+            return
+        self._finished = True
+        self._success = bool(success)
+        self._failure_reason = str(reason or "")
+        self._finish_sim_time = float(sim_time)
+        self._completion_time_s = (
+            float(self._finish_sim_time - self._start_sim_time)
+            if self._start_sim_time is not None
+            else None
+        )
+        self._status = "success" if self._success else "failed"
+        self._should_exit = True
+        message = (
+            "%s complete" % self.preset.name
+            if self._success
+            else "%s failed: %s" % (self.preset.name, self._failure_reason or "unknown")
+        )
+        world.hud.notification(message, seconds=4.0)
+        print("[scenario] %s" % message)
+
+    def should_exit(self):
+        return bool(self._should_exit)
+
+    def tick(self, world):
+        if self._status == "setup_failed":
+            self._should_exit = True
+            return
+        if self._finished:
+            return
+
+        sim_time = float(getattr(world.hud, 'simulation_time', 0.0))
+        self._last_sim_time = float(sim_time)
+        ego_location = world.player.get_location()
+        ego_waypoint = world.world.get_map().get_waypoint(
+            ego_location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+        self._last_current_lane_id = int(ego_waypoint.lane_id) if ego_waypoint is not None else None
+        self._last_progress_m = self._project_progress_m(ego_location)
+
+        if not self._started:
+            if self._start_location is not None and _location_distance(ego_location, self._start_location) <= float(self.preset.checkpoint_radius_m):
+                self._started = True
+                self._status = "active"
+                self._start_sim_time = float(sim_time)
+                self._next_checkpoint_index = 1 if self._checkpoint_locations else 0
+                world.hud.notification("Scenario started", seconds=2.0)
+        else:
+            self._advance_checkpoints(ego_location)
+
+        if self._started and not self._finished and self._start_sim_time is not None:
+            elapsed = float(sim_time - self._start_sim_time)
+            if elapsed > float(self.preset.timeout_s):
+                self._finish(world, sim_time, False, "timeout")
+                return
+
+        if not self._started or self._finished:
+            return
+
+        if self.preset.kind == "lane_keep":
+            if self._checkpoint_locations and self._next_checkpoint_index >= len(self._checkpoint_locations):
+                self._finish(world, sim_time, True, "")
+            return
+
+        if self.preset.kind != "overtake":
+            return
+
+        if self._lead_vehicle is None or not self._lead_vehicle.is_alive:
+            self._finish(world, sim_time, False, "lead_vehicle_missing")
+            return
+
+        lead_location = self._lead_vehicle.get_location()
+        self._last_lead_distance_m = _location_distance(ego_location, lead_location)
+        lead_progress_m = self._project_progress_m(lead_location)
+        if self._last_progress_m is not None and lead_progress_m is not None:
+            self._last_lead_gap_m = float(lead_progress_m - self._last_progress_m)
+        else:
+            self._last_lead_gap_m = None
+
+        in_start_lane = True
+        if bool(self.preset.require_return_to_start_lane) and ego_waypoint is not None:
+            in_start_lane = (
+                int(ego_waypoint.road_id) == int(self._start_road_id)
+                and int(ego_waypoint.lane_id) == int(self._start_lane_id)
+            )
+
+        if (
+            self._last_progress_m is not None
+            and lead_progress_m is not None
+            and self._last_progress_m >= lead_progress_m + float(self.preset.overtake_finish_margin_m)
+            and in_start_lane
+        ):
+            self._finish(world, sim_time, True, "")
+
+    def snapshot(self):
+        elapsed_s = None
+        if self._started and self._start_sim_time is not None:
+            if self._finished and self._completion_time_s is not None:
+                elapsed_s = float(self._completion_time_s)
+            else:
+                elapsed_s = max(0.0, float(self._last_sim_time - self._start_sim_time))
+        checkpoint_count = len(self._checkpoint_locations)
+        checkpoint_index = min(self._next_checkpoint_index, checkpoint_count)
+        return {
+            "scenario_name": str(self.preset.name),
+            "scenario_kind": str(self.preset.kind),
+            "scenario_status": str(self._status),
+            "scenario_started": bool(self._started),
+            "scenario_finished": bool(self._finished),
+            "scenario_success": bool(self._success) if self._finished else None,
+            "scenario_failure_reason": str(self._failure_reason),
+            "scenario_elapsed_s": (
+                float(elapsed_s)
+                if elapsed_s is not None
+                else None
+            ),
+            "scenario_completion_time_s": (
+                float(self._completion_time_s)
+                if self._completion_time_s is not None
+                else None
+            ),
+            "scenario_checkpoint_index": int(checkpoint_index),
+            "scenario_checkpoint_count": int(checkpoint_count),
+            "scenario_progress_m": (
+                float(self._last_progress_m)
+                if self._last_progress_m is not None
+                else None
+            ),
+            "scenario_lead_distance_m": (
+                float(self._last_lead_distance_m)
+                if self._last_lead_distance_m is not None
+                else None
+            ),
+            "scenario_lead_gap_m": (
+                float(self._last_lead_gap_m)
+                if self._last_lead_gap_m is not None
+                else None
+            ),
+            "scenario_current_lane_id": (
+                int(self._last_current_lane_id)
+                if self._last_current_lane_id is not None
+                else None
+            ),
+            "scenario_target_lane_id": (
+                int(self._start_lane_id)
+                if self._start_lane_id is not None
+                else None
+            ),
+        }
+
+    def hud_lines(self, sim_time):
+        if not self.preset:
+            return []
+        lines = [
+            "Scenario: %s" % self.preset.name,
+            "Scenario status: %s" % self._status,
+        ]
+        if self._checkpoint_locations:
+            lines.append(
+                "Checkpoints: %d/%d" % (
+                    min(self._next_checkpoint_index, len(self._checkpoint_locations)),
+                    len(self._checkpoint_locations),
+                )
+            )
+        if self._started and self._start_sim_time is not None:
+            elapsed = (
+                float(self._completion_time_s)
+                if self._finished and self._completion_time_s is not None
+                else float(sim_time - self._start_sim_time)
+            )
+            lines.append("Scenario time: %.1fs" % max(0.0, elapsed))
+        if self._last_lead_distance_m is not None:
+            lines.append("Lead distance: %.1fm" % self._last_lead_distance_m)
+        return lines
 
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
@@ -272,7 +754,7 @@ def parse_resolution(value):
 
 
 class World(object):
-    def __init__(self, carla_world, hud, actor_filter):
+    def __init__(self, carla_world, hud, actor_filter, client=None, scenario_preset=None):
         self.world = carla_world
         self.hud = hud
         self.player = None
@@ -283,9 +765,30 @@ class World(object):
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
         self._actor_filter = actor_filter
+        self._client = client
+        self._traffic_manager = client.get_trafficmanager() if client is not None else None
+        self._scenario_preset = scenario_preset
+        self._scenario_runtime = ScenarioRuntime(scenario_preset, self._traffic_manager) if scenario_preset else None
+        self._scenario_exit_requested = False
         self._apply_runtime_world_settings()
         self.restart()
         self.world.on_tick(hud.on_world_tick)
+
+    def _resolve_blueprint(self, preferred_id='', fallback_filter='vehicle.*'):
+        library = self.world.get_blueprint_library()
+        blueprint = None
+        preferred_text = str(preferred_id or '').strip()
+        if preferred_text:
+            try:
+                blueprint = library.find(preferred_text)
+            except RuntimeError:
+                blueprint = None
+        if blueprint is None:
+            candidates = list(library.filter(str(fallback_filter or self._actor_filter)))
+            if not candidates:
+                raise RuntimeError('no matching CARLA vehicle blueprints found')
+            blueprint = random.choice(candidates)
+        return blueprint
 
     def _apply_runtime_world_settings(self):
         if not LOW_GRAPHICS_MODE:
@@ -302,23 +805,24 @@ class World(object):
         # Keep same camera config if the camera manager exists.
         cam_index = self.camera_manager.index if self.camera_manager is not None else 0
         cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
-        # Get a random blueprint.
-        blueprint = random.choice(self.world.get_blueprint_library().filter(self._actor_filter))
+        self._scenario_exit_requested = False
+        if self.player is not None:
+            self.destroy()
+        if self._scenario_preset is not None:
+            blueprint = self._resolve_blueprint(self._scenario_preset.ego_blueprint_id, self._actor_filter)
+        else:
+            blueprint = self._resolve_blueprint('', self._actor_filter)
         blueprint.set_attribute('role_name', 'hero')
         if blueprint.has_attribute('color'):
-            color = random.choice(blueprint.get_attribute('color').recommended_values)
-            blueprint.set_attribute('color', color)
-        # Spawn the player.
-        if self.player is not None:
-            spawn_point = self.player.get_transform()
-            spawn_point.location.z += 2.0
-            spawn_point.rotation.roll = 0.0
-            spawn_point.rotation.pitch = 0.0
-            self.destroy()
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+            colors = list(blueprint.get_attribute('color').recommended_values)
+            if colors:
+                blueprint.set_attribute('color', colors[0] if self._scenario_preset is not None else random.choice(colors))
         while self.player is None:
-            spawn_points = self.world.get_map().get_spawn_points()
-            spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
+            if self._scenario_runtime is not None:
+                spawn_point = self._scenario_runtime.get_ego_spawn_transform(self.world.get_map())
+            else:
+                spawn_points = self.world.get_map().get_spawn_points()
+                spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
         # Set up the sensors.
         self.collision_sensor = CollisionSensor(self.player, self.hud)
@@ -329,6 +833,8 @@ class World(object):
         self.camera_manager.set_sensor(cam_index, notify=False)
         actor_type = get_actor_display_name(self.player)
         self.hud.notification(actor_type)
+        if self._scenario_runtime is not None:
+            self._scenario_runtime.setup(self)
 
     def next_weather(self, reverse=False):
         self._weather_index += -1 if reverse else 1
@@ -338,24 +844,43 @@ class World(object):
         self.player.get_world().set_weather(preset[0])
 
     def tick(self, clock):
+        if self._scenario_runtime is not None:
+            self._scenario_runtime.tick(self)
+            self._scenario_exit_requested = self._scenario_runtime.should_exit()
         self.hud.tick(self, clock)
 
     def render(self, display):
         self.camera_manager.render(display)
         self.hud.render(display)
 
+    def get_scenario_snapshot(self):
+        if self._scenario_runtime is None:
+            return {}
+        return self._scenario_runtime.snapshot()
+
+    def get_scenario_hud_lines(self):
+        if self._scenario_runtime is None:
+            return []
+        return self._scenario_runtime.hud_lines(getattr(self.hud, 'simulation_time', 0.0))
+
+    def scenario_exit_requested(self):
+        return bool(self._scenario_exit_requested)
+
     def destroy(self):
+        if self._scenario_runtime is not None:
+            self._scenario_runtime.destroy()
         sensors = [
-            self.camera_manager.sensor,
-            self.collision_sensor.sensor,
-            self.lane_invasion_sensor.sensor,
-            self.gnss_sensor.sensor]
+            self.camera_manager.sensor if self.camera_manager is not None else None,
+            self.collision_sensor.sensor if self.collision_sensor is not None else None,
+            self.lane_invasion_sensor.sensor if self.lane_invasion_sensor is not None else None,
+            self.gnss_sensor.sensor if self.gnss_sensor is not None else None]
         for sensor in sensors:
             if sensor is not None:
                 sensor.stop()
                 sensor.destroy()
         if self.player is not None:
             self.player.destroy()
+            self.player = None
 
 # ==============================================================================
 # -- DualControl -----------------------------------------------------------
@@ -449,6 +974,9 @@ class DualControl(object):
             f"active_dwell={self._active_steer_dwell_frames}, "
             f"neutral_dwell={self._neutral_steer_dwell_frames})"
         )
+        scenario_name = getattr(getattr(world, "_scenario_preset", None), "name", "")
+        if scenario_name:
+            print(f"[scenario] active scenario: {scenario_name}")
         
         # Track signals so they behave like a real car (stay on until changed/canceled)
         self._signal_state = "off"  # "off" | "left" | "right"
@@ -837,6 +1365,7 @@ class DualControl(object):
             self._latest_pred_conf = max(self._latest_left_conf, self._latest_right_conf)
 
         apply_ts = time.time()
+        scenario = world.get_scenario_snapshot()
         row = {
             'runtime_preset': RUNTIME_TUNING_PRESET_NAME,
             'timestamp': datetime.datetime.now().isoformat(),
@@ -878,6 +1407,22 @@ class DualControl(object):
             'lane_invasion_count_total': lane_invasion_count,
             'collision_event': bool(collision_event),
             'collision_count_total': collision_count,
+            'scenario_name': str(scenario.get('scenario_name', '')),
+            'scenario_kind': str(scenario.get('scenario_kind', '')),
+            'scenario_status': str(scenario.get('scenario_status', '')),
+            'scenario_started': scenario.get('scenario_started', ''),
+            'scenario_finished': scenario.get('scenario_finished', ''),
+            'scenario_success': scenario.get('scenario_success', ''),
+            'scenario_failure_reason': str(scenario.get('scenario_failure_reason', '')),
+            'scenario_elapsed_s': scenario.get('scenario_elapsed_s', ''),
+            'scenario_completion_time_s': scenario.get('scenario_completion_time_s', ''),
+            'scenario_checkpoint_index': scenario.get('scenario_checkpoint_index', ''),
+            'scenario_checkpoint_count': scenario.get('scenario_checkpoint_count', ''),
+            'scenario_progress_m': scenario.get('scenario_progress_m', ''),
+            'scenario_lead_distance_m': scenario.get('scenario_lead_distance_m', ''),
+            'scenario_lead_gap_m': scenario.get('scenario_lead_gap_m', ''),
+            'scenario_current_lane_id': scenario.get('scenario_current_lane_id', ''),
+            'scenario_target_lane_id': scenario.get('scenario_target_lane_id', ''),
             'published_labels': published_labels,
         }
         self._drive_logger.write_row(row)
@@ -997,6 +1542,10 @@ class HUD(object):
             collision,
             '',
             'Number of vehicles: % 8d' % len(vehicles)]
+        scenario_lines = world.get_scenario_hud_lines()
+        if scenario_lines:
+            self._info_text += ['']
+            self._info_text += scenario_lines
         if len(vehicles) > 1:
             self._info_text += ['Nearby vehicles:']
             distance = lambda l: math.sqrt((l.x - t.location.x)**2 + (l.y - t.location.y)**2 + (l.z - t.location.z)**2)
@@ -1340,7 +1889,13 @@ def game_loop(args):
             pygame.HWSURFACE | pygame.DOUBLEBUF)
 
         hud = HUD(args.width, args.height)
-        world = World(sim_world, hud, args.filter)
+        world = World(
+            sim_world,
+            hud,
+            args.filter,
+            client=client,
+            scenario_preset=getattr(args, 'scenario_preset', None),
+        )
         controller = DualControl(
             world,
             args.autopilot,
@@ -1359,6 +1914,9 @@ def game_loop(args):
             world.tick(clock)
             world.render(display)
             pygame.display.flip()
+            if world.scenario_exit_requested():
+                time.sleep(1.0)
+                return
 
     finally:
         if controller is not None:
@@ -1413,6 +1971,11 @@ def main():
         metavar='NAME',
         default='',
         help='Optional CARLA map name to load via client API before spawning the vehicle.')
+    argparser.add_argument(
+        '--scenario',
+        choices=scenario_choices(),
+        default='',
+        help='Optional named CARLA evaluation scenario.')
     argparser.add_argument(
         '--graphics',
         choices=['low', 'normal'],
@@ -1486,6 +2049,17 @@ def main():
     eval_log_dir = str(getattr(args, 'eval_log_dir', '') or '').strip()
     carla_log = str(getattr(args, 'carla_log', '') or '').strip()
     realtime_log = str(getattr(args, 'realtime_log', '') or '').strip()
+    scenario_preset = get_scenario_preset(getattr(args, 'scenario', ''))
+    args.scenario_preset = scenario_preset
+    if scenario_preset is not None:
+        if args.map and _map_basename(args.map) != _map_basename(scenario_preset.map_name):
+            print(
+                "[scenario] overriding requested map %s with scenario map %s" % (
+                    args.map,
+                    scenario_preset.map_name,
+                )
+            )
+        args.map = scenario_preset.map_name
     if eval_log_dir:
         eval_dir = Path(eval_log_dir)
         eval_dir.mkdir(parents=True, exist_ok=True)

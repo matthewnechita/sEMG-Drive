@@ -27,6 +27,17 @@ def _to_bool(value):
     return text in {"1", "true", "yes", "y"}
 
 
+def _last_nonempty(rows, column):
+    for row in reversed(rows):
+        value = row.get(column)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
 def _summary_lane_error(rows):
     vals = [_to_float(row.get("lane_error_m")) for row in rows]
     vals = [v for v in vals if v is not None]
@@ -48,6 +59,27 @@ def _completion_time_s(rows):
     wall_vals = [v for v in wall_vals if v is not None]
     if wall_vals:
         return float(max(wall_vals) - min(wall_vals))
+    return None
+
+
+def _scenario_completion_time_s(rows):
+    vals = [_to_float(row.get("scenario_completion_time_s")) for row in rows]
+    vals = [v for v in vals if v is not None]
+    if vals:
+        return float(vals[-1])
+    vals = [_to_float(row.get("scenario_elapsed_s")) for row in rows if _to_bool(row.get("scenario_finished"))]
+    vals = [v for v in vals if v is not None]
+    if vals:
+        return float(vals[-1])
+    return None
+
+
+def _scenario_success(rows):
+    for row in reversed(rows):
+        value = row.get("scenario_success")
+        if value in (None, ""):
+            continue
+        return bool(_to_bool(value))
     return None
 
 
@@ -81,13 +113,18 @@ def _command_success_rate(rows):
 
 def summarize_rows(rows):
     lane = _summary_lane_error(rows)
+    scenario_name = _last_nonempty(rows, "scenario_name")
+    scenario_completion_s = _scenario_completion_time_s(rows) if scenario_name else None
     return {
         "rows": len(rows),
+        "scenario_name": scenario_name,
+        "scenario_kind": _last_nonempty(rows, "scenario_kind"),
+        "scenario_status": _last_nonempty(rows, "scenario_status"),
+        "scenario_success": _scenario_success(rows),
         "lane_error_mean_m": lane["mean_m"],
         "lane_error_rmse_m": lane["rmse_m"],
         "lane_invasions": _event_count(rows, "lane_invasion_event", "lane_invasion"),
-        "collisions": _event_count(rows, "collision_event", "collision"),
-        "completion_time_s": _completion_time_s(rows),
+        "completion_time_s": scenario_completion_s if scenario_completion_s is not None else _completion_time_s(rows),
         "steering_smoothness": _steering_smoothness(rows),
         "command_success_rate": _command_success_rate(rows),
     }

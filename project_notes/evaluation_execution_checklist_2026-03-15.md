@@ -92,7 +92,6 @@ Mark this bundle complete only if the row has the applicable system-level result
 - average lane keeping error
 - lane keeping RMSE
 - lane invasions
-- collisions
 - completion time
 - steering smoothness
 - command success rate
@@ -105,7 +104,6 @@ Mark this bundle complete only if the row includes the subset of prior-paper-com
 - classification-performance metrics that can be compared fairly
 - driving or control outcome metrics
 - lane-keeping-related metrics
-- collisions or error events
 - completion time or task-performance summaries
 - steering or control-response summaries
 
@@ -181,7 +179,6 @@ These are the main metrics that should feed both the capstone report and the res
 - average lane keeping error
 - lane keeping RMSE
 - lane invasions
-- collisions
 - completion time
 - steering smoothness
 - command success rate
@@ -202,7 +199,6 @@ Use the previous paper for comparison where applicable, excluding eye-tracker-re
 - classification performance metrics that can be compared fairly
 - driving-control outcome metrics
 - lane-keeping-related metrics
-- collisions or error events
 - completion time or task-performance summaries
 - steering or control-response summaries
 
@@ -393,7 +389,6 @@ Collect system-level driving or control metrics that support both the roadmap re
 - [ ] Average lane keeping error
 - [ ] Lane keeping RMSE
 - [ ] Lane invasions
-- [ ] Collisions
 - [ ] Completion time
 - [ ] Steering smoothness
 - [ ] Command success rate

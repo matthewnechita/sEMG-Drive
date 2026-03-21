@@ -824,7 +824,6 @@ It also reports per-label end-to-end latency summaries.
 - mean lane error
 - lane error RMSE
 - lane invasions
-- collisions
 - completion time
 - steering smoothness
 - command success rate
