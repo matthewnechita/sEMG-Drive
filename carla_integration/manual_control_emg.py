@@ -143,6 +143,11 @@ CAMERA_IMAGE_HEIGHT = 360
 CAMERA_SENSOR_TICK_S = 1.0 / DEFAULT_CAMERA_FPS
 DEFAULT_HUD_VISIBLE = False
 HUD_VISIBLE_BY_DEFAULT = DEFAULT_HUD_VISIBLE
+CONTROL_POLICY_NAME = "split_strength_latched_aux_v1"
+SIGNAL_TOGGLE_TIMEOUT_S = 6.0
+SIGNAL_TOGGLE_COOLDOWN_S = 0.75
+REVERSE_TOGGLE_COOLDOWN_S = 1.0
+REVERSE_TOGGLE_MAX_SPEED_MPS = 0.75
 
 
 def _now_stamp():
@@ -186,6 +191,7 @@ class DriveCSVLogger(object):
         self._file = out_path.open('w', newline='', encoding='utf-8')
         self._fieldnames = [
             'runtime_preset',
+            'control_policy',
             'timestamp',
             'wall_time_s',
             'control_apply_ts',
@@ -237,6 +243,8 @@ class DriveCSVLogger(object):
             'scenario_checkpoint_index',
             'scenario_checkpoint_count',
             'scenario_progress_m',
+            'scenario_objective_met',
+            'scenario_next_checkpoint_distance_m',
             'scenario_lead_distance_m',
             'scenario_lead_gap_m',
             'scenario_current_lane_id',
@@ -259,6 +267,14 @@ def _location_distance(a, b):
         (float(a.x) - float(b.x)) ** 2
         + (float(a.y) - float(b.y)) ** 2
         + (float(a.z) - float(b.z)) ** 2
+    )
+
+
+def _shift_location(location, z=0.0):
+    return carla.Location(
+        x=float(location.x),
+        y=float(location.y),
+        z=float(location.z) + float(z),
     )
 
 
@@ -290,6 +306,8 @@ class ScenarioRuntime(object):
         self._completion_time_s = None
         self._next_checkpoint_index = 0
         self._last_progress_m = None
+        self._overtake_objective_met = False
+        self._last_next_checkpoint_distance_m = None
         self._last_lead_distance_m = None
         self._last_lead_gap_m = None
         self._last_current_lane_id = None
@@ -330,7 +348,13 @@ class ScenarioRuntime(object):
         return min(candidates, key=_score)
 
     def _build_route(self, start_waypoint):
-        total_length = max(float(self.preset.route_length_m), float(self.preset.start_offset_m) + 20.0)
+        explicit_progress = [float(x) for x in getattr(self.preset, 'checkpoint_progress_m', ()) if x is not None]
+        total_length = max(
+            float(self.preset.route_length_m),
+            float(self.preset.start_offset_m) + 20.0,
+            max(explicit_progress) if explicit_progress else 0.0,
+            float(self.preset.lead_spawn_distance_m) + 25.0,
+        )
         step_m = min(max(float(self.preset.checkpoint_spacing_m) * 0.5, 8.0), 15.0)
         route_waypoints = [start_waypoint]
         route_progress = [0.0]
@@ -360,7 +384,38 @@ class ScenarioRuntime(object):
                 return self._route_waypoints[idx].transform.location
         return self._route_waypoints[-1].transform.location
 
+    def _locations_from_explicit_checkpoints(self):
+        checkpoints = []
+        explicit_locations = list(getattr(self.preset, 'checkpoint_locations_xyz', ()) or ())
+        for xyz in explicit_locations:
+            if xyz is None or len(xyz) != 3:
+                continue
+            checkpoints.append(
+                carla.Location(
+                    x=float(xyz[0]),
+                    y=float(xyz[1]),
+                    z=float(xyz[2]),
+                )
+            )
+        return checkpoints
+
     def _build_checkpoints(self):
+        explicit_locations = self._locations_from_explicit_checkpoints()
+        if explicit_locations:
+            return explicit_locations
+
+        explicit_progress = [float(x) for x in getattr(self.preset, 'checkpoint_progress_m', ()) if x is not None]
+        if explicit_progress:
+            checkpoints = []
+            for progress in explicit_progress:
+                location = self._progress_to_location(progress)
+                if location is None:
+                    continue
+                if checkpoints and _location_distance(checkpoints[-1], location) <= 1.0:
+                    continue
+                checkpoints.append(location)
+            return checkpoints
+
         checkpoints = []
         next_progress = float(self.preset.start_offset_m)
         route_end = float(self._route_progress_m[-1]) if self._route_progress_m else 0.0
@@ -391,6 +446,12 @@ class ScenarioRuntime(object):
             return None
         return float(self._route_progress_m[best_index])
 
+    def _distance_to_next_checkpoint(self, ego_location):
+        if self._next_checkpoint_index >= len(self._checkpoint_locations):
+            return None
+        checkpoint = self._checkpoint_locations[self._next_checkpoint_index]
+        return float(_location_distance(ego_location, checkpoint))
+
     def _advance_checkpoints(self, ego_location):
         radius = float(self.preset.checkpoint_radius_m)
         while self._next_checkpoint_index < len(self._checkpoint_locations):
@@ -398,6 +459,56 @@ class ScenarioRuntime(object):
             if _location_distance(ego_location, checkpoint) > radius:
                 break
             self._next_checkpoint_index += 1
+
+    def _draw_checkpoint_markers(self, world):
+        if not self._checkpoint_locations or not bool(getattr(self.preset, 'draw_debug_markers', True)):
+            return
+        debug = getattr(world.world, 'debug', None)
+        if debug is None:
+            return
+
+        lifetime = max(0.2, 1.0 / max(1.0, float(CLIENT_FPS_LIMIT)) * 2.5)
+        route_color = carla.Color(100, 100, 255)
+        completed_color = carla.Color(60, 220, 60)
+        next_color = carla.Color(255, 220, 0)
+        future_color = carla.Color(80, 160, 255)
+        finish_color = carla.Color(255, 80, 80)
+        start_color = carla.Color(60, 255, 255)
+
+        for idx, checkpoint in enumerate(self._checkpoint_locations):
+            if idx < self._next_checkpoint_index:
+                color = completed_color
+            elif idx == self._next_checkpoint_index and not self._finished:
+                color = next_color
+            elif idx == len(self._checkpoint_locations) - 1:
+                color = finish_color
+            elif idx == 0 and not self._started:
+                color = start_color
+            else:
+                color = future_color
+
+            point_location = _shift_location(checkpoint, z=1.2)
+            text_location = _shift_location(checkpoint, z=2.2)
+            if idx == 0:
+                label = "START"
+            elif idx == len(self._checkpoint_locations) - 1:
+                label = "FINISH"
+            else:
+                label = "CP %d" % idx
+
+            size = 0.35 if idx == self._next_checkpoint_index and not self._finished else 0.22
+            debug.draw_point(point_location, size, color, lifetime, False)
+            debug.draw_string(text_location, label, False, color, lifetime, False)
+
+            if idx + 1 < len(self._checkpoint_locations):
+                debug.draw_line(
+                    _shift_location(checkpoint, z=0.8),
+                    _shift_location(self._checkpoint_locations[idx + 1], z=0.8),
+                    0.10,
+                    route_color,
+                    lifetime,
+                    False,
+                )
 
     def _spawn_lead_vehicle(self, world):
         if not self._route_progress_m:
@@ -486,6 +597,8 @@ class ScenarioRuntime(object):
         self._completion_time_s = None
         self._next_checkpoint_index = 0
         self._last_progress_m = None
+        self._overtake_objective_met = False
+        self._last_next_checkpoint_distance_m = None
         self._last_lead_distance_m = None
         self._last_lead_gap_m = None
         self._last_current_lane_id = None
@@ -540,6 +653,7 @@ class ScenarioRuntime(object):
                 checkpoint_count,
             )
         )
+        self._draw_checkpoint_markers(world)
 
     def _finish(self, world, sim_time, success, reason=""):
         if self._finished:
@@ -562,6 +676,7 @@ class ScenarioRuntime(object):
         )
         world.hud.notification(message, seconds=4.0)
         print("[scenario] %s" % message)
+        self._draw_checkpoint_markers(world)
 
     def should_exit(self):
         return bool(self._should_exit)
@@ -571,6 +686,7 @@ class ScenarioRuntime(object):
             self._should_exit = True
             return
         if self._finished:
+            self._draw_checkpoint_markers(world)
             return
 
         sim_time = float(getattr(world.hud, 'simulation_time', 0.0))
@@ -583,6 +699,8 @@ class ScenarioRuntime(object):
         )
         self._last_current_lane_id = int(ego_waypoint.lane_id) if ego_waypoint is not None else None
         self._last_progress_m = self._project_progress_m(ego_location)
+        self._last_next_checkpoint_distance_m = self._distance_to_next_checkpoint(ego_location)
+        self._draw_checkpoint_markers(world)
 
         if not self._started:
             if self._start_location is not None and _location_distance(ego_location, self._start_location) <= float(self.preset.checkpoint_radius_m):
@@ -590,9 +708,11 @@ class ScenarioRuntime(object):
                 self._status = "active"
                 self._start_sim_time = float(sim_time)
                 self._next_checkpoint_index = 1 if self._checkpoint_locations else 0
+                self._last_next_checkpoint_distance_m = self._distance_to_next_checkpoint(ego_location)
                 world.hud.notification("Scenario started", seconds=2.0)
         else:
             self._advance_checkpoints(ego_location)
+            self._last_next_checkpoint_distance_m = self._distance_to_next_checkpoint(ego_location)
 
         if self._started and not self._finished and self._start_sim_time is not None:
             elapsed = float(sim_time - self._start_sim_time)
@@ -636,6 +756,19 @@ class ScenarioRuntime(object):
             and self._last_progress_m >= lead_progress_m + float(self.preset.overtake_finish_margin_m)
             and in_start_lane
         ):
+            if not self._overtake_objective_met:
+                self._overtake_objective_met = True
+                self._status = "finish_gate_pending"
+                world.hud.notification("Overtake complete, reach FINISH", seconds=2.5)
+
+        if self._checkpoint_locations and self._next_checkpoint_index >= len(self._checkpoint_locations):
+            if self._overtake_objective_met:
+                self._finish(world, sim_time, True, "")
+            else:
+                self._finish(world, sim_time, False, "finish_without_overtake")
+            return
+
+        if not self._checkpoint_locations and self._overtake_objective_met:
             self._finish(world, sim_time, True, "")
 
     def snapshot(self):
@@ -670,6 +803,12 @@ class ScenarioRuntime(object):
             "scenario_progress_m": (
                 float(self._last_progress_m)
                 if self._last_progress_m is not None
+                else None
+            ),
+            "scenario_objective_met": bool(self._overtake_objective_met),
+            "scenario_next_checkpoint_distance_m": (
+                float(self._last_next_checkpoint_distance_m)
+                if self._last_next_checkpoint_distance_m is not None
                 else None
             ),
             "scenario_lead_distance_m": (
@@ -708,6 +847,8 @@ class ScenarioRuntime(object):
                     len(self._checkpoint_locations),
                 )
             )
+        if self._last_next_checkpoint_distance_m is not None:
+            lines.append("Next checkpoint: %.1fm" % self._last_next_checkpoint_distance_m)
         if self._started and self._start_sim_time is not None:
             elapsed = (
                 float(self._completion_time_s)
@@ -715,6 +856,10 @@ class ScenarioRuntime(object):
                 else float(sim_time - self._start_sim_time)
             )
             lines.append("Scenario time: %.1fs" % max(0.0, elapsed))
+        if self.preset.kind == "overtake":
+            lines.append(
+                "Overtake objective: %s" % ("done" if self._overtake_objective_met else "pending")
+            )
         if self._last_lead_distance_m is not None:
             lines.append("Lead distance: %.1fm" % self._last_lead_distance_m)
         return lines
@@ -948,7 +1093,6 @@ class DualControl(object):
         self._latest_steer_dwell_required = 1
         self._latest_signal_state = "off"
         self._latest_horn_on = False
-        self._gesture_reverse_active = False
         self._latest_gesture_fresh = False
         self._last_lane_invasion_count = 0
         self._last_collision_count = 0
@@ -968,17 +1112,29 @@ class DualControl(object):
         self._applied_steer_key = "neutral"
         self._pending_steer_key = None
         self._pending_steer_count = 0
+        self._signal_toggle_timeout_s = float(SIGNAL_TOGGLE_TIMEOUT_S)
+        self._signal_toggle_cooldown_s = float(SIGNAL_TOGGLE_COOLDOWN_S)
+        self._reverse_toggle_cooldown_s = float(REVERSE_TOGGLE_COOLDOWN_S)
+        self._reverse_toggle_max_speed_mps = float(REVERSE_TOGGLE_MAX_SPEED_MPS)
+        self._signal_expiry_ts = None
+        self._last_left_signal_toggle_ts = -1e9
+        self._last_right_signal_toggle_ts = -1e9
+        self._last_reverse_toggle_ts = -1e9
+        self._prev_left_signal_active = False
+        self._prev_right_signal_active = False
+        self._prev_reverse_toggle_active = False
         print(
             f"[gesture] runtime preset: {RUNTIME_TUNING_PRESET_NAME} "
             f"(gesture_max_age={self._gesture_max_age:.2f}s, "
             f"active_dwell={self._active_steer_dwell_frames}, "
-            f"neutral_dwell={self._neutral_steer_dwell_frames})"
+            f"neutral_dwell={self._neutral_steer_dwell_frames}, "
+            f"control_policy={CONTROL_POLICY_NAME})"
         )
         scenario_name = getattr(getattr(world, "_scenario_preset", None), "name", "")
         if scenario_name:
             print(f"[scenario] active scenario: {scenario_name}")
         
-        # Track signals so they behave like a real car (stay on until changed/canceled)
+        # Signals and reverse are edge-triggered so a brief gesture can latch a state.
         self._signal_state = "off"  # "off" | "left" | "right"
         
         self._gesture_thread = None
@@ -1130,46 +1286,35 @@ class DualControl(object):
         """
         Returns:
             steer_key: "left", "right", "left_strong", "right_strong", or "neutral"
-            signal_state: "left", "right", or "off"
-            reverse_requested: bool
+            left_signal_toggle_requested: bool
+            right_signal_toggle_requested: bool
+            reverse_toggle_requested: bool
         """
-    
-        labels = {str(left_label), str(right_label)}
-    
-        # --- reverse ---
-        reverse_requested = str(left_label) == "horn" and str(right_label) == "horn"
-    
-        # --- signal ---
-        has_signal_left = "signal_left" in labels
-        has_signal_right = "signal_right" in labels
-    
-        if has_signal_left and has_signal_right:
-            signal_state = "off"
-        elif has_signal_left:
-            signal_state = "left"
-        elif has_signal_right:
-            signal_state = "right"
-        else:
-            signal_state = "off"
-    
-        # --- steer ---
-        has_left_turn = "left_turn" in labels
-        has_right_turn = "right_turn" in labels
-    
-        if has_left_turn and has_right_turn:
-            steer_key = "neutral"
-        elif left_label == "left_turn" and right_label == "left_turn":
+        left_label = str(left_label)
+        right_label = str(right_label)
+
+        reverse_toggle_requested = left_label == "horn" and right_label == "horn"
+        left_signal_toggle_requested = left_label == "signal_left"
+        right_signal_toggle_requested = right_label == "signal_right"
+
+        # Left arm is the strong/decisive steering arm. Right arm is the weak/fine arm.
+        if left_label == "left_turn":
             steer_key = "left_strong"
-        elif left_label == "right_turn" and right_label == "right_turn":
+        elif left_label == "right_turn":
             steer_key = "right_strong"
-        elif has_left_turn:
+        elif right_label == "left_turn":
             steer_key = "left"
-        elif has_right_turn:
+        elif right_label == "right_turn":
             steer_key = "right"
         else:
             steer_key = "neutral"
 
-        return steer_key, signal_state, reverse_requested
+        return (
+            steer_key,
+            left_signal_toggle_requested,
+            right_signal_toggle_requested,
+            reverse_toggle_requested,
+        )
 
     def _reset_steer_dwell_candidate(self):
         self._pending_steer_key = None
@@ -1210,20 +1355,87 @@ class DualControl(object):
             self._latest_steer_dwell_pending_count = 0
         return applied_steer_key
 
-    def _apply_reverse_override(self, reverse_requested: bool):
+    def _clear_discrete_gesture_states(self):
+        self._prev_left_signal_active = False
+        self._prev_right_signal_active = False
+        self._prev_reverse_toggle_active = False
+
+    def _expire_signal_if_needed(self, now: float | None = None):
+        now = time.monotonic() if now is None else float(now)
+        if self._signal_state == "off" or self._signal_expiry_ts is None:
+            return
+        if now < float(self._signal_expiry_ts):
+            return
+        self._set_turn_signal("off")
+        self._signal_expiry_ts = None
+
+    def _toggle_signal_state(self, requested_side: str, now: float):
+        requested_side = str(requested_side)
+        current_side = str(self._signal_state)
+        if requested_side == current_side:
+            self._set_turn_signal("off")
+            self._signal_expiry_ts = None
+            return
+        self._set_turn_signal(requested_side)
+        if self._signal_toggle_timeout_s > 0.0:
+            self._signal_expiry_ts = float(now + self._signal_toggle_timeout_s)
+        else:
+            self._signal_expiry_ts = None
+
+    def _update_signal_toggles(
+        self,
+        left_signal_toggle_requested: bool,
+        right_signal_toggle_requested: bool,
+    ):
+        now = time.monotonic()
+        self._expire_signal_if_needed(now)
+
+        left_active = bool(left_signal_toggle_requested)
+        right_active = bool(right_signal_toggle_requested)
+        left_edge = left_active and not self._prev_left_signal_active
+        right_edge = right_active and not self._prev_right_signal_active
+
+        if left_edge and right_edge:
+            self._set_turn_signal("off")
+            self._signal_expiry_ts = None
+            self._last_left_signal_toggle_ts = float(now)
+            self._last_right_signal_toggle_ts = float(now)
+        elif left_edge and (now - self._last_left_signal_toggle_ts) >= self._signal_toggle_cooldown_s:
+            self._toggle_signal_state("left", now)
+            self._last_left_signal_toggle_ts = float(now)
+        elif right_edge and (now - self._last_right_signal_toggle_ts) >= self._signal_toggle_cooldown_s:
+            self._toggle_signal_state("right", now)
+            self._last_right_signal_toggle_ts = float(now)
+
+        self._prev_left_signal_active = left_active
+        self._prev_right_signal_active = right_active
+
+    def _update_reverse_toggle(self, reverse_toggle_requested: bool):
         if not isinstance(self._control, carla.VehicleControl):
             return
-
-        reverse_requested = bool(reverse_requested)
-        if reverse_requested:
-            if self._control.gear >= 0:
-                self._control.gear = -1
-            self._gesture_reverse_active = True
-            return
-
-        if self._gesture_reverse_active and self._control.gear < 0:
-            self._control.gear = 1
-        self._gesture_reverse_active = False
+        reverse_active = bool(reverse_toggle_requested)
+        reverse_edge = reverse_active and not self._prev_reverse_toggle_active
+        now = time.monotonic()
+        if reverse_edge and (now - self._last_reverse_toggle_ts) >= self._reverse_toggle_cooldown_s:
+            velocity = self._player.get_velocity()
+            speed_mps = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
+            if speed_mps > self._reverse_toggle_max_speed_mps:
+                if self._hud is not None:
+                    self._hud.notification(
+                        "Reverse toggle blocked while moving",
+                        seconds=2.0,
+                    )
+            else:
+                currently_reverse = bool(self._control.gear < 0)
+                self._control.gear = 1 if currently_reverse else -1
+                self._control.reverse = bool(self._control.gear < 0)
+                if self._hud is not None:
+                    self._hud.notification(
+                        "Reverse %s" % ("Off" if currently_reverse else "On"),
+                        seconds=2.0,
+                    )
+            self._last_reverse_toggle_ts = float(now)
+        self._prev_reverse_toggle_active = reverse_active
 
     def _apply_gesture_override(self):
         if realtime_gesture is None:
@@ -1231,7 +1443,10 @@ class DualControl(object):
             self._reset_steer_dwell_candidate()
             self._latest_steer_dwell_pending_key = ""
             self._latest_steer_dwell_pending_count = 0
-            self._apply_reverse_override(False)
+            self._expire_signal_if_needed()
+            self._clear_discrete_gesture_states()
+            self._latest_signal_state = self._signal_state
+            self._latest_horn_on = False
             return
     
         # Read the new published dual-arm output from realtime_gesture_cnn.py
@@ -1243,7 +1458,10 @@ class DualControl(object):
             self._reset_steer_dwell_candidate()
             self._latest_steer_dwell_pending_key = ""
             self._latest_steer_dwell_pending_count = 0
-            self._apply_reverse_override(False)
+            self._expire_signal_if_needed()
+            self._clear_discrete_gesture_states()
+            self._latest_signal_state = self._signal_state
+            self._latest_horn_on = False
             return
     
         left_label = "neutral"
@@ -1294,12 +1512,15 @@ class DualControl(object):
         self._latest_right_label = right_label
         self._latest_right_conf = right_conf
     
-        steer_key, signal_state, reverse_requested = self._resolve_dual_arm_actions(left_label, right_label)
+        (
+            steer_key,
+            left_signal_toggle_requested,
+            right_signal_toggle_requested,
+            reverse_toggle_requested,
+        ) = self._resolve_dual_arm_actions(left_label, right_label)
         self._latest_steer_key = steer_key
         applied_steer_key = self._apply_steer_dwell(steer_key)
         self._latest_applied_steer_key = applied_steer_key
-        self._latest_signal_state = signal_state
-        self._latest_horn_on = False
         self._latest_pred_label = "split" if getattr(published, "mode", "single") == "split" else (
             left_label if left_label == right_label else right_label
         )
@@ -1308,13 +1529,17 @@ class DualControl(object):
     
         # Apply steering
         self._control.steer = float(self._gesture_to_steer[applied_steer_key])
-    
-        # Apply turn signal
-        if signal_state != self._signal_state:
-            self._set_turn_signal(signal_state)
 
-        # Reverse engages only when both arms collapse to horn.
-        self._apply_reverse_override(reverse_requested)
+        # Signals latch on a gesture edge and auto-cancel after a short timeout.
+        self._update_signal_toggles(
+            left_signal_toggle_requested=left_signal_toggle_requested,
+            right_signal_toggle_requested=right_signal_toggle_requested,
+        )
+
+        # Reverse is a dual-horn toggle, not a hold-to-reverse action.
+        self._update_reverse_toggle(reverse_toggle_requested)
+        self._latest_signal_state = self._signal_state
+        self._latest_horn_on = bool(reverse_toggle_requested)
 
     def _estimate_lane_error_m(self, world):
         try:
@@ -1368,6 +1593,7 @@ class DualControl(object):
         scenario = world.get_scenario_snapshot()
         row = {
             'runtime_preset': RUNTIME_TUNING_PRESET_NAME,
+            'control_policy': CONTROL_POLICY_NAME,
             'timestamp': datetime.datetime.now().isoformat(),
             'wall_time_s': apply_ts,
             'control_apply_ts': apply_ts,
@@ -1419,6 +1645,8 @@ class DualControl(object):
             'scenario_checkpoint_index': scenario.get('scenario_checkpoint_index', ''),
             'scenario_checkpoint_count': scenario.get('scenario_checkpoint_count', ''),
             'scenario_progress_m': scenario.get('scenario_progress_m', ''),
+            'scenario_objective_met': scenario.get('scenario_objective_met', ''),
+            'scenario_next_checkpoint_distance_m': scenario.get('scenario_next_checkpoint_distance_m', ''),
             'scenario_lead_distance_m': scenario.get('scenario_lead_distance_m', ''),
             'scenario_lead_gap_m': scenario.get('scenario_lead_gap_m', ''),
             'scenario_current_lane_id': scenario.get('scenario_current_lane_id', ''),

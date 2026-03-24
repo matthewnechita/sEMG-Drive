@@ -1,0 +1,146 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{[Paper Title]}
+\author{[Author names and affiliations]}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This draft presents the current capstone continuation of an EMG-based driving interface built around Delsys Trigno sensing, a strict sensor-placement workflow, convolutional neural network gesture classification, and CARLA-based downstream evaluation. The active implementation collects strict-layout EMG data through a custom Python GUI, resamples heterogeneous sensor streams to a common 2000 Hz time grid, filters the EMG signal with fixed notch and bandpass filters, and trains a residual 1D CNN with channel attention and an explicit energy bypass to preserve rest-versus-active amplitude cues. The deployed realtime path currently focuses on the three-gesture subset of \texttt{neutral}, \texttt{left\_turn}, and \texttt{right\_turn}, and applies smoothing, confidence gating, hysteresis, and ambiguity rejection to reduce neutral flicker. Evaluation is organized around three main groups of metrics: offline classification performance, end-to-end latency, and CARLA scenario performance. Final numerical results will be inserted once the experiment set is frozen.
+\end{abstract}
+
+\section{Introduction}
+EMG-based human-machine interfaces remain attractive for driving-related control because they offer a potential pathway for non-traditional or accessibility-oriented control without requiring conventional manual interaction. In practice, however, an EMG driving interface is only useful if it is stable enough to move beyond isolated offline classification and into reproducible runtime behavior. This makes system discipline as important as raw classifier accuracy.
+
+The current work continues earlier EMG-for-driving research by tightening the full experimental contract rather than simply increasing the number of gesture classes. Three engineering issues shaped the present design. First, inconsistent sensor placement made cross-session channel meaning unstable. Second, heterogeneous Delsys sensor sampling rates required explicit preprocessing before training and deployment. Third, neutral-class instability in realtime caused downstream steering flicker even when the base classifier appeared promising offline.
+
+This paper therefore centers on a narrower and more defensible story: a strict-layout three-gesture EMG pipeline for driving-related control. The main contributions of the current system are:
+\begin{itemize}[leftmargin=1.5em]
+\item a fixed pair-number-specific strict sensor-placement workflow for both training and inference;
+\item a preprocessing path that resamples multi-sensor EMG to a common time base and applies a mirrored offline/realtime filtering stack;
+\item a residual 1D CNN with channel attention and an explicit pre-normalization energy bypass for improved neutral-versus-active separation;
+\item a deployment path that combines classifier output with post-processing tuned to reduce neutral flicker; and
+\item a CARLA evaluation harness with logged latency and scenario-level driving metrics.
+\end{itemize}
+
+At the time of writing, the cleanest reported scope is the strict-layout three-gesture setting consisting of \texttt{neutral}, \texttt{left\_turn}, and \texttt{right\_turn}. Broader gesture sets remain possible, but the three-gesture configuration is the narrowest version of the pipeline that aligns with the current deployed runtime and evaluation emphasis.
+
+\section{Related Work}
+This project builds most directly on the prior EMG driving-interface work by Basnet et al.~\cite{basnet2025}. The relationship to that work should be framed as continuation rather than replacement. The key difference in the current capstone branch is the shift toward a more controlled sensing and evaluation contract: fixed sensor placement, strict-layout dataset roots, explicit runtime stabilization, and downstream scenario logging.
+
+The project also overlaps more broadly with literature on EMG gesture recognition, assistive control, and realtime biosignal classification. Within that space, the present work is intentionally focused on a practical engineering question: what system changes are required to make a previously fragile EMG-control prototype reproducible enough to support credible offline, latency, and simulator-level evaluation?
+
+\section{System Overview}
+The active system pipeline is collection $\rightarrow$ resampling $\rightarrow$ filtering $\rightarrow$ optional recalibration $\rightarrow$ windowing and label generation $\rightarrow$ CNN training $\rightarrow$ realtime post-processing $\rightarrow$ CARLA control evaluation. Data collection is performed with a custom Delsys GUI, preprocessing and training are implemented in Python and PyTorch, and downstream control experiments are conducted in CARLA through a simulator client that launches realtime inference internally.
+
+The active top-level entrypoints are \texttt{DelsysPythonGUI.py} for collection, \texttt{tools/resample\_raw\_dataset.py} and \texttt{emg/filtering.py} for preprocessing, \texttt{train\_per\_subject.py} and \texttt{train\_cross\_subject.py} for model training, \texttt{realtime\_gesture\_cnn.py} for standalone inference, and \texttt{carla\_integration/manual\_control\_emg.py} for simulator runs. Strict raw collections are stored under \texttt{data\_strict/}, resampled strict data under \texttt{data\_resampled\_strict/}, and trained bundles under \texttt{models/strict/}.
+
+\section{Methods}
+\subsection{Data acquisition}
+EMG acquisition is performed with Delsys Trigno hardware through a custom Python GUI that supports explicit sensor pairing, scanning of paired devices, live EMG viewing, and scripted labeled collection protocols. The standard collection protocol includes the labels \texttt{left\_turn}, \texttt{right\_turn}, \texttt{neutral}, \texttt{signal\_left}, \texttt{signal\_right}, and \texttt{horn}. In the current implementation, each active gesture lasts 5.0~s, each neutral segment lasts 5.0~s, five repetitions are recorded, and calibration is enabled with 5.0~s neutral-rest and 5.0~s MVC segments.
+
+In addition to the standard protocol, the current branch includes a dedicated neutral-recovery protocol designed to capture turn-to-neutral transitions without modifying the balanced baseline collection workflow. This protocol records repeated \texttt{left\_turn} to \texttt{neutral} and \texttt{right\_turn} to \texttt{neutral} sequences using 3.0~s active holds and 5.0~s neutral holds. The protocol omits an explicit visible \texttt{neutral\_buffer} stage but still trims the leading release region internally before assigning settled neutral labels. This addition was motivated by deployment observations showing that the most important failure mode was instability immediately after returning to neutral.
+
+If the reported experiments only use the three-gesture deployment subset, that should be stated explicitly as a training and evaluation restriction rather than a collection restriction. The collection pipeline itself still supports the broader active label set.
+
+\subsection{Strict sensor-placement policy}
+The strict sensor-placement workflow is central to the current method. Earlier mixed-layout assumptions were replaced because they allowed the semantic meaning of channel indices to drift between sessions. The active strict helper resolves channels by fixed pair identity and fails closed if required pair numbers are missing, duplicated, or inconsistent with the arm-specific layout contract.
+
+For the right arm, pairs 1, 2, and 3 are assigned to the three Avanti slots, pair 7 to Maize, pair 9 to Galileo, and pair 11 to Mini. For the left arm, pairs 4, 5, and 6 are assigned to the three Avanti slots, pair 8 to Maize, and pair 10 to Galileo. This yields 17 strict channels on the right arm and 16 on the left. Channels are reordered by fixed pair identity during both training and inference.
+
+\subsection{Preprocessing}
+Different Delsys sensor types can stream at different effective sample rates, so raw multi-sensor sessions are first resampled to a common time base. The active resampler estimates per-channel sample rates from timestamp differences, finds the overlapping valid time interval across channels, constructs a uniform 2000~Hz grid, linearly interpolates each channel onto that grid, and transfers labels to the new grid by nearest-neighbor remapping.
+
+After resampling, the active filtering stack applies a 60~Hz notch, a 120~Hz notch, and a 20--450~Hz sixth-order bandpass filter. The same filter family is mirrored in the realtime path so that deployment does not operate on a materially different signal than the one used during training. A recalibration utility is also available for sessions whose explicit MVC calibration is too weak; when the MVC-to-neutral quality ratio is insufficient, the tool can derive replacement neutral and scale terms from the labeled filtered session.
+
+\subsection{Windowing and label generation}
+The filtered EMG stream is segmented into overlapping 200-sample windows with a 100-sample step. At the 2000~Hz resampled rate, this corresponds to 100~ms windows with 50~ms stride. Each window is labeled by the majority class of its constituent samples. The inter-gesture rest label \texttt{neutral\_buffer} is retained during collection but excluded from model training. Windows with insufficient label purity can also be dropped through a configurable minimum label-confidence threshold.
+
+\subsection{Model architecture}
+The active classifier is \texttt{GestureCNNv2}, which consumes EMG windows shaped as $(\mathrm{channels}, \mathrm{time})$. The network applies input \texttt{InstanceNorm1d} followed by a residual 1D convolutional backbone with three stages at 32, 64, and 128 channels. Each stage includes squeeze-and-excitation channel attention, and the final embedding is global-average pooled before classification.
+
+A key design feature is an explicit pre-normalization energy bypass. Before input normalization, the model computes the mean squared energy of the raw window and concatenates this scalar to the learned representation before the final linear classifier. The purpose of this bypass is to preserve amplitude information that would otherwise be attenuated by per-window normalization, particularly for separating rest-like neutral windows from active gesture windows.
+
+\subsection{Training configuration}
+The repository maintains both per-subject and cross-subject training paths. The per-subject configuration currently uses 60 epochs, batch size 512, Adam optimization with learning rate $10^{-4}$, dropout 0.25, label smoothing 0.05, and calibration-aware normalization when calibration quality passes threshold checks. Augmentation includes amplitude scaling, additive Gaussian noise, temporal shift, channel dropout, and temporal stretch. The active per-subject minimum label-confidence threshold is 0.85.
+
+The cross-subject path uses the same general architecture but extends training to 80 epochs and uses subject-balanced sampling via \texttt{WeightedRandomSampler}. This distinction is important because subject-specific and pooled models answer different questions about personalization and generalization.
+
+\subsection{Deployment and runtime post-processing}
+The current deployment path uses \texttt{realtime\_gesture\_cnn.py} in dual-arm mode and restricts active output labels to the three-gesture subset \{\texttt{neutral}, \texttt{left\_turn}, \texttt{right\_turn}\}. Incoming streams are resampled to 2000~Hz, filtered using the same notch and bandpass stack as the offline path, and optionally normalized using saved neutral and MVC calibration terms.
+
+The active runtime tuning preset is \texttt{flicker\_mild\_margin}. This preset applies smoothing of 3 frames, a minimum confidence threshold of 0.80, a dual-arm agreement threshold of 0.55, output hysteresis with two-frame confirmation, and softmax ambiguity rejection with minimum confidence 0.80 and minimum margin 0.10. These controls were added to address neutral flicker observed during live use. The paper should describe only the preset actually used for the reported experiments.
+
+\section{Experimental Setup}
+\subsection{Hardware and software}
+The active software environment targets Python~3.10 with NumPy, SciPy, scikit-learn, libemg, PyTorch, PySide6, pygame, and the CARLA Python API. Live data collection expects Windows with the Delsys SDK bridge through \texttt{pythonnet}. The simulator client is implemented in CARLA through a modified manual-control interface that launches realtime inference internally.
+
+\subsection{Dataset scope}
+The narrowest defensible reported configuration on the current branch is the strict-layout three-gesture setting. In that configuration, collection may still use the broader label set, but training and deployment are restricted to \texttt{neutral}, \texttt{left\_turn}, and \texttt{right\_turn}. The final manuscript should explicitly state which subjects, arms, sessions, and strict dataset roots were used for the reported experiments.
+
+\subsection{CARLA scenarios}
+To support repeatable downstream evaluation, the simulator layer includes two scenario presets. The first is a checkpoint-based lane-keeping route that starts timing once the vehicle crosses a start checkpoint placed slightly ahead of spawn and finishes when the final visible checkpoint is reached. The second is an overtake scenario in which a slower lead vehicle is spawned ahead of the ego vehicle; success requires both satisfying the overtake objective and crossing the finish checkpoint. Both scenarios use a fixed sedan blueprint and write per-tick state to CSV logs, including checkpoint progress and completion state.
+
+The current branch also exposes visible checkpoint markers and explicit finish conditions so that scenario completion is both machine-detectable and human-interpretable during a run. The final paper should report the exact frozen scenario configuration used for the final results.
+
+\section{Evaluation Protocol}
+The main reported metric set for this paper should match the capstone report. Prompted realtime behavior metrics can still be used as supplementary analysis, but the core evaluation should remain centered on offline model quality, latency, and downstream simulator behavior.
+
+\subsection{Offline metrics}
+The primary offline metrics are balanced accuracy and macro F1. Supporting metrics include accuracy, weighted F1, per-class recall, worst-class recall, the confusion matrix, confusion-to-neutral rate, and neutral prediction false-positive rate. These metrics are harvested directly from saved model bundles.
+
+\subsection{Latency metrics}
+Latency analysis joins realtime prediction logs and CARLA drive logs on a shared prediction identifier. The reported latency families are classifier latency, publish latency, control latency, and end-to-end latency. Each family should be summarized with mean, median, p90, p95, and maximum.
+
+\subsection{CARLA scenario metrics}
+The primary CARLA metrics are mean lane error, lane error RMSE, lane invasions, scenario success or failure, and scenario completion time. Lane error is defined as the distance from the vehicle to the nearest driving-lane centerline. Completion time is valid only for explicit scenarios and is measured from the start checkpoint to the scenario finish condition.
+
+Metrics such as steering smoothness, command success rate, and collision count are deliberately omitted from the main metric set because they are either weakly grounded in the current pipeline or not central to the reportable experimental story.
+
+\section{Results}
+\subsection{Offline classification results}
+[Insert the main offline results table here. The expected headline metrics are balanced accuracy and macro F1, with supporting confusion analysis.]
+
+\subsection{Latency results}
+[Insert the latency summary table here. Include classifier, publish, control, and end-to-end latency with mean, median, p90, p95, and max.]
+
+\subsection{CARLA scenario results}
+[Insert the lane-keeping and overtake scenario table here. Include mean lane error, lane error RMSE, lane invasions, success/failure, and completion time.]
+
+\subsection{Comparison to prior work}
+This section should compare only on metrics that are genuinely comparable to the prior paper. Eye-tracker-specific or otherwise unmatched measures should be excluded. The comparison should also make it clear which changes in the current work reflect a stricter sensing and evaluation contract rather than a direct architectural replacement.
+
+\section{Discussion}
+The main technical discussion should focus on whether stricter data discipline and runtime stabilization materially improved system credibility. In particular, the current branch suggests that layout control, preprocessing consistency, and post-processing behavior are at least as important to deployment quality as the underlying network architecture.
+
+One recurring design tradeoff is between control breadth and reliability. The repository still supports a broader collection label set, but the deployed three-gesture subset remains the most stable control story. Another is the tradeoff between classifier flexibility and downstream interpretability: by freezing explicit scenarios, visible checkpoints, and shared metrics, the system becomes easier to evaluate even if some broader behaviors remain out of scope.
+
+The final paper should also state the current limitations plainly. These may include limited subject count, the focus on simulator evaluation rather than real vehicles, the present emphasis on three-gesture deployment, and any scenario configurations that were still being tuned when experiments were collected.
+
+\section{Conclusion}
+This draft paper documents a strict-layout EMG control pipeline that connects Delsys-based collection, a reproducible preprocessing workflow, a residual 1D CNN with an energy bypass, runtime flicker suppression, and CARLA-based downstream evaluation. The clearest current contribution is not merely a working classifier, but a more defensible experimental system whose sensing contract, deployment behavior, and evaluation outputs are explicitly controlled.
+
+The next step is to freeze the final experiment set, insert the corresponding offline, latency, and CARLA results, and then tighten the claims so that every reported conclusion maps directly to collected evidence.
+
+\section*{Acknowledgments}
+[Insert sponsor, supervisor, lab, and support acknowledgments here.]
+
+\begin{thebibliography}{9}
+\bibitem{basnet2025}
+Basnet et al.
+\newblock Evaluating the Feasibility of EMG-Based Human-Machine Interfaces for Driving.
+\newblock 2025.
+\newblock [Complete venue, volume, pages, and DOI to be inserted.]
+\end{thebibliography}
+
+\end{document}

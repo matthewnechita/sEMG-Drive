@@ -1932,8 +1932,12 @@ def main(argv=None):
                     )
             else:
                 # Legacy dual-arm contiguous split (requires right channels first).
-                original_right_indices = right_channel_indices.copy()
-                original_left_indices = left_channel_indices.copy()
+                if right_channel_indices is None or left_channel_indices is None:
+                    raise RuntimeError(
+                        "[gesture] dual-arm channel indices unavailable for legacy calibration."
+                    )
+                original_right_indices = np.asarray(right_channel_indices, dtype=int).copy()
+                original_left_indices = np.asarray(left_channel_indices, dtype=int).copy()
                 neutral_mean_right, mvc_scale_right = _do_calibration(
                     "right", RIGHT_ARM_CHANNELS, collect_channels=None, channel_start=0
                 )
