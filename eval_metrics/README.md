@@ -31,7 +31,7 @@ top-level training and realtime entrypoints.
   - Expects timestamp columns to be present in the logs.
 
 - `analyze_drive_metrics.py`
-  - Summarize CARLA run logs into lane-keeping, collision, timing, and steering metrics.
+  - Summarize CARLA run logs into lane-keeping, timing, and steering metrics.
   - Consumes the per-tick CARLA CSV emitted by `carla wheel z.py`.
 
 - `build_eval_tables.py`

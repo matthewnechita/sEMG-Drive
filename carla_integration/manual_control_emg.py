@@ -275,8 +275,6 @@ class DriveCSVLogger(object):
             'lane_error_m',
             'lane_invasion_event',
             'lane_invasion_count_total',
-            'collision_event',
-            'collision_count_total',
             'scenario_name',
             'scenario_kind',
             'scenario_status',
@@ -338,6 +336,7 @@ class ScenarioRuntime(object):
         self._route_waypoints = []
         self._route_progress_m = []
         self._checkpoint_locations = []
+        self._checkpoint_progress_m = []
         self._start_location = None
         self._finish_location = None
         self._start_lane_id = None
@@ -498,6 +497,84 @@ class ScenarioRuntime(object):
         checkpoint = self._checkpoint_locations[self._next_checkpoint_index]
         return float(_location_distance(ego_location, checkpoint))
 
+    def _progress_to_route_index(self, target_progress_m):
+        if not self._route_progress_m:
+            return None
+        target = float(target_progress_m)
+        for idx, progress in enumerate(self._route_progress_m):
+            if progress >= target:
+                return idx
+        return len(self._route_progress_m) - 1
+
+    def _build_checkpoint_progress(self):
+        progress_values = []
+        for checkpoint in self._checkpoint_locations:
+            progress_values.append(self._project_progress_m(checkpoint))
+        return progress_values
+
+    def _active_checkpoint_pair(self):
+        if self._finished or len(self._checkpoint_locations) < 2:
+            return None
+        if not self._started:
+            return (0, 1)
+        if self._next_checkpoint_index >= len(self._checkpoint_locations):
+            return None
+        start_idx = max(0, self._next_checkpoint_index - 1)
+        end_idx = min(start_idx + 1, len(self._checkpoint_locations) - 1)
+        if end_idx <= start_idx:
+            return None
+        return (start_idx, end_idx)
+
+    def _route_segment_locations(self, start_idx, end_idx):
+        if start_idx < 0 or end_idx >= len(self._checkpoint_locations) or end_idx <= start_idx:
+            return []
+
+        progress_values = self._checkpoint_progress_m
+        start_progress = progress_values[start_idx] if start_idx < len(progress_values) else None
+        end_progress = progress_values[end_idx] if end_idx < len(progress_values) else None
+        if start_progress is None or end_progress is None:
+            return []
+
+        route_start_idx = self._progress_to_route_index(start_progress)
+        route_end_idx = self._progress_to_route_index(end_progress)
+        if route_start_idx is None or route_end_idx is None or route_end_idx <= route_start_idx:
+            return []
+
+        segment_locations = []
+        for idx in range(route_start_idx, route_end_idx + 1):
+            segment_locations.append(self._route_waypoints[idx].transform.location)
+        return segment_locations
+
+    def _draw_active_checkpoint_guide(self, debug, lifetime):
+        pair = self._active_checkpoint_pair()
+        if pair is None:
+            return
+
+        start_idx, end_idx = pair
+        guide_color = carla.Color(180, 150, 40)
+        segment_locations = self._route_segment_locations(start_idx, end_idx)
+
+        if len(segment_locations) >= 2:
+            for idx in range(len(segment_locations) - 1):
+                debug.draw_line(
+                    _shift_location(segment_locations[idx], z=0.55),
+                    _shift_location(segment_locations[idx + 1], z=0.55),
+                    0.12,
+                    guide_color,
+                    lifetime,
+                    False,
+                )
+            return
+
+        debug.draw_line(
+            _shift_location(self._checkpoint_locations[start_idx], z=0.8),
+            _shift_location(self._checkpoint_locations[end_idx], z=0.8),
+            0.10,
+            guide_color,
+            lifetime,
+            False,
+        )
+
     def _advance_checkpoints(self, ego_location):
         radius = float(self.preset.checkpoint_radius_m)
         while self._next_checkpoint_index < len(self._checkpoint_locations):
@@ -514,27 +591,14 @@ class ScenarioRuntime(object):
             return
 
         lifetime = max(0.2, 1.0 / max(1.0, float(CLIENT_FPS_LIMIT)) * 2.5)
-        route_color = carla.Color(100, 100, 255)
-        completed_color = carla.Color(60, 220, 60)
         next_color = carla.Color(255, 220, 0)
-        future_color = carla.Color(80, 160, 255)
-        finish_color = carla.Color(255, 80, 80)
-        start_color = carla.Color(60, 255, 255)
 
-        for idx, checkpoint in enumerate(self._checkpoint_locations):
-            if idx < self._next_checkpoint_index:
-                color = completed_color
-            elif idx == self._next_checkpoint_index and not self._finished:
-                color = next_color
-            elif idx == len(self._checkpoint_locations) - 1:
-                color = finish_color
-            elif idx == 0 and not self._started:
-                color = start_color
-            else:
-                color = future_color
-
+        if not self._finished and self._next_checkpoint_index < len(self._checkpoint_locations):
+            idx = int(self._next_checkpoint_index)
+            checkpoint = self._checkpoint_locations[idx]
             point_location = _shift_location(checkpoint, z=1.2)
             text_location = _shift_location(checkpoint, z=2.2)
+
             if idx == 0:
                 label = "START"
             elif idx == len(self._checkpoint_locations) - 1:
@@ -542,19 +606,9 @@ class ScenarioRuntime(object):
             else:
                 label = "CP %d" % idx
 
-            size = 0.35 if idx == self._next_checkpoint_index and not self._finished else 0.22
-            debug.draw_point(point_location, size, color, lifetime, False)
-            debug.draw_string(text_location, label, False, color, lifetime, False)
-
-            if idx + 1 < len(self._checkpoint_locations):
-                debug.draw_line(
-                    _shift_location(checkpoint, z=0.8),
-                    _shift_location(self._checkpoint_locations[idx + 1], z=0.8),
-                    0.10,
-                    route_color,
-                    lifetime,
-                    False,
-                )
+            debug.draw_point(point_location, 0.35, next_color, lifetime, False)
+            debug.draw_string(text_location, label, False, next_color, lifetime, False)
+        self._draw_active_checkpoint_guide(debug, lifetime)
 
     def _spawn_lead_vehicle(self, world):
         if not self._route_progress_m:
@@ -631,6 +685,7 @@ class ScenarioRuntime(object):
         self._route_waypoints = []
         self._route_progress_m = []
         self._checkpoint_locations = []
+        self._checkpoint_progress_m = []
         self._start_location = None
         self._finish_location = None
         self._status = "waiting_start"
@@ -665,6 +720,7 @@ class ScenarioRuntime(object):
         self._start_road_id = int(start_waypoint.road_id)
         self._route_waypoints, self._route_progress_m = self._build_route(start_waypoint)
         self._checkpoint_locations = self._build_checkpoints()
+        self._checkpoint_progress_m = self._build_checkpoint_progress()
         if self._checkpoint_locations:
             self._start_location = self._checkpoint_locations[0]
             self._finish_location = self._checkpoint_locations[-1]
@@ -1141,7 +1197,6 @@ class DualControl(object):
         self._latest_horn_on = False
         self._latest_gesture_fresh = False
         self._last_lane_invasion_count = 0
-        self._last_collision_count = 0
         self._drive_logger = DriveCSVLogger(carla_log_path) if carla_log_path else None
         self._realtime_log_path = str(realtime_log_path or '').strip()
         
@@ -1211,7 +1266,6 @@ class DualControl(object):
         self._last_right_signal_toggle_ts = -1e9
         self._last_reverse_toggle_ts = -1e9
         self._last_lane_invasion_count = 0
-        self._last_collision_count = 0
         self._clear_discrete_gesture_states()
         self._reset_steer_dwell_candidate()
         self._applied_steer_key = "neutral"
@@ -1680,11 +1734,8 @@ class DualControl(object):
         velocity = world.player.get_velocity()
         speed_mps = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
         lane_invasion_count = int(getattr(world.lane_invasion_sensor, "event_count", 0))
-        collision_count = int(getattr(world.collision_sensor, "event_count", 0))
         lane_invasion_event = lane_invasion_count > self._last_lane_invasion_count
-        collision_event = collision_count > self._last_collision_count
         self._last_lane_invasion_count = lane_invasion_count
-        self._last_collision_count = collision_count
 
         gestures = tuple(getattr(published, "gestures", ())) if published is not None else ()
         if gestures:
@@ -1744,8 +1795,6 @@ class DualControl(object):
             'lane_error_m': self._estimate_lane_error_m(world),
             'lane_invasion_event': bool(lane_invasion_event),
             'lane_invasion_count_total': lane_invasion_count,
-            'collision_event': bool(collision_event),
-            'collision_count_total': collision_count,
             'scenario_name': str(scenario.get('scenario_name', '')),
             'scenario_kind': str(scenario.get('scenario_kind', '')),
             'scenario_status': str(scenario.get('scenario_status', '')),
@@ -2073,14 +2122,55 @@ class LaneInvasionSensor(object):
         self.sensor.listen(lambda event: LaneInvasionSensor._on_invasion(weak_self, event))
 
     @staticmethod
+    def _enum_value_name(value):
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if "." in text:
+            text = text.split(".")[-1]
+        if text.startswith("LaneMarkingType.") or text.startswith("LaneChange."):
+            text = text.split(".", 1)[-1]
+        return text.strip()
+
+    @staticmethod
+    def _lane_marking_type(marking):
+        value = getattr(marking, "type", None)
+        if callable(value):
+            value = value()
+        return LaneInvasionSensor._enum_value_name(value)
+
+    @staticmethod
+    def _lane_marking_allows_change(marking):
+        lane_change = getattr(marking, "lane_change", None)
+        if callable(lane_change):
+            lane_change = lane_change()
+        if lane_change is not None:
+            try:
+                return int(lane_change) != 0
+            except (TypeError, ValueError):
+                pass
+            lane_change_name = LaneInvasionSensor._enum_value_name(lane_change).lower()
+            if lane_change_name in {"left", "right", "both"}:
+                return True
+            if lane_change_name in {"none", "0", ""}:
+                return False
+
+        return LaneInvasionSensor._lane_marking_type(marking).lower() in {"broken", "brokenbroken"}
+
+    @staticmethod
     def _on_invasion(weak_self, event):
         self = weak_self()
         if not self:
             return
+        markings = tuple(getattr(event, "crossed_lane_markings", ()) or ())
+        if markings and all(LaneInvasionSensor._lane_marking_allows_change(marking) for marking in markings):
+            return
         self.event_count += 1
-        lane_types = set(x.type for x in event.crossed_lane_markings)
-        text = ['%r' % str(x).split()[-1] for x in lane_types]
-        self.hud.notification('Crossed line %s' % ' and '.join(text))
+        lane_types = sorted({LaneInvasionSensor._lane_marking_type(marking) for marking in markings if marking is not None})
+        if lane_types:
+            self.hud.notification('Crossed line %s' % ' and '.join(repr(text) for text in lane_types))
+        else:
+            self.hud.notification('Crossed line')
 
 # ==============================================================================
 # -- GnssSensor --------------------------------------------------------

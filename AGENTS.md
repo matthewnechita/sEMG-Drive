@@ -8,6 +8,8 @@ Project context
   - `carla_integration/run_manual_control_emg_0_9_16.bat`: existing low-load launcher path.
   - `carla_integration/start_clean_carla_server_0_9_16.bat`: existing server launcher path.
   - `carla_integration/test_run_manual_control_emg_0_9_16.bat`: restored-display test copy with HUD shown, 30 FPS client cap, and client-side `--map Town02_Opt` loading.
+  - `carla_integration/test_run_lane_keep_5min_emg_0_9_16.cmd`: named lane-keep scenario launcher.
+  - `carla_integration/test_run_highway_overtake_emg_0_9_16.cmd`: named overtake scenario launcher.
   - `carla_integration/test_start_carla_server_0_9_16.bat`: restored-display test server copy; its exe startup map argument is not the reliable control point on this install.
 - Do not change CARLA map defaults or optimize/swap maps unless the user explicitly requests a specific map name.
 - The collection GUI entrypoint is `python DelsysPythonGUI.py`; it uses `DataCollector/CollectDataWindow.py`.
@@ -89,6 +91,13 @@ Common commands
   - `python realtime_gesture_cnn.py --model-right <right_bundle> --model-left <left_bundle>`
 - Build evaluation tables from harvested metrics and JSON summaries:
   - `python eval_metrics/build_eval_tables.py --manifest eval_metrics/table_manifest.csv`
+- Run named CARLA lane-keep scenario:
+  - `carla_integration\test_run_lane_keep_5min_emg_0_9_16.cmd`
+- Run named CARLA overtake scenario:
+  - `carla_integration\test_run_highway_overtake_emg_0_9_16.cmd`
+- Run a named CARLA scenario with logging enabled:
+  - `carla_integration\test_run_lane_keep_5min_emg_0_9_16.cmd --eval-log-dir eval_metrics\out\lane_keep_run_01`
+  - `carla_integration\test_run_highway_overtake_emg_0_9_16.cmd --eval-log-dir eval_metrics\out\overtake_run_01`
 
 Evaluation workflow
 - Evaluation scripts now live under `eval_metrics/`.
@@ -101,7 +110,7 @@ Evaluation workflow
 - The consolidated planning/tracking note is `project_notes/evaluation_execution_checklist_2026-03-15.md`.
 
 Current status
-- As of `2026-03-16`, fresh strict recollection, retraining, and standalone realtime testing are working again with the fixed strict sensor placement workflow.
+- As of `2026-03-25`, fresh strict recollection, retraining, and standalone realtime testing are working again with the fixed strict sensor placement workflow.
 - Left-arm, right-arm, and dual-arm realtime runs have all worked with fresh data and updated models when all required strict pairs are present.
 - The current checked-in realtime defaults are focused on 3-gesture strict testing:
   - `MODE = "dual"`
@@ -110,7 +119,15 @@ Current status
   - current default per-arm bundles = `models/strict/per_subject/<arm>/Matthew_3_gesture_15.pt`
 - Observed issue during live testing: intermittent Delsys sensor presence/dropout has been seen before inference starts, especially right-arm pairs `2` and `9`; treat this as a hardware/connectivity issue first unless software evidence changes.
 - CARLA integration is running again through `manual_control_emg.py`; the restored-display test launchers are the safer path when checking visuals/HUD without touching the current low-load launchers.
-- Current CARLA test runs should rely on client-side map loading through `manual_control_emg.py --map Town02_Opt`; editing the server batch map alone has not been reliable on this local CARLA install.
+- Named scenario wrappers are now the preferred path for CARLA evaluation runs.
+- Current named scenario preset maps are:
+  - `lane_keep_5min` -> `Town04_Opt`
+  - `highway_overtake` -> `Town04_Opt`
+- The shared restored-display test launcher still passes `--map Town02_Opt`, but named scenarios override that map inside `manual_control_emg.py`; editing the server batch map alone is still not the reliable control point on this local CARLA install.
+- The active scenario HUD now shows only the current target checkpoint and a single active route guide segment instead of all future checkpoint markers and all checkpoint-to-checkpoint guide lines.
+- The overtake scenario has been shortened from the earlier longer highway version by reducing lead spawn distance, route length, and checkpoint spacing/progression.
+- Runtime evaluation logging no longer writes collision fields into new CARLA drive CSVs.
+- Lane invasion logging now ignores permissive lane-change crossings and is intended to count only non-permissive lane-boundary violations.
 - Dual-arm CARLA reverse is now gesture-driven: both arms must publish `horn` at the same time to request reverse, and no horn action is emitted.
 - Next planned work for the next session is live tuning to reduce `neutral` flicker without making turn control too sticky or too weak.
 
@@ -127,7 +144,9 @@ Realtime notes
 - `carla_integration/manual_control_emg.py` reads `get_latest_published_gestures()` and resolves split-or-single dual-arm outputs into CARLA steering/signal/reverse actions.
 - `realtime_gesture_cnn.py` can now emit per-prediction timing CSVs with `--prediction-log` for evaluation work.
 - The CARLA integration can now emit per-tick drive logs and forward realtime prediction logs for latency analysis.
+- `--eval-log-dir` is the preferred switch for CARLA metrics collection; it auto-creates timestamped `carla_drive_*.csv` and `realtime_predictions_*.csv` files under the requested directory.
 - `manual_control_emg.py` now supports `--map <name>` and uses `client.load_world(...)` before the vehicle/HUD are created.
+- The current CARLA drive summary metrics are centered on lane error, lane invasions, scenario success/failure, completion time, and steering smoothness; new raw drive CSVs no longer include collision columns.
 - The current realtime file defaults are still tuned for strict 3-gesture testing; check `MODE`, `INCLUDED_GESTURES`, smoothing, confidence thresholds, and `OUTPUT_HYSTERESIS` before a run.
 - `manual_control_emg.py` launches realtime internally; for CARLA testing do not start `realtime_gesture_cnn.py` separately unless explicitly debugging that interface boundary.
 - `realtime_confidence_analysis.py` still uses older pair-membership logic and is not the source of truth for strict-layout validation.
