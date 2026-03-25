@@ -268,7 +268,7 @@ PROTOTYPE_REJECT_MIN_MARGIN = REALTIME_TUNING.prototype_reject_min_margin
 # Optional runtime gesture filtering (code-only; no CLI flags).
 # Example (3-class mode):
 # INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"}
-INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn"}
+INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "horn"}
 
 GESTURE_LABELS = ["neutral", "left_turn", "right_turn", "signal_left", "signal_right", "horn"]
 
@@ -295,7 +295,7 @@ MODEL_RIGHT = os.path.join(
     "strict",
     "per_subject",
     "right",
-    "Matthew_3_gesture_15.pt",
+    "Matthew_4_gesture_15.pt",
 )
 
 MODEL_LEFT = os.path.join(
@@ -304,7 +304,7 @@ MODEL_LEFT = os.path.join(
     "strict",
     "per_subject",
     "left",
-    "Matthew_3_gesture_15.pt",
+    "Matthew_4_gesture_15.pt",
 )
 # ================================
 
@@ -2467,7 +2467,6 @@ def main(argv=None):
                 if prediction_logger is not None:
                     prediction_logger.write_state(state)
 
-                output_signature = published_gesture_signature(published_output)
                 is_neutral_only = all(
                     gesture.label == LOW_CONFIDENCE_LABEL
                     for gesture in published_output.gestures
@@ -2475,14 +2474,14 @@ def main(argv=None):
                 if not published_output.gestures:
                     is_neutral_only = True
                 if (not is_neutral_only) or (last_output is not None):
-                    if output_signature != last_output:
-                        msg = format_published_gesture_output(published_output)
+                    msg = format_published_gesture_output(published_output)
+                    if msg != last_output:
                         if len(msg) < last_msg_len:
                             msg = msg.ljust(last_msg_len)
                         else:
                             last_msg_len = len(msg)
                         print(msg, end="\r", flush=True)
-                        last_output = output_signature
+                        last_output = format_published_gesture_output(published_output)
     except KeyboardInterrupt:
         print("\nStopping stream...")
     finally:

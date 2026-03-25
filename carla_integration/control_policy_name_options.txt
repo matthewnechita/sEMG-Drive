@@ -1,0 +1,29 @@
+CONTROL_POLICY_NAME options for carla_integration/manual_control_emg.py
+
+Edit this line in manual_control_emg.py:
+CONTROL_POLICY_NAME = "..."
+
+Valid string options:
+
+split_strength_latched_aux_v1
+- Left arm controls strong steering.
+- Right arm controls weak steering.
+- left arm left_turn -> left_strong
+- left arm right_turn -> right_strong
+- right arm left_turn -> left
+- right arm right_turn -> right
+- If neither arm is turning, steering stays neutral.
+
+collapsed_strength_latched_aux_v1
+- Matching turns on both arms become strong steering.
+- A turn from only one arm becomes weak steering.
+- both arms left_turn -> left_strong
+- both arms right_turn -> right_strong
+- either arm left_turn alone -> left
+- either arm right_turn alone -> right
+- left_turn on one arm and right_turn on the other -> neutral
+
+Notes:
+- These names now map to real behavior in manual_control_emg.py.
+- Signal toggle and reverse toggle behavior are separate from this selector.
+- After changing the string, rerun the CARLA client or one of the scenario .cmd launchers.

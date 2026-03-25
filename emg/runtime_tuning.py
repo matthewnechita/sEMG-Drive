@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 
 
 # Edit this one name to switch the active runtime tuning preset.
-ACTIVE_RUNTIME_TUNING_PRESET = "flicker_mild_margin"
+ACTIVE_RUNTIME_TUNING_PRESET = "baseline"
 
 
 @dataclass(frozen=True)
@@ -41,8 +41,8 @@ class CarlaTuning:
     neutral_steer_dwell_frames: int = 1
     steer_left: float = -0.08
     steer_right: float = 0.08
-    steer_left_strong: float = -0.4
-    steer_right_strong: float = 0.4
+    steer_left_strong: float = -0.35
+    steer_right_strong: float = 0.35
     steer_neutral: float = 0.0
 
 

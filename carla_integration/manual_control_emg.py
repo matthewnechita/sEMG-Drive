@@ -144,7 +144,15 @@ CAMERA_SENSOR_TICK_S = 1.0 / DEFAULT_CAMERA_FPS
 DEFAULT_HUD_VISIBLE = False
 HUD_VISIBLE_BY_DEFAULT = DEFAULT_HUD_VISIBLE
 CONTROL_POLICY_NAME = "split_strength_latched_aux_v1"
-SIGNAL_TOGGLE_TIMEOUT_S = 6.0
+CONTROL_POLICY_OPTIONS = {
+    "split_strength_latched_aux_v1": (
+        "Left arm is strong steering, right arm is weak steering."
+    ),
+    "collapsed_strength_latched_aux_v1": (
+        "Matching turns become strong steering; a single-arm turn is weak steering."
+    ),
+}
+SIGNAL_TOGGLE_TIMEOUT_S = 0.0
 SIGNAL_TOGGLE_COOLDOWN_S = 0.75
 REVERSE_TOGGLE_COOLDOWN_S = 1.0
 REVERSE_TOGGLE_MAX_SPEED_MPS = 0.75
@@ -152,6 +160,44 @@ REVERSE_TOGGLE_MAX_SPEED_MPS = 0.75
 
 def _now_stamp():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _resolve_dual_arm_steer_key(left_label: str, right_label: str) -> str:
+    left_label = str(left_label)
+    right_label = str(right_label)
+    policy_name = str(CONTROL_POLICY_NAME).strip()
+    labels = {left_label, right_label}
+    has_left_turn = "left_turn" in labels
+    has_right_turn = "right_turn" in labels
+
+    if policy_name == "split_strength_latched_aux_v1":
+        if left_label == "left_turn":
+            return "left_strong"
+        if left_label == "right_turn":
+            return "right_strong"
+        if right_label == "left_turn":
+            return "left"
+        if right_label == "right_turn":
+            return "right"
+        return "neutral"
+
+    if policy_name == "collapsed_strength_latched_aux_v1":
+        if has_left_turn and has_right_turn:
+            return "neutral"
+        if left_label == "left_turn" and right_label == "left_turn":
+            return "left_strong"
+        if left_label == "right_turn" and right_label == "right_turn":
+            return "right_strong"
+        if has_left_turn:
+            return "left"
+        if has_right_turn:
+            return "right"
+        return "neutral"
+
+    valid = ", ".join(sorted(CONTROL_POLICY_OPTIONS))
+    raise ValueError(
+        f"Unknown CONTROL_POLICY_NAME={policy_name!r}. Valid options: {valid}"
+    )
 
 
 def _map_basename(map_name):
@@ -1116,6 +1162,11 @@ class DualControl(object):
         self._signal_toggle_cooldown_s = float(SIGNAL_TOGGLE_COOLDOWN_S)
         self._reverse_toggle_cooldown_s = float(REVERSE_TOGGLE_COOLDOWN_S)
         self._reverse_toggle_max_speed_mps = float(REVERSE_TOGGLE_MAX_SPEED_MPS)
+        if str(CONTROL_POLICY_NAME).strip() not in CONTROL_POLICY_OPTIONS:
+            valid = ", ".join(sorted(CONTROL_POLICY_OPTIONS))
+            raise ValueError(
+                f"Unknown CONTROL_POLICY_NAME={CONTROL_POLICY_NAME!r}. Valid options: {valid}"
+            )
         self._signal_expiry_ts = None
         self._last_left_signal_toggle_ts = -1e9
         self._last_right_signal_toggle_ts = -1e9
@@ -1145,8 +1196,65 @@ class DualControl(object):
             self._drive_logger.close()
             self._drive_logger = None
 
+    def _get_live_player(self):
+        player = self._player
+        if player is None:
+            return None
+        if hasattr(player, "is_alive") and not player.is_alive:
+            return None
+        return player
+
+    def _reset_vehicle_state_for_respawn(self):
+        self._signal_state = "off"
+        self._signal_expiry_ts = None
+        self._last_left_signal_toggle_ts = -1e9
+        self._last_right_signal_toggle_ts = -1e9
+        self._last_reverse_toggle_ts = -1e9
+        self._last_lane_invasion_count = 0
+        self._last_collision_count = 0
+        self._clear_discrete_gesture_states()
+        self._reset_steer_dwell_candidate()
+        self._applied_steer_key = "neutral"
+        self._latest_steer_key = "neutral"
+        self._latest_applied_steer_key = "neutral"
+        self._latest_steer_dwell_pending_key = ""
+        self._latest_steer_dwell_pending_count = 0
+        self._latest_steer_dwell_required = 1
+        self._latest_signal_state = "off"
+        self._latest_horn_on = False
+        self._latest_gesture_fresh = False
+
+    def _sync_world_refs(self, world, reset_state_on_change: bool = False):
+        self._hud = getattr(world, "hud", None)
+        player = getattr(world, "player", None)
+        if player is self._player:
+            return False
+
+        self._player = player
+        if isinstance(player, carla.Vehicle):
+            try:
+                self._control = player.get_control()
+            except RuntimeError:
+                self._control = carla.VehicleControl()
+            player.set_autopilot(self._autopilot_enabled)
+        elif isinstance(player, carla.Walker):
+            try:
+                self._control = player.get_control()
+            except RuntimeError:
+                self._control = carla.WalkerControl()
+            self._autopilot_enabled = False
+            try:
+                self._rotation = player.get_transform().rotation
+            except RuntimeError:
+                pass
+
+        if reset_state_on_change:
+            self._reset_vehicle_state_for_respawn()
+        return True
+
     def parse_events(self, world, clock):
         self._client_fps = float(clock.get_fps())
+        self._sync_world_refs(world, reset_state_on_change=True)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return True
@@ -1202,6 +1310,7 @@ class DualControl(object):
                         world.player.set_autopilot(self._autopilot_enabled)
                         world.hud.notification('Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
 
+        self._sync_world_refs(world, reset_state_on_change=True)
         if not self._autopilot_enabled:
             if isinstance(self._control, carla.VehicleControl):
                 self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
@@ -1294,20 +1403,10 @@ class DualControl(object):
         right_label = str(right_label)
 
         reverse_toggle_requested = left_label == "horn" and right_label == "horn"
-        left_signal_toggle_requested = left_label == "signal_left"
-        right_signal_toggle_requested = right_label == "signal_right"
+        left_signal_toggle_requested = False
+        right_signal_toggle_requested = False
 
-        # Left arm is the strong/decisive steering arm. Right arm is the weak/fine arm.
-        if left_label == "left_turn":
-            steer_key = "left_strong"
-        elif left_label == "right_turn":
-            steer_key = "right_strong"
-        elif right_label == "left_turn":
-            steer_key = "left"
-        elif right_label == "right_turn":
-            steer_key = "right"
-        else:
-            steer_key = "neutral"
+        steer_key = _resolve_dual_arm_steer_key(left_label, right_label)
 
         return (
             steer_key,
@@ -1388,7 +1487,7 @@ class DualControl(object):
         right_signal_toggle_requested: bool,
     ):
         now = time.monotonic()
-        self._expire_signal_if_needed(now)
+        self._set_turn_signal("off")
 
         left_active = bool(left_signal_toggle_requested)
         right_active = bool(right_signal_toggle_requested)
@@ -1411,13 +1510,22 @@ class DualControl(object):
         self._prev_right_signal_active = right_active
 
     def _update_reverse_toggle(self, reverse_toggle_requested: bool):
-        if not isinstance(self._control, carla.VehicleControl):
-            return
         reverse_active = bool(reverse_toggle_requested)
+        if not isinstance(self._control, carla.VehicleControl):
+            self._prev_reverse_toggle_active = reverse_active
+            return
+        player = self._get_live_player()
+        if not isinstance(player, carla.Vehicle):
+            self._prev_reverse_toggle_active = reverse_active
+            return
         reverse_edge = reverse_active and not self._prev_reverse_toggle_active
         now = time.monotonic()
         if reverse_edge and (now - self._last_reverse_toggle_ts) >= self._reverse_toggle_cooldown_s:
-            velocity = self._player.get_velocity()
+            try:
+                velocity = player.get_velocity()
+            except RuntimeError:
+                self._prev_reverse_toggle_active = reverse_active
+                return
             speed_mps = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
             if speed_mps > self._reverse_toggle_max_speed_mps:
                 if self._hud is not None:
@@ -1443,7 +1551,7 @@ class DualControl(object):
             self._reset_steer_dwell_candidate()
             self._latest_steer_dwell_pending_key = ""
             self._latest_steer_dwell_pending_count = 0
-            self._expire_signal_if_needed()
+            self._set_turn_signal("off")
             self._clear_discrete_gesture_states()
             self._latest_signal_state = self._signal_state
             self._latest_horn_on = False
@@ -1530,11 +1638,16 @@ class DualControl(object):
         # Apply steering
         self._control.steer = float(self._gesture_to_steer[applied_steer_key])
 
-        # Signals latch on a gesture edge and auto-cancel after a short timeout.
-        self._update_signal_toggles(
-            left_signal_toggle_requested=left_signal_toggle_requested,
-            right_signal_toggle_requested=right_signal_toggle_requested,
-        )
+        # Signals are on only while a hard turn is being held.
+        if applied_steer_key == "left_strong":
+            target_signal = "left"
+        elif applied_steer_key == "right_strong":
+            target_signal = "right"
+        else:
+            target_signal = "off"
+
+        if target_signal != self._signal_state:
+            self._set_turn_signal(target_signal)
 
         # Reverse is a dual-horn toggle, not a hold-to-reverse action.
         self._update_reverse_toggle(reverse_toggle_requested)
@@ -1663,23 +1776,33 @@ class DualControl(object):
         """
         side: "off" | "left" | "right"
         """
-        if not isinstance(self._player, carla.Vehicle):
+        player = self._get_live_player()
+        if not isinstance(player, carla.Vehicle):
+            self._signal_state = "off"
             return
-    
+
         # Preserve any existing lights, but replace blinker bits.
-        current = int(self._player.get_light_state())
+        try:
+            current = int(player.get_light_state())
+        except RuntimeError:
+            self._signal_state = "off"
+            return
         left_bit = int(carla.VehicleLightState.LeftBlinker)
         right_bit = int(carla.VehicleLightState.RightBlinker)
         mask = left_bit | right_bit
-    
+
         new_bits = 0
         if side == "left":
             new_bits = left_bit
         elif side == "right":
             new_bits = right_bit
-    
+
         new_state = (current & ~mask) | new_bits
-        self._player.set_light_state(carla.VehicleLightState(new_state))
+        try:
+            player.set_light_state(carla.VehicleLightState(new_state))
+        except RuntimeError:
+            self._signal_state = "off"
+            return
         self._signal_state = side
     
     def _honk(self):
@@ -2114,7 +2237,7 @@ def game_loop(args):
 
         display = pygame.display.set_mode(
             (args.width, args.height),
-            pygame.HWSURFACE | pygame.DOUBLEBUF)
+            pygame.HWSURFACE | pygame.DOUBLEBUF | pygame.FULLSCREEN)
 
         hud = HUD(args.width, args.height)
         world = World(
