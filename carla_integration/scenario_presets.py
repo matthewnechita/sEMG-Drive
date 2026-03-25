@@ -32,9 +32,10 @@ class ScenarioPreset:
     route_length_m: float = 0.0
     checkpoint_progress_m: Tuple[float, ...] = ()
     checkpoint_locations_xyz: Tuple[CheckpointXYZ, ...] = ()
-    timeout_s: float = 300.0
+    timeout_s: Optional[float] = 300.0
     lead_blueprint_id: str = FIXED_SEDAN_BLUEPRINT
     lead_spawn_distance_m: float = 40.0
+    lead_hold_until_start: bool = False
     lead_speed_reduction_pct: float = 55.0
     overtake_finish_margin_m: float = 12.0
     require_return_to_start_lane: bool = True
@@ -52,7 +53,7 @@ SCENARIO_PRESETS: Dict[str, ScenarioPreset] = {
         checkpoint_radius_m=10.0,
         route_length_m=2600.0,
         checkpoint_progress_m=_progress_markers(18.0, 2600.0, 140.0),
-        timeout_s=420.0,
+        timeout_s=None,
     ),
     "highway_overtake": ScenarioPreset(
         name="highway_overtake",
@@ -64,8 +65,9 @@ SCENARIO_PRESETS: Dict[str, ScenarioPreset] = {
         checkpoint_radius_m=8.0,
         route_length_m=420.0,
         checkpoint_progress_m=_progress_markers(18.0, 420.0, 85.0),
-        timeout_s=90.0,
-        lead_spawn_distance_m=30.0,
+        timeout_s=None,
+        lead_spawn_distance_m=25.0,
+        lead_hold_until_start=True,
         lead_speed_reduction_pct=60.0,
         overtake_finish_margin_m=15.0,
         require_return_to_start_lane=True,

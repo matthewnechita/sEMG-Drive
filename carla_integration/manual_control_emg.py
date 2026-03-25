@@ -65,7 +65,7 @@ import weakref
 from pathlib import Path
 
 from carla_integration.scenario_presets import get_scenario_preset, scenario_choices
-from emg.runtime_tuning import get_runtime_tuning_preset
+from emg.runtime_tuning import CARLA_TUNING, RUNTIME_TUNING_NAME
 
 if sys.version_info >= (3, 0):
 
@@ -118,10 +118,6 @@ try:
     import numpy as np
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
-
-RUNTIME_TUNING_PRESET = get_runtime_tuning_preset()
-RUNTIME_TUNING_PRESET_NAME = RUNTIME_TUNING_PRESET.name
-CARLA_TUNING = RUNTIME_TUNING_PRESET.carla
 
 # Gesture/CARLA timing diagnostics.
 # Frame rate does not need to match EMG sample rate; this only controls how
@@ -358,6 +354,7 @@ class ScenarioRuntime(object):
         self._last_current_lane_id = None
         self._last_sim_time = 0.0
         self._should_exit = False
+        self._lead_autopilot_enabled = False
 
     def get_ego_spawn_transform(self, carla_map):
         spawn_points = list(carla_map.get_spawn_points())
@@ -428,6 +425,35 @@ class ScenarioRuntime(object):
             if progress >= target:
                 return self._route_waypoints[idx].transform.location
         return self._route_waypoints[-1].transform.location
+
+    def _lead_spawn_waypoint(self, target_progress_m):
+        route_index = self._progress_to_route_index(target_progress_m)
+        if route_index is None or not self._route_waypoints:
+            return None
+
+        if self._start_lane_id is None or self._start_road_id is None:
+            return self._route_waypoints[route_index]
+
+        candidate = self._route_waypoints[route_index]
+        if (
+            int(candidate.road_id) == int(self._start_road_id)
+            and int(candidate.lane_id) == int(self._start_lane_id)
+        ):
+            return candidate
+
+        best_match = None
+        best_offset = None
+        for idx, waypoint in enumerate(self._route_waypoints):
+            if (
+                int(waypoint.road_id) != int(self._start_road_id)
+                or int(waypoint.lane_id) != int(self._start_lane_id)
+            ):
+                continue
+            offset = abs(int(idx) - int(route_index))
+            if best_offset is None or offset < best_offset:
+                best_match = waypoint
+                best_offset = offset
+        return best_match if best_match is not None else candidate
 
     def _locations_from_explicit_checkpoints(self):
         checkpoints = []
@@ -617,14 +643,7 @@ class ScenarioRuntime(object):
             float(self.preset.lead_spawn_distance_m),
             float(self._route_progress_m[-1]),
         )
-        spawn_location = self._progress_to_location(target_progress)
-        if spawn_location is None:
-            return
-        waypoint = world.world.get_map().get_waypoint(
-            spawn_location,
-            project_to_road=True,
-            lane_type=carla.LaneType.Driving,
-        )
+        waypoint = self._lead_spawn_waypoint(target_progress)
         if waypoint is None:
             return
         transform = carla.Transform(
@@ -650,9 +669,20 @@ class ScenarioRuntime(object):
             return
         self._lead_vehicle = actor
         self._actors.append(actor)
-        if self._traffic_manager is None:
+        if bool(getattr(self.preset, "lead_hold_until_start", False)):
+            self._freeze_lead_vehicle()
+            return
+        self._enable_lead_autopilot()
+
+    def _enable_lead_autopilot(self):
+        actor = self._lead_vehicle
+        if actor is None or not actor.is_alive or self._traffic_manager is None:
             return
         tm_port = int(self._traffic_manager.get_port())
+        try:
+            actor.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.0, hand_brake=False))
+        except RuntimeError:
+            pass
         actor.set_autopilot(True, tm_port)
         try:
             self._traffic_manager.auto_lane_change(actor, False)
@@ -669,6 +699,24 @@ class ScenarioRuntime(object):
             )
         except RuntimeError:
             pass
+        self._lead_autopilot_enabled = True
+
+    def _freeze_lead_vehicle(self):
+        actor = self._lead_vehicle
+        if actor is None or not actor.is_alive:
+            return
+        try:
+            if self._traffic_manager is not None:
+                actor.set_autopilot(False, int(self._traffic_manager.get_port()))
+            else:
+                actor.set_autopilot(False)
+        except RuntimeError:
+            pass
+        try:
+            actor.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=True))
+        except RuntimeError:
+            pass
+        self._lead_autopilot_enabled = False
 
     def destroy(self):
         for actor in reversed(self._actors):
@@ -679,6 +727,7 @@ class ScenarioRuntime(object):
                 pass
         self._actors = []
         self._lead_vehicle = None
+        self._lead_autopilot_enabled = False
 
     def setup(self, world):
         self.destroy()
@@ -705,6 +754,7 @@ class ScenarioRuntime(object):
         self._last_current_lane_id = None
         self._last_sim_time = 0.0
         self._should_exit = False
+        self._lead_autopilot_enabled = False
 
         start_waypoint = world.world.get_map().get_waypoint(
             world.player.get_location(),
@@ -811,6 +861,8 @@ class ScenarioRuntime(object):
                 self._start_sim_time = float(sim_time)
                 self._next_checkpoint_index = 1 if self._checkpoint_locations else 0
                 self._last_next_checkpoint_distance_m = self._distance_to_next_checkpoint(ego_location)
+                if self.preset.kind == "overtake" and bool(getattr(self.preset, "lead_hold_until_start", False)):
+                    self._enable_lead_autopilot()
                 world.hud.notification("Scenario started", seconds=2.0)
         else:
             self._advance_checkpoints(ego_location)
@@ -818,7 +870,8 @@ class ScenarioRuntime(object):
 
         if self._started and not self._finished and self._start_sim_time is not None:
             elapsed = float(sim_time - self._start_sim_time)
-            if elapsed > float(self.preset.timeout_s):
+            timeout_s = getattr(self.preset, "timeout_s", None)
+            if timeout_s is not None and float(timeout_s) > 0.0 and elapsed > float(timeout_s):
                 self._finish(world, sim_time, False, "timeout")
                 return
 
@@ -1230,7 +1283,7 @@ class DualControl(object):
         self._prev_right_signal_active = False
         self._prev_reverse_toggle_active = False
         print(
-            f"[gesture] runtime preset: {RUNTIME_TUNING_PRESET_NAME} "
+            f"[gesture] runtime tuning: {RUNTIME_TUNING_NAME} "
             f"(gesture_max_age={self._gesture_max_age:.2f}s, "
             f"active_dwell={self._active_steer_dwell_frames}, "
             f"neutral_dwell={self._neutral_steer_dwell_frames}, "
@@ -1756,7 +1809,7 @@ class DualControl(object):
         apply_ts = time.time()
         scenario = world.get_scenario_snapshot()
         row = {
-            'runtime_preset': RUNTIME_TUNING_PRESET_NAME,
+            'runtime_preset': RUNTIME_TUNING_NAME,
             'control_policy': CONTROL_POLICY_NAME,
             'timestamp': datetime.datetime.now().isoformat(),
             'wall_time_s': apply_ts,

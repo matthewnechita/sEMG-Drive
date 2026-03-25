@@ -25,18 +25,13 @@ from libemg import filtering as libemg_filter
 from emg.channel_layout import infer_channel_layout
 from emg.gesture_model_cnn import load_cnn_bundle, quick_finetune
 from emg.prototype_classifier import PrototypeClassifier
-from emg.runtime_tuning import get_runtime_tuning_preset
+from emg.runtime_tuning import REALTIME_TUNING, RUNTIME_TUNING_NAME
 from emg.strict_layout import (
     parse_pair_number as parse_strict_pair_number,
     resolve_strict_channel_indices,
     strict_channel_count_for_arm,
     strict_pair_numbers_for_arm,
 )
-
-RUNTIME_TUNING_PRESET = get_runtime_tuning_preset()
-RUNTIME_TUNING_PRESET_NAME = RUNTIME_TUNING_PRESET.name
-REALTIME_TUNING = RUNTIME_TUNING_PRESET.realtime
-
 
 # ======== Config (edit as needed) ========
 WINDOW_SIZE = 200
@@ -184,7 +179,7 @@ class PredictionCSVLogger:
     def write_state(self, state: DualGestureState) -> None:
         published = state.published
         row = {
-            "runtime_preset": RUNTIME_TUNING_PRESET_NAME,
+            "runtime_preset": RUNTIME_TUNING_NAME,
             "prediction_seq": int(getattr(published, "prediction_seq", 0)),
             "window_end_ts": float(getattr(published, "window_end_ts", 0.0)),
             "prediction_ts": float(getattr(published, "prediction_ts", 0.0)),
@@ -1435,7 +1430,7 @@ def main(argv=None):
             raise RuntimeError("Requested --device cuda, but CUDA is not available.")
     print('[gesture] device:', device)
     print(
-        f"[gesture] runtime preset: {RUNTIME_TUNING_PRESET_NAME} "
+        f"[gesture] runtime tuning: {RUNTIME_TUNING_NAME} "
         f"(smoothing={SMOOTHING}, min_conf={MIN_CONFIDENCE:.2f}, "
         f"hysteresis={OUTPUT_HYSTERESIS}, softmax_reject={REALTIME_TUNING.softmax_reject_enabled})"
     )

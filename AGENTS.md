@@ -115,7 +115,8 @@ Current status
 - The current checked-in realtime defaults are focused on 3-gesture strict testing:
   - `MODE = "dual"`
   - `INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"}`
-  - active runtime preset = `flicker_mild_margin`
+  - runtime tuning presets have been removed; edit the concrete values directly in `emg/runtime_tuning.py`
+  - current runtime tuning log label = `manual`
   - current default per-arm bundles = `models/strict/per_subject/<arm>/Matthew_3_gesture_15.pt`
 - Observed issue during live testing: intermittent Delsys sensor presence/dropout has been seen before inference starts, especially right-arm pairs `2` and `9`; treat this as a hardware/connectivity issue first unless software evidence changes.
 - CARLA integration is running again through `manual_control_emg.py`; the restored-display test launchers are the safer path when checking visuals/HUD without touching the current low-load launchers.
@@ -125,7 +126,9 @@ Current status
   - `highway_overtake` -> `Town04_Opt`
 - The shared restored-display test launcher still passes `--map Town02_Opt`, but named scenarios override that map inside `manual_control_emg.py`; editing the server batch map alone is still not the reliable control point on this local CARLA install.
 - The active scenario HUD now shows only the current target checkpoint and a single active route guide segment instead of all future checkpoint markers and all checkpoint-to-checkpoint guide lines.
+- The named `lane_keep_5min` and `highway_overtake` scenarios no longer auto-fail on elapsed time; they now run until completed, manually exited, or another failure condition occurs.
 - The overtake scenario has been shortened from the earlier longer highway version by reducing lead spawn distance, route length, and checkpoint spacing/progression.
+- The overtake lead vehicle is intended to spawn in the same lane as the ego start lane, closer than before, and remain held at spawn until the scenario actually starts so calibration does not consume the overtake gap.
 - Runtime evaluation logging no longer writes collision fields into new CARLA drive CSVs.
 - Lane invasion logging now ignores permissive lane-change crossings and is intended to count only non-permissive lane-boundary violations.
 - Dual-arm CARLA reverse is now gesture-driven: both arms must publish `horn` at the same time to request reverse, and no horn action is emitted.
@@ -133,6 +136,7 @@ Current status
 
 Realtime notes
 - `realtime_gesture_cnn.py` is the source of truth for live strict-layout behavior.
+- `emg/runtime_tuning.py` is the source of truth for live runtime tuning values; there is no preset selector anymore.
 - `AUTO_DUAL_ARM_CHANNEL_MAPPING` does not override strict dual-arm mapping when both bundles advertise strict layout.
 - Dual-arm realtime now keeps per-arm state internally and exposes:
   - `get_latest_dual_state()` for full left/right arm state plus compatibility combined state.
