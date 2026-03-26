@@ -8,7 +8,6 @@ data_resampled_strict/
 models/cross_subject/left/
 models/cross_subject/right/*_stage_a_neutral_active.pt
 models/cross_subject/right/*_stage_b_active_gestures.pt
-models/strict/
 
 # Python caches
 __pycache__/
