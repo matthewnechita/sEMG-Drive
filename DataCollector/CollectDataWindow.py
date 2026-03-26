@@ -333,27 +333,33 @@ class CollectDataWindow(QWidget):
         armWidget.setLayout(armLayout)
         buttonLayout.addWidget(armWidget)
 
+        # ---- Protocol selector
+        protocolWidget = QWidget()
+        protocolLayout = QHBoxLayout()
+        protocolLayout.setContentsMargins(0, 0, 0, 0)
+        protocol_label = QLabel("Protocol:")
+        protocol_label.setStyleSheet("color: white;")
+        protocolLayout.addWidget(protocol_label)
+        self.protocol_selector = QComboBox(self)
+        self.protocol_selector.setToolTip('Choose the scripted collection protocol to run')
+        self.protocol_selector.setStyleSheet('QComboBox {color: white;background: #848482}')
+        self.protocol_selector.setMinimumContentsLength(28)
+        self.protocol_selector.setMinimumWidth(280)
+        self.protocol_selector.setEnabled(False)
+        self._populate_protocol_selector()
+        protocolLayout.addWidget(self.protocol_selector, 1)
+        protocolWidget.setLayout(protocolLayout)
+        buttonLayout.addWidget(protocolWidget)
+
         # ---- Labeled Protocol (NPZ) Button
         self.recordnpz_button = QPushButton('Run Protocol + Save NPZ', self)
-        self.recordnpz_button.setToolTip('Run scripted gesture/rest protocol and save .npz with labels')
+        self.recordnpz_button.setToolTip('Run the selected scripted collection protocol and save .npz with labels')
         self.recordnpz_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.recordnpz_button.clicked.connect(self.protocol_callback)
         self.recordnpz_button.setStyleSheet('QPushButton {color: grey;}')
         self.recordnpz_button.setEnabled(False)
         self.recordnpz_button.setFixedHeight(50)
         buttonLayout.addWidget(self.recordnpz_button)
-
-        # ---- Neutral Recovery Protocol Button
-        self.neutral_recovery_button = QPushButton('Run Neutral Recovery Protocol', self)
-        self.neutral_recovery_button.setToolTip(
-            'Collect repeated left/right gesture releases into neutral without changing the standard protocol'
-        )
-        self.neutral_recovery_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        self.neutral_recovery_button.clicked.connect(self.neutral_recovery_protocol_callback)
-        self.neutral_recovery_button.setStyleSheet('QPushButton {color: grey;}')
-        self.neutral_recovery_button.setEnabled(False)
-        self.neutral_recovery_button.setFixedHeight(50)
-        buttonLayout.addWidget(self.neutral_recovery_button)
 
         # ---- Drop-down menu of sensor modes
         self.SensorModeList = QComboBox(self)
@@ -645,8 +651,7 @@ class CollectDataWindow(QWidget):
             self.stop_button.setStyleSheet("color : white")
             self.recordnpz_button.setEnabled(True)
             self.recordnpz_button.setStyleSheet("color : white")
-            self.neutral_recovery_button.setEnabled(True)
-            self.neutral_recovery_button.setStyleSheet("color : white")
+            self.protocol_selector.setEnabled(True)
             self.MetricsConnector.sensorsconnected.setText(str(len(sensorList)))
             self.starttriggercheckbox.setEnabled(True)
             self.stoptriggercheckbox.setEnabled(True)
@@ -765,25 +770,155 @@ class CollectDataWindow(QWidget):
         arm = "right" if self.arm_right_radio.isChecked() else "left"
         return subject, session, arm
 
+    def _populate_protocol_selector(self):
+        if not hasattr(self, "protocol_selector"):
+            return
+        self.protocol_selector.clear()
+        for protocol_name, _ in self._protocol_catalog():
+            self.protocol_selector.addItem(protocol_name, protocol_name)
+
+    def _protocol_catalog(self):
+        return (
+            ("standard_4g", self._build_standard_protocol_config),
+            ("left_turn_focus", self._build_left_turn_focus_protocol_config),
+            ("right_turn_focus", self._build_right_turn_focus_protocol_config),
+            ("horn_focus", self._build_horn_focus_protocol_config),
+            ("signal_left_focus", self._build_signal_left_focus_protocol_config),
+            ("signal_right_focus", self._build_signal_right_focus_protocol_config),
+            ("neutral_dynamic", self._build_neutral_dynamic_protocol_config),
+            ("neutral_recovery", self._build_neutral_recovery_protocol_config),
+        )
+
+    def _selected_protocol_name(self) -> str:
+        if not hasattr(self, "protocol_selector"):
+            return "standard_4g"
+        selected = self.protocol_selector.currentData()
+        if selected is None:
+            selected = self.protocol_selector.currentText()
+        return str(selected or "standard_4g")
+
+    def _build_protocol_config(self, protocol_name: str, subject: str, session: str, arm: str) -> TrialConfig:
+        for name, builder in self._protocol_catalog():
+            if name == protocol_name:
+                return builder(subject, session, arm)
+        valid = ", ".join(name for name, _ in self._protocol_catalog())
+        raise ValueError(f"Unknown protocol {protocol_name!r}. Valid options: {valid}")
+
+    def _base_protocol_kwargs(self, subject: str, session: str, arm: str) -> dict:
+        return {
+            "subject": subject.strip(),
+            "session": session.strip(),
+            "arm": arm,
+            "prep_duration": 5.0,
+            "calibrate": True,
+            "calibration_neutral_s": 5.0,
+            "calibration_mvc_s": 5.0,
+            "calibration_mvc_prep_s": 2.0,
+            "calibration_min_ratio": 2.0,
+        }
+
+    def _build_focus_protocol_config(
+        self,
+        gesture: str,
+        protocol_name: str,
+        subject: str,
+        session: str,
+        arm: str,
+        *,
+        gesture_duration: float = 4.0,
+        repetitions: int = 20,
+    ) -> TrialConfig:
+        return TrialConfig(
+            gestures=[gesture],
+            gesture_duration=gesture_duration,
+            neutral_duration=5.0,
+            repetitions=repetitions,
+            protocol_name=protocol_name,
+            inter_gesture_rest_s=1.5,
+            label_trim_s=0.5,
+            rest_label_trim_s=None,
+            **self._base_protocol_kwargs(subject, session, arm),
+        )
+
     def _build_standard_protocol_config(self, subject: str, session: str, arm: str) -> TrialConfig:
         return TrialConfig(
-            gestures=["left_turn", "right_turn", "neutral", "signal_left", "signal_right", "horn"],
+            gestures=["left_turn", "right_turn", "neutral", "horn"],
             gesture_duration=5.0,
             neutral_duration=5.0,
             repetitions=5,
-            subject=subject.strip(),
-            session=session.strip(),
             protocol_name="standard",
-            arm=arm,
-            prep_duration=5.0,
-            inter_gesture_rest_s=1.0,
+            inter_gesture_rest_s=1.5,
             label_trim_s=0.5,
             rest_label_trim_s=None,
-            calibrate=True,
-            calibration_neutral_s=5.0,
-            calibration_mvc_s=5.0,
-            calibration_mvc_prep_s=2.0,
-            calibration_min_ratio=2.0,
+            **self._base_protocol_kwargs(subject, session, arm),
+        )
+
+    def _build_left_turn_focus_protocol_config(self, subject: str, session: str, arm: str) -> TrialConfig:
+        return self._build_focus_protocol_config(
+            "left_turn",
+            "left_turn_focus",
+            subject,
+            session,
+            arm,
+            gesture_duration=4.0,
+            repetitions=20,
+        )
+
+    def _build_right_turn_focus_protocol_config(self, subject: str, session: str, arm: str) -> TrialConfig:
+        return self._build_focus_protocol_config(
+            "right_turn",
+            "right_turn_focus",
+            subject,
+            session,
+            arm,
+            gesture_duration=4.0,
+            repetitions=20,
+        )
+
+    def _build_horn_focus_protocol_config(self, subject: str, session: str, arm: str) -> TrialConfig:
+        return self._build_focus_protocol_config(
+            "horn",
+            "horn_focus",
+            subject,
+            session,
+            arm,
+            gesture_duration=4.0,
+            repetitions=15,
+        )
+
+    def _build_signal_left_focus_protocol_config(self, subject: str, session: str, arm: str) -> TrialConfig:
+        return self._build_focus_protocol_config(
+            "signal_left",
+            "signal_left_focus",
+            subject,
+            session,
+            arm,
+            gesture_duration=4.0,
+            repetitions=15,
+        )
+
+    def _build_signal_right_focus_protocol_config(self, subject: str, session: str, arm: str) -> TrialConfig:
+        return self._build_focus_protocol_config(
+            "signal_right",
+            "signal_right_focus",
+            subject,
+            session,
+            arm,
+            gesture_duration=4.0,
+            repetitions=15,
+        )
+
+    def _build_neutral_dynamic_protocol_config(self, subject: str, session: str, arm: str) -> TrialConfig:
+        return TrialConfig(
+            gestures=["neutral"],
+            gesture_duration=5.0,
+            neutral_duration=25.0,
+            repetitions=4,
+            protocol_name="neutral_dynamic",
+            inter_gesture_rest_s=0.0,
+            label_trim_s=0.0,
+            rest_label_trim_s=None,
+            **self._base_protocol_kwargs(subject, session, arm),
         )
 
     def _build_neutral_recovery_protocol_config(self, subject: str, session: str, arm: str) -> TrialConfig:
@@ -792,21 +927,13 @@ class CollectDataWindow(QWidget):
             gesture_duration=3.0,
             neutral_duration=5.0,
             repetitions=6,
-            subject=subject.strip(),
-            session=session.strip(),
             protocol_name="neutral_recovery",
-            arm=arm,
-            prep_duration=5.0,
             inter_gesture_rest_s=0.0,
             label_trim_s=0.5,
             rest_label_trim_s=None,
             recovery_neutral_lead_trim_s=1.0,
             recovery_neutral_trail_trim_s=0.0,
-            calibrate=True,
-            calibration_neutral_s=5.0,
-            calibration_mvc_s=5.0,
-            calibration_mvc_prep_s=2.0,
-            calibration_min_ratio=2.0,
+            **self._base_protocol_kwargs(subject, session, arm),
         )
 
     def _protocol_output_path(self, config: TrialConfig) -> Path:
@@ -829,24 +956,8 @@ class CollectDataWindow(QWidget):
             return
 
         subject, session, arm = self._protocol_subject_session_arm()
-        config = self._build_standard_protocol_config(subject, session, arm)
-        output_path = self._protocol_output_path(config)
-
-        try:
-            self.run_protocol_with_plot(config, output_path)
-            QMessageBox.information(self, "Saved", f"Saved to {output_path}")
-            self.exportcsv_button.setEnabled(False)
-            self.exportcsv_button.setStyleSheet("color : gray")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-
-    def neutral_recovery_protocol_callback(self):
-        if not self.CallbackConnector or not hasattr(self, "CallbackConnector"):
-            QMessageBox.critical(self, "Error", "CallbackConnector not ready. Connect and scan first.")
-            return
-
-        subject, session, arm = self._protocol_subject_session_arm()
-        config = self._build_neutral_recovery_protocol_config(subject, session, arm)
+        protocol_name = self._selected_protocol_name()
+        config = self._build_protocol_config(protocol_name, subject, session, arm)
         output_path = self._protocol_output_path(config)
 
         try:

@@ -1,0 +1,236 @@
+cross subject right:
+Epoch 70 | loss 0.3738 | eval_loss 0.5091 | train 0.932 | eval 0.887
+
+In-distribution test accuracy: 0.909
+(Note: this is NOT the cross-subject accuracy. See LOSO results above.)
+
+Report:
+               precision    recall  f1-score   support
+
+        horn       0.97      0.93      0.95      2870
+   left_turn       0.99      0.77      0.87      3371
+     neutral       0.84      0.98      0.90      4832
+  right_turn       0.92      0.93      0.92      3374
+
+    accuracy                           0.91     14447
+   macro avg       0.93      0.90      0.91     14447
+weighted avg       0.92      0.91      0.91     14447
+
+
+Confusion matrix (counts, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       2666         16        102         86
+ left_turn |         75       2595        592        109
+   neutral |         10         10       4750         62
+right_turn |          5          7        239       3123
+
+Confusion matrix (row-normalized %, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       92.9        0.6        3.6        3.0
+ left_turn |        2.2       77.0       17.6        3.2
+   neutral |        0.2        0.2       98.3        1.3
+right_turn |        0.1        0.2        7.1       92.6
+
+Confusion matrix (col-normalized %, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       96.7        0.6        1.8        2.5
+ left_turn |        2.7       98.7       10.4        3.2
+   neutral |        0.4        0.4       83.6        1.8
+right_turn |        0.2        0.3        4.2       92.4
+
+Core metrics:
+  balanced_accuracy: 0.902
+  macro P/R/F1: 0.929 / 0.902 / 0.910
+  weighted P/R/F1: 0.918 / 0.909 / 0.908
+  worst_class_recall: left_turn = 0.770
+  max_precision_recall_gap: left_turn = 0.218
+  confusion_to_neutral_rate:
+    horn -> neutral: 0.036
+    left_turn -> neutral: 0.176
+    right_turn -> neutral: 0.071
+  neutral_prediction_fp_rate: 0.164
+Per-subject breakdown:
+  Iggy: 0.934  (1485 windows)
+  Matthew: 0.938  (4919 windows)
+  Subject03: 0.870  (3123 windows)
+  subject01: 0.930  (1640 windows)
+  subject04: 0.882  (3280 windows)
+Saved to models\strict\cross_subject\right\v6_4_gestures.pt
+
+=======================================================
+Cross-subject model saved to models\strict\cross_subject\right\v6_4_gestures.pt
+Run realtime inference:
+  python realtime_gesture_cnn.py --model models\strict\cross_subject\right\v6_4_gestures.pt
+
+cross subject left:
+Epoch 70 | loss 0.3233 | eval_loss 0.5294 | train 0.952 | eval 0.888
+
+In-distribution test accuracy: 0.919
+(Note: this is NOT the cross-subject accuracy. See LOSO results above.)
+
+Report:
+               precision    recall  f1-score   support
+
+        horn       0.85      0.98      0.91      2870
+   left_turn       0.99      0.85      0.91      2870
+     neutral       0.87      0.98      0.92      2868
+  right_turn       1.00      0.87      0.93      2870
+
+    accuracy                           0.92     11478
+   macro avg       0.93      0.92      0.92     11478
+weighted avg       0.93      0.92      0.92     11478
+
+
+Confusion matrix (counts, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       2801          8         59          2
+ left_turn |        127       2441        300          2
+   neutral |         53         11       2799          5
+right_turn |        316          7         42       2505
+
+Confusion matrix (row-normalized %, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       97.6        0.3        2.1        0.1
+ left_turn |        4.4       85.1       10.5        0.1
+   neutral |        1.8        0.4       97.6        0.2
+right_turn |       11.0        0.2        1.5       87.3
+
+Confusion matrix (col-normalized %, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       85.0        0.3        1.8        0.1
+ left_turn |        3.9       98.9        9.4        0.1
+   neutral |        1.6        0.4       87.5        0.2
+right_turn |        9.6        0.3        1.3       99.6
+
+Core metrics:
+  balanced_accuracy: 0.919
+  macro P/R/F1: 0.928 / 0.919 / 0.919
+  weighted P/R/F1: 0.928 / 0.919 / 0.919
+  worst_class_recall: left_turn = 0.851
+  max_precision_recall_gap: left_turn = 0.139
+  confusion_to_neutral_rate:
+    horn -> neutral: 0.021
+    left_turn -> neutral: 0.105
+    right_turn -> neutral: 0.015
+  neutral_prediction_fp_rate: 0.125
+Per-subject breakdown:
+  Matthew: 0.937  (3279 windows)
+  subject02: 0.886  (3280 windows)
+  subject03: 0.899  (1639 windows)
+  subject04: 0.943  (3280 windows)
+Saved to models\strict\cross_subject\left\v6_4_gestures.pt
+
+=======================================================
+Cross-subject model saved to models\strict\cross_subject\left\v6_4_gestures.pt
+Run realtime inference:
+  python realtime_gesture_cnn.py --model models\strict\cross_subject\left\v6_4_gestures.pt
+
+per subject right (Matthew):
+Epoch 70 | loss 0.2529 | eval_loss 0.3679 | train 0.983 | eval 0.946
+
+In-distribution test accuracy: 0.952
+
+Report:
+               precision    recall  f1-score   support
+
+        horn       0.95      0.93      0.94      1230
+   left_turn       0.98      0.96      0.97      1230
+     neutral       0.89      0.97      0.93      1230
+  right_turn       0.98      0.95      0.97      1230
+
+    accuracy                           0.95      4920
+   macro avg       0.95      0.95      0.95      4920
+weighted avg       0.95      0.95      0.95      4920
+
+
+Confusion matrix (counts, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       1138         10         70         12
+ left_turn |         12       1177         38          3
+   neutral |         20          8       1195          7
+right_turn |         23          0         35       1172
+
+Confusion matrix (row-normalized %, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       92.5        0.8        5.7        1.0
+ left_turn |        1.0       95.7        3.1        0.2
+   neutral |        1.6        0.7       97.2        0.6
+right_turn |        1.9        0.0        2.8       95.3
+
+Confusion matrix (col-normalized %, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       95.4        0.8        5.2        1.0
+ left_turn |        1.0       98.5        2.8        0.3
+   neutral |        1.7        0.7       89.3        0.6
+right_turn |        1.9        0.0        2.6       98.2
+
+Core metrics:
+  balanced_accuracy: 0.952
+  macro P/R/F1: 0.953 / 0.952 / 0.952
+  weighted P/R/F1: 0.953 / 0.952 / 0.952
+  worst_class_recall: horn = 0.925
+  max_precision_recall_gap: neutral = 0.078
+  confusion_to_neutral_rate:
+    horn -> neutral: 0.057
+    left_turn -> neutral: 0.031
+    right_turn -> neutral: 0.028
+  neutral_prediction_fp_rate: 0.107
+Saved to models\strict\per_subject\right\Matthewv6_4_gestures.pt
+
+=======================================================
+Single-subject training complete.
+  python realtime_gesture_cnn.py --model models\strict\per_subject\right\Matthewv6_4_gestures.pt
+
+per subject left (Matthew):
+In-distribution test accuracy: 0.946
+
+Report:
+               precision    recall  f1-score   support
+
+        horn       0.92      0.95      0.93      1230
+   left_turn       0.99      0.89      0.94      1229
+     neutral       0.90      0.98      0.94      1230
+  right_turn       0.99      0.96      0.97      1230
+
+    accuracy                           0.95      4919
+   macro avg       0.95      0.95      0.95      4919
+weighted avg       0.95      0.95      0.95      4919
+
+
+Confusion matrix (counts, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       1166          4         59          1
+ left_turn |         59       1097         66          7
+   neutral |         11          3       1206         10
+right_turn |         31          3         12       1184
+
+Confusion matrix (row-normalized %, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       94.8        0.3        4.8        0.1
+ left_turn |        4.8       89.3        5.4        0.6
+   neutral |        0.9        0.2       98.0        0.8
+right_turn |        2.5        0.2        1.0       96.3
+
+Confusion matrix (col-normalized %, rows=true, cols=pred):
+                   horn  left_turn    neutral right_turn
+      horn |       92.0        0.4        4.4        0.1
+ left_turn |        4.7       99.1        4.9        0.6
+   neutral |        0.9        0.3       89.8        0.8
+right_turn |        2.4        0.3        0.9       98.5
+
+Core metrics:
+  balanced_accuracy: 0.946
+  macro P/R/F1: 0.949 / 0.946 / 0.946
+  weighted P/R/F1: 0.949 / 0.946 / 0.946
+  worst_class_recall: left_turn = 0.893
+  max_precision_recall_gap: left_turn = 0.098
+  confusion_to_neutral_rate:
+    horn -> neutral: 0.048
+    left_turn -> neutral: 0.054
+    right_turn -> neutral: 0.010
+  neutral_prediction_fp_rate: 0.102
+Saved to models\strict\per_subject\left\Matthewv6_4_gestures.pt
+
+=======================================================
+Single-subject training complete.
+  python realtime_gesture_cnn.py --model models\strict\per_subject\left\Matthewv6_4_gestures.pt

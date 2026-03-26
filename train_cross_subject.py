@@ -44,9 +44,9 @@ from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_
 
 
 # ======== Config ========
-ARM        = "right"            # ← set to "right" or "left" before running, lowercase l
+ARM        = "left"            # ← set to "right" or "left" before running, lowercase l
 DATA_ROOT  = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
-MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "gesture_cnn_v3_3_gestures.pt"
+MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "v6_4_gestures.pt"
 PATTERN    = "*_filtered.npz"
 
 WINDOW_SIZE = 200
@@ -55,7 +55,7 @@ WINDOW_STEP = 100
 USE_CALIBRATION          = True
 MVC_PERCENTILE           = 95.0
 USE_MIN_LABEL_CONFIDENCE = True
-MIN_LABEL_CONFIDENCE     = 0.75
+MIN_LABEL_CONFIDENCE     = 0.85
 
 TEST_SIZE    = 0.2
 RANDOM_STATE = 42
@@ -65,7 +65,7 @@ BATCH_SIZE   = 512
 # GestureCNNv2 at 503K params on ~122K training windows = ~4 params/sample.
 # More epochs than per-subject: larger model + larger dataset benefits from
 # longer training. Convergence argument, not wall-clock.
-EPOCHS  = 80
+EPOCHS  = 70
 LR      = 1e-4
 DROPOUT = 0.25
 LABEL_SMOOTHING = 0.05
@@ -88,7 +88,7 @@ EXCLUDED_SUBJECTS: list[str] = []
 # Set INCLUDED_GESTURES to a subset to train only those labels.
 # Example:
 # INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"} example
-INCLUDED_GESTURES: set[str] | None = None # set to = None to include all gestures
+INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "horn"} # set to = None to include all gestures
 
 # LOSO evaluation must be run before deploying the cross-subject model.
 # This measures true cross-subject accuracy (model vs subjects it never trained on).
