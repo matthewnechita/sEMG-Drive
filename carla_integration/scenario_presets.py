@@ -27,6 +27,7 @@ class ScenarioPreset:
     ego_blueprint_id: str = FIXED_SEDAN_BLUEPRINT
     ego_spawn_index: int = 0
     start_offset_m: float = 18.0
+    start_checkpoint_index: int = 0
     checkpoint_spacing_m: float = 40.0
     checkpoint_radius_m: float = 10.0
     route_length_m: float = 0.0
@@ -49,6 +50,7 @@ SCENARIO_PRESETS: Dict[str, ScenarioPreset] = {
         map_name="Town04_Opt",
         ego_spawn_index=0,
         start_offset_m=18.0,
+        start_checkpoint_index=3,
         checkpoint_spacing_m=35.0,
         checkpoint_radius_m=10.0,
         route_length_m=2600.0,

@@ -346,6 +346,7 @@ class ScenarioRuntime(object):
         self._finish_sim_time = None
         self._completion_time_s = None
         self._next_checkpoint_index = 0
+        self._start_checkpoint_index = 0
         self._last_progress_m = None
         self._overtake_objective_met = False
         self._last_next_checkpoint_distance_m = None
@@ -523,6 +524,14 @@ class ScenarioRuntime(object):
         checkpoint = self._checkpoint_locations[self._next_checkpoint_index]
         return float(_location_distance(ego_location, checkpoint))
 
+    def _active_checkpoint_count(self):
+        return max(0, len(self._checkpoint_locations) - int(self._start_checkpoint_index))
+
+    def _checkpoint_display_index(self):
+        checkpoint_count = self._active_checkpoint_count()
+        raw_index = max(0, int(self._next_checkpoint_index) - int(self._start_checkpoint_index))
+        return min(raw_index, checkpoint_count)
+
     def _progress_to_route_index(self, target_progress_m):
         if not self._route_progress_m:
             return None
@@ -538,18 +547,30 @@ class ScenarioRuntime(object):
             progress_values.append(self._project_progress_m(checkpoint))
         return progress_values
 
-    def _active_checkpoint_pair(self):
+    def _active_checkpoint_pairs(self):
         if self._finished or len(self._checkpoint_locations) < 2:
-            return None
+            return []
         if not self._started:
-            return (0, 1)
-        if self._next_checkpoint_index >= len(self._checkpoint_locations):
-            return None
-        start_idx = max(0, self._next_checkpoint_index - 1)
-        end_idx = min(start_idx + 1, len(self._checkpoint_locations) - 1)
-        if end_idx <= start_idx:
-            return None
-        return (start_idx, end_idx)
+            start_idx = int(self._start_checkpoint_index)
+            end_idx = min(start_idx + 1, len(self._checkpoint_locations) - 1)
+            if end_idx <= start_idx:
+                return []
+            current_pair = (start_idx, end_idx)
+        elif self._next_checkpoint_index >= len(self._checkpoint_locations):
+            return []
+        else:
+            start_idx = max(0, self._next_checkpoint_index - 1)
+            end_idx = min(start_idx + 1, len(self._checkpoint_locations) - 1)
+            if end_idx <= start_idx:
+                return []
+            current_pair = (start_idx, end_idx)
+
+        pairs = [current_pair]
+        next_start_idx = current_pair[1]
+        next_end_idx = next_start_idx + 1
+        if next_end_idx < len(self._checkpoint_locations):
+            pairs.append((next_start_idx, next_end_idx))
+        return pairs
 
     def _route_segment_locations(self, start_idx, end_idx):
         if start_idx < 0 or end_idx >= len(self._checkpoint_locations) or end_idx <= start_idx:
@@ -571,13 +592,7 @@ class ScenarioRuntime(object):
             segment_locations.append(self._route_waypoints[idx].transform.location)
         return segment_locations
 
-    def _draw_active_checkpoint_guide(self, debug, lifetime):
-        pair = self._active_checkpoint_pair()
-        if pair is None:
-            return
-
-        start_idx, end_idx = pair
-        guide_color = carla.Color(180, 150, 40)
+    def _draw_checkpoint_guide_pair(self, debug, lifetime, start_idx, end_idx, guide_color, thickness):
         segment_locations = self._route_segment_locations(start_idx, end_idx)
 
         if len(segment_locations) >= 2:
@@ -585,7 +600,7 @@ class ScenarioRuntime(object):
                 debug.draw_line(
                     _shift_location(segment_locations[idx], z=0.55),
                     _shift_location(segment_locations[idx + 1], z=0.55),
-                    0.12,
+                    thickness,
                     guide_color,
                     lifetime,
                     False,
@@ -595,11 +610,30 @@ class ScenarioRuntime(object):
         debug.draw_line(
             _shift_location(self._checkpoint_locations[start_idx], z=0.8),
             _shift_location(self._checkpoint_locations[end_idx], z=0.8),
-            0.10,
+            max(0.10, thickness - 0.02),
             guide_color,
             lifetime,
             False,
         )
+
+    def _draw_active_checkpoint_guide(self, debug, lifetime):
+        pairs = self._active_checkpoint_pairs()
+        if not pairs:
+            return
+
+        active_guide_color = carla.Color(83, 69, 18)
+        preview_guide_color = carla.Color(58, 48, 14)
+        for pair_index, (start_idx, end_idx) in enumerate(pairs):
+            guide_color = active_guide_color if pair_index == 0 else preview_guide_color
+            thickness = 0.12 if pair_index == 0 else 0.09
+            self._draw_checkpoint_guide_pair(
+                debug,
+                lifetime,
+                start_idx,
+                end_idx,
+                guide_color,
+                thickness,
+            )
 
     def _advance_checkpoints(self, ego_location):
         radius = float(self.preset.checkpoint_radius_m)
@@ -625,12 +659,12 @@ class ScenarioRuntime(object):
             point_location = _shift_location(checkpoint, z=1.2)
             text_location = _shift_location(checkpoint, z=2.2)
 
-            if idx == 0:
+            if idx == int(self._start_checkpoint_index) and not self._started:
                 label = "START"
             elif idx == len(self._checkpoint_locations) - 1:
                 label = "FINISH"
             else:
-                label = "CP %d" % idx
+                label = "CP %d" % max(1, idx - int(self._start_checkpoint_index))
 
             debug.draw_point(point_location, 0.35, next_color, lifetime, False)
             debug.draw_string(text_location, label, False, next_color, lifetime, False)
@@ -746,6 +780,7 @@ class ScenarioRuntime(object):
         self._finish_sim_time = None
         self._completion_time_s = None
         self._next_checkpoint_index = 0
+        self._start_checkpoint_index = 0
         self._last_progress_m = None
         self._overtake_objective_met = False
         self._last_next_checkpoint_distance_m = None
@@ -771,8 +806,24 @@ class ScenarioRuntime(object):
         self._route_waypoints, self._route_progress_m = self._build_route(start_waypoint)
         self._checkpoint_locations = self._build_checkpoints()
         self._checkpoint_progress_m = self._build_checkpoint_progress()
+        configured_start_checkpoint_index = max(
+            0,
+            int(getattr(self.preset, "start_checkpoint_index", 0) or 0),
+        )
         if self._checkpoint_locations:
-            self._start_location = self._checkpoint_locations[0]
+            remaining_checkpoints = len(self._checkpoint_locations) - configured_start_checkpoint_index
+            if remaining_checkpoints < 2:
+                self._status = "setup_failed"
+                self._failure_reason = "start_checkpoint_index_out_of_range"
+                world.hud.notification("Scenario setup failed: invalid start checkpoint", seconds=4.0)
+                print(
+                    "[scenario] setup failed: start checkpoint index %d leaves fewer than 2 checkpoints"
+                    % configured_start_checkpoint_index
+                )
+                return
+            self._start_checkpoint_index = configured_start_checkpoint_index
+            self._next_checkpoint_index = int(self._start_checkpoint_index)
+            self._start_location = self._checkpoint_locations[self._start_checkpoint_index]
             self._finish_location = self._checkpoint_locations[-1]
         elif self._route_waypoints:
             self._start_location = self._route_waypoints[0].transform.location
@@ -793,16 +844,17 @@ class ScenarioRuntime(object):
                 print("[scenario] setup failed: lead vehicle spawn failed")
                 return
 
-        checkpoint_count = len(self._checkpoint_locations)
+        checkpoint_count = self._active_checkpoint_count()
         world.hud.notification(
             "Scenario: %s (%d checkpoints)" % (self.preset.name, checkpoint_count),
             seconds=4.0,
         )
         print(
-            "[scenario] prepared %s on %s with %d checkpoints" % (
+            "[scenario] prepared %s on %s with %d active checkpoints (start checkpoint index %d)" % (
                 self.preset.name,
                 self.preset.map_name,
                 checkpoint_count,
+                int(self._start_checkpoint_index),
             )
         )
         self._draw_checkpoint_markers(world)
@@ -859,7 +911,11 @@ class ScenarioRuntime(object):
                 self._started = True
                 self._status = "active"
                 self._start_sim_time = float(sim_time)
-                self._next_checkpoint_index = 1 if self._checkpoint_locations else 0
+                self._next_checkpoint_index = (
+                    min(self._start_checkpoint_index + 1, len(self._checkpoint_locations))
+                    if self._checkpoint_locations
+                    else 0
+                )
                 self._last_next_checkpoint_distance_m = self._distance_to_next_checkpoint(ego_location)
                 if self.preset.kind == "overtake" and bool(getattr(self.preset, "lead_hold_until_start", False)):
                     self._enable_lead_autopilot()
@@ -933,8 +989,8 @@ class ScenarioRuntime(object):
                 elapsed_s = float(self._completion_time_s)
             else:
                 elapsed_s = max(0.0, float(self._last_sim_time - self._start_sim_time))
-        checkpoint_count = len(self._checkpoint_locations)
-        checkpoint_index = min(self._next_checkpoint_index, checkpoint_count)
+        checkpoint_count = self._active_checkpoint_count()
+        checkpoint_index = self._checkpoint_display_index()
         return {
             "scenario_name": str(self.preset.name),
             "scenario_kind": str(self.preset.kind),
@@ -998,8 +1054,8 @@ class ScenarioRuntime(object):
         if self._checkpoint_locations:
             lines.append(
                 "Checkpoints: %d/%d" % (
-                    min(self._next_checkpoint_index, len(self._checkpoint_locations)),
-                    len(self._checkpoint_locations),
+                    self._checkpoint_display_index(),
+                    self._active_checkpoint_count(),
                 )
             )
         if self._last_next_checkpoint_distance_m is not None:

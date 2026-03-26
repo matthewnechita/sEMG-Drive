@@ -21,8 +21,12 @@ Files in this folder
   - Clean upstream CARLA example copied from the untouched install.
 - `upstream/generate_traffic.py`
   - Clean upstream traffic-generation example copied from the untouched install.
-- `start_carla_low.bat`
-  - Convenience launcher for the external CARLA install in low-quality mode.
+- `test_start_carla_server_0_9_16.bat`
+  - Restored-display test server launcher for the external CARLA install.
+- `test_run_lane_keep_5min_emg_0_9_16.cmd`
+  - Named lane-keep scenario wrapper.
+- `test_run_highway_overtake_emg_0_9_16.cmd`
+  - Named highway-overtake scenario wrapper.
 - `CARLA_VERSION.txt`
   - Records the runtime version and reference install path.
 
@@ -44,8 +48,55 @@ Suggested next cleanup
 
 Example runtime flow
 
-1. Start CARLA with `carla_integration/start_carla_low.bat`
-2. Run the maintained control script from the repo
+1. Start CARLA with `carla_integration/test_start_carla_server_0_9_16.bat`
+2. Run a named scenario wrapper or `python carla_integration\manual_control_emg.py --scenario ...`
 3. Keep traffic generation as a separate process if needed
+
+Scenario CLI commands
+
+Start the restored-display CARLA server:
+
+```bat
+carla_integration\test_start_carla_server_0_9_16.bat
+```
+
+Run the named lane-keep scenario:
+
+```bat
+carla_integration\test_run_lane_keep_5min_emg_0_9_16.cmd
+```
+
+Run the named overtake scenario:
+
+```bat
+carla_integration\test_run_highway_overtake_emg_0_9_16.cmd
+```
+
+Run either named scenario with evaluation logging enabled:
+
+```bat
+carla_integration\test_run_lane_keep_5min_emg_0_9_16.cmd --eval-log-dir eval_metrics\out\lane_keep_run_01
+carla_integration\test_run_highway_overtake_emg_0_9_16.cmd --eval-log-dir eval_metrics\out\overtake_run_01
+```
+
+Run the maintained Python entrypoint directly:
+
+```bat
+python carla_integration\manual_control_emg.py --scenario lane_keep_5min
+python carla_integration\manual_control_emg.py --scenario highway_overtake
+```
+
+Optional direct CLI examples:
+
+```bat
+python carla_integration\manual_control_emg.py --scenario lane_keep_5min --show-hud
+python carla_integration\manual_control_emg.py --scenario lane_keep_5min --eval-log-dir eval_metrics\out\lane_keep_run_01
+python carla_integration\manual_control_emg.py --scenario highway_overtake --eval-log-dir eval_metrics\out\overtake_run_01
+```
+
+Notes:
+
+- Scenario presets set their own map, so `--scenario lane_keep_5min` and `--scenario highway_overtake` automatically load `Town04_Opt`.
+- `lane_keep_5min` currently starts from checkpoint index `3`, so the scenario START is intentionally moved farther up the route instead of beginning at the first physical checkpoint.
 
 The maps and simulator binaries are intentionally not stored in Git here.

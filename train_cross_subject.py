@@ -44,7 +44,7 @@ from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_
 
 
 # ======== Config ========
-ARM        = "left"            # ← set to "right" or "left" before running, lowercase l
+ARM        = "right"            # ← set to "right" or "left" before running, lowercase l
 DATA_ROOT  = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
 MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "v6_4_gestures.pt"
 PATTERN    = "*_filtered.npz"
@@ -65,7 +65,7 @@ BATCH_SIZE   = 512
 # GestureCNNv2 at 503K params on ~122K training windows = ~4 params/sample.
 # More epochs than per-subject: larger model + larger dataset benefits from
 # longer training. Convergence argument, not wall-clock.
-EPOCHS  = 70
+EPOCHS  = 40
 LR      = 1e-4
 DROPOUT = 0.25
 LABEL_SMOOTHING = 0.05
@@ -93,7 +93,7 @@ INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "hor
 # LOSO evaluation must be run before deploying the cross-subject model.
 # This measures true cross-subject accuracy (model vs subjects it never trained on).
 # Minimum recommended LOSO accuracy before deployment: 65%.
-LOSO_EVAL = False
+LOSO_EVAL = True
 
 # ========================
 
@@ -168,12 +168,14 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
     report_text = classification_report(
         y_true,
         y_pred,
+        labels=label_indices,
         target_names=label_names,
         zero_division=0,
     )
     report_dict_raw = classification_report(
         y_true,
         y_pred,
+        labels=label_indices,
         target_names=label_names,
         output_dict=True,
         zero_division=0,
@@ -530,8 +532,20 @@ def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train_eval_split(X_train, y_train, X_eval, y_eval,
-                     channels, num_classes, epochs, device, subjects_train):
+def train_eval_split(
+    X_train,
+    y_train,
+    X_eval,
+    y_eval,
+    channels,
+    num_classes,
+    epochs,
+    device,
+    subjects_train,
+    *,
+    use_eval_for_model_selection=True,
+    use_eval_for_scheduler=True,
+):
     # No z-score: GestureCNNv2 normalises internally via InstanceNorm.
     # Compute mean/std for bundle compatibility (inference path checks metadata).
     mean = X_train.mean(axis=(0, 2))
@@ -567,7 +581,8 @@ def train_eval_split(X_train, y_train, X_eval, y_eval,
         optimizer, mode="min", factor=0.5, patience=5, threshold=1e-4, min_lr=1e-6,
     )
 
-    best_state, best_acc = None, -1.0
+    best_state = None
+    best_metric = -1.0 if use_eval_for_model_selection else float("inf")
     start_time = time.time()
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
@@ -608,21 +623,27 @@ def train_eval_split(X_train, y_train, X_eval, y_eval,
             f"| train {train_acc:.3f} | eval {eval_acc:.3f}"
         )
         prev_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(avg_eval)
+        scheduler_metric = avg_eval if use_eval_for_scheduler else avg_loss
+        scheduler.step(scheduler_metric)
         if optimizer.param_groups[0]["lr"] < prev_lr:
             print(f"LR reduced: {prev_lr:.2e} -> {optimizer.param_groups[0]['lr']:.2e}")
         if epoch == 1:
             est = (time.time() - epoch_start) * epochs
             print(f"Estimated remaining: ~{max(0, est - (time.time() - start_time)):.0f}s")
-        if eval_acc > best_acc:
-            best_acc   = eval_acc
+        if use_eval_for_model_selection:
+            improved = eval_acc > best_metric
+            best_metric = max(best_metric, eval_acc)
+        else:
+            improved = avg_loss < best_metric
+            best_metric = min(best_metric, avg_loss)
+        if improved:
             # state_dict() holds tensor references; deepcopy is required
             # to preserve the true best checkpoint instead of the final epoch.
             best_state = copy.deepcopy(model.state_dict())
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    return model, mean, std, best_acc
+    return model, mean, std, best_metric
 
 
 # ── LOSO evaluation ───────────────────────────────────────────────────────────
@@ -652,6 +673,8 @@ def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_
             X[test_mask],  y_idx[test_mask],
             channels, num_classes, EPOCHS, device,
             subjects_train=subjects[train_mask],
+            use_eval_for_model_selection=False,
+            use_eval_for_scheduler=False,
         )
         model.eval()
         X_test   = _prepare_test_data(X[test_mask], mean, std)
@@ -669,7 +692,9 @@ def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_
         print(f"    Accuracy: {acc:.3f}")
         print(classification_report(
             y_idx[test_mask], y_pred,
+            labels=list(range(len(index_to_label))),
             target_names=[index_to_label[i] for i in range(len(index_to_label))],
+            zero_division=0,
         ))
 
     loso_accs = np.asarray(loso_accs, dtype=float)

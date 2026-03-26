@@ -25,7 +25,7 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.model_selection import StratifiedGroupKFold
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -56,11 +56,12 @@ MVC_PERCENTILE = 95.0
 USE_MIN_LABEL_CONFIDENCE = True
 MIN_LABEL_CONFIDENCE = 0.85
 
-TEST_SIZE = 0.2
 RANDOM_STATE = 42
 BATCH_SIZE = 512
+# Session-grouped k-fold CV for unbiased per-subject metrics.
+PER_SUBJECT_CV_FOLDS = 5
 
-EPOCHS = 70
+EPOCHS = 30
 LR = 1e-4
 DROPOUT = 0.25
 LABEL_SMOOTHING = 0.05
@@ -229,6 +230,100 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
         "confusion_to_neutral_rate": confusion_to_neutral_rate,
         "neutral_prediction_fp_rate": neutral_prediction_fp_rate,
     }
+
+
+def _scalar_summary(values):
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return None
+    return {
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+    }
+
+
+def _serialize_eval_metrics(eval_artifacts):
+    return {
+        "test_accuracy": float(eval_artifacts["test_accuracy"]),
+        "balanced_accuracy": float(eval_artifacts["balanced_accuracy"]),
+        "macro_precision": float(eval_artifacts["macro_precision"]),
+        "macro_recall": float(eval_artifacts["macro_recall"]),
+        "macro_f1": float(eval_artifacts["macro_f1"]),
+        "weighted_precision": float(eval_artifacts["weighted_precision"]),
+        "weighted_recall": float(eval_artifacts["weighted_recall"]),
+        "weighted_f1": float(eval_artifacts["weighted_f1"]),
+        "worst_class_recall_label": eval_artifacts["worst_class_recall_label"],
+        "worst_class_recall": eval_artifacts["worst_class_recall"],
+        "max_precision_recall_gap_label": eval_artifacts["max_pr_gap_label"],
+        "max_precision_recall_gap": eval_artifacts["max_pr_gap"],
+        "confusion_to_neutral_rate": eval_artifacts["confusion_to_neutral_rate"],
+        "neutral_prediction_fp_rate": eval_artifacts["neutral_prediction_fp_rate"],
+        "confusion_matrix_counts": eval_artifacts["confusion_matrix_counts"].tolist(),
+        "confusion_matrix_row_norm": eval_artifacts["confusion_matrix_row_norm"].tolist(),
+        "confusion_matrix_col_norm": eval_artifacts["confusion_matrix_col_norm"].tolist(),
+    }
+
+
+def _print_eval_summary(title, accuracy_label, eval_artifacts, labels, index_to_label):
+    accuracy = float(eval_artifacts["test_accuracy"])
+    print(f"\n{title}: {accuracy_label} {accuracy:.3f}")
+    print("\nReport:\n", eval_artifacts["classification_report_text"])
+    _print_confusion_matrix(
+        "Confusion matrix (counts, rows=true, cols=pred):",
+        eval_artifacts["confusion_matrix_counts"],
+        [index_to_label[i] for i in range(len(labels))],
+        as_percent=False,
+    )
+    _print_confusion_matrix(
+        "Confusion matrix (row-normalized %, rows=true, cols=pred):",
+        eval_artifacts["confusion_matrix_row_norm"],
+        [index_to_label[i] for i in range(len(labels))],
+        as_percent=True,
+    )
+    _print_confusion_matrix(
+        "Confusion matrix (col-normalized %, rows=true, cols=pred):",
+        eval_artifacts["confusion_matrix_col_norm"],
+        [index_to_label[i] for i in range(len(labels))],
+        as_percent=True,
+    )
+
+    print("\nCore metrics:")
+    print(f"  balanced_accuracy: {eval_artifacts['balanced_accuracy']:.3f}")
+    print(
+        f"  macro P/R/F1: "
+        f"{eval_artifacts['macro_precision']:.3f} / "
+        f"{eval_artifacts['macro_recall']:.3f} / "
+        f"{eval_artifacts['macro_f1']:.3f}"
+    )
+    print(
+        f"  weighted P/R/F1: "
+        f"{eval_artifacts['weighted_precision']:.3f} / "
+        f"{eval_artifacts['weighted_recall']:.3f} / "
+        f"{eval_artifacts['weighted_f1']:.3f}"
+    )
+    if eval_artifacts["worst_class_recall_label"] is not None:
+        print(
+            f"  worst_class_recall: "
+            f"{eval_artifacts['worst_class_recall_label']} = "
+            f"{eval_artifacts['worst_class_recall']:.3f}"
+        )
+    if eval_artifacts["max_pr_gap_label"] is not None:
+        print(
+            f"  max_precision_recall_gap: "
+            f"{eval_artifacts['max_pr_gap_label']} = "
+            f"{eval_artifacts['max_pr_gap']:.3f}"
+        )
+    if eval_artifacts["confusion_to_neutral_rate"]:
+        print("  confusion_to_neutral_rate:")
+        for label, rate in sorted(eval_artifacts["confusion_to_neutral_rate"].items()):
+            print(f"    {label} -> neutral: {rate:.3f}")
+    if eval_artifacts["neutral_prediction_fp_rate"] is not None:
+        print(
+            f"  neutral_prediction_fp_rate: "
+            f"{eval_artifacts['neutral_prediction_fp_rate']:.3f}"
+        )
 
 
 # -- Calibration ---------------------------------------------------------------
@@ -595,6 +690,7 @@ def train_eval_split(
 
     best_state = None
     best_acc = -1.0
+    best_epoch = 1
     start_time = time.time()
 
     for epoch in range(1, epochs + 1):
@@ -668,11 +764,254 @@ def train_eval_split(
 
         if eval_acc > best_acc:
             best_acc = eval_acc
+            best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    return model, mean, std, best_acc
+    return model, mean, std, best_acc, best_epoch
+
+
+def train_full_dataset(
+    X_train,
+    y_train,
+    channel_count,
+    num_classes,
+    epochs,
+    device,
+    permutation_groups=None,
+):
+    mean = X_train.mean(axis=(0, 2))
+    std = X_train.std(axis=(0, 2))
+    std = np.where(std < 1e-6, 1.0, std)
+
+    X_train_t = X_train.astype(np.float32)
+    train_ds = TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train))
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, pin_memory=True
+    )
+
+    model = _build_model(int(channel_count), num_classes, device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5, threshold=1e-4, min_lr=1e-6
+    )
+
+    best_state = None
+    best_loss = float("inf")
+    best_epoch = 1
+    start_time = time.time()
+
+    for epoch in range(1, epochs + 1):
+        epoch_start = time.time()
+        model.train()
+        train_correct = 0
+        train_total = 0
+        train_loss = 0.0
+
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            if USE_AUGMENTATION:
+                xb = augment_emg_gpu(
+                    xb,
+                    p=AUG_PROB,
+                    permutation_groups=(
+                        permutation_groups
+                        if USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION
+                        else None
+                    ),
+                )
+
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * xb.size(0)
+            preds = torch.argmax(logits, dim=1)
+            train_correct += (preds == yb).sum().item()
+            train_total += xb.size(0)
+
+        train_acc = train_correct / max(train_total, 1)
+        avg_loss = train_loss / max(train_total, 1)
+        print(f"Final fit epoch {epoch:02d} | loss {avg_loss:.4f} | train {train_acc:.3f}")
+
+        prev_lr = optimizer.param_groups[0]["lr"]
+        scheduler.step(avg_loss)
+        new_lr = optimizer.param_groups[0]["lr"]
+        if new_lr < prev_lr:
+            print(f"LR reduced: {prev_lr:.2e} -> {new_lr:.2e}")
+
+        if epoch == 1:
+            epoch_time = time.time() - epoch_start
+            est_total = epoch_time * epochs
+            est_remaining = max(0.0, est_total - (time.time() - start_time))
+            print(f"Estimated remaining time (final fit): ~{est_remaining:.1f}s")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, mean, std, float(best_loss), int(best_epoch)
+
+
+def _predict_labels(model, X, device):
+    model.eval()
+    X_test = _prepare_test_data(X, None, None)
+    test_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_test)),
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+    )
+    all_preds = []
+    with torch.no_grad():
+        for (xb,) in test_loader:
+            all_preds.append(torch.argmax(model(xb.to(device)), dim=1).cpu().numpy())
+    if not all_preds:
+        return np.empty((0,), dtype=np.int64)
+    return np.concatenate(all_preds).astype(np.int64, copy=False)
+
+
+def _run_grouped_cross_validation(
+    X,
+    y_idx,
+    groups,
+    channel_count,
+    num_classes,
+    device,
+    labels,
+    index_to_label,
+    permutation_groups,
+):
+    unique_groups = np.unique(groups)
+    if unique_groups.size < 2:
+        raise ValueError(
+            "Per-subject grouped cross-validation requires at least 2 session files."
+        )
+
+    class_group_counts = [
+        np.unique(groups[y_idx == class_idx]).size for class_idx in np.unique(y_idx)
+    ]
+    max_supported_splits = min(int(unique_groups.size), *[int(v) for v in class_group_counts])
+    n_splits = min(int(PER_SUBJECT_CV_FOLDS), max_supported_splits)
+    if n_splits < 2:
+        raise ValueError(
+            "Per-subject grouped cross-validation requires each class to appear in at least "
+            "2 distinct session files."
+        )
+
+    splitter = StratifiedGroupKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+    oof_pred = np.full(y_idx.shape, -1, dtype=np.int64)
+    fold_results = []
+
+    print(f"\n{'=' * 55}")
+    print(
+        f"Per-subject grouped cross-validation: {n_splits} folds over "
+        f"{len(unique_groups)} session file(s)."
+    )
+
+    for fold_idx, (train_idx, test_idx) in enumerate(
+        splitter.split(X, y_idx, groups),
+        start=1,
+    ):
+        train_files = sorted({str(g) for g in groups[train_idx]})
+        test_files = sorted({str(g) for g in groups[test_idx]})
+        print(f"\nCV fold {fold_idx}/{n_splits}")
+        print(f"Train ({len(train_files)} files): {[Path(f).name for f in train_files]}")
+        print(f"Test  ({len(test_files)} files):  {[Path(f).name for f in test_files]}")
+        print(f"Training GestureCNNv2 for {EPOCHS} epochs on {len(train_idx)} windows.")
+
+        model, _, _, _, best_epoch = train_eval_split(
+            X[train_idx],
+            y_idx[train_idx],
+            X[test_idx],
+            y_idx[test_idx],
+            channel_count,
+            num_classes,
+            EPOCHS,
+            device,
+            permutation_groups=permutation_groups,
+        )
+
+        y_pred = _predict_labels(model, X[test_idx], device)
+        oof_pred[test_idx] = y_pred
+        fold_eval = _compute_eval_artifacts(y_idx[test_idx], y_pred, index_to_label)
+        fold_metrics = _serialize_eval_metrics(fold_eval)
+        fold_results.append(
+            {
+                "fold_index": int(fold_idx),
+                "train_windows": int(train_idx.size),
+                "test_windows": int(test_idx.size),
+                "best_epoch": int(best_epoch),
+                "train_files": [Path(f).name for f in train_files],
+                "test_files": [Path(f).name for f in test_files],
+                "metrics": fold_metrics,
+            }
+        )
+        print(
+            f"Fold {fold_idx} metrics: accuracy {fold_metrics['test_accuracy']:.3f} | "
+            f"balanced {fold_metrics['balanced_accuracy']:.3f} | "
+            f"macro_f1 {fold_metrics['macro_f1']:.3f} | best_epoch {best_epoch}"
+        )
+
+    if np.any(oof_pred < 0):
+        missing = int(np.sum(oof_pred < 0))
+        raise RuntimeError(f"Cross-validation left {missing} window(s) without predictions.")
+
+    eval_artifacts = _compute_eval_artifacts(y_idx, oof_pred, index_to_label)
+    accuracy_values = [fold["metrics"]["test_accuracy"] for fold in fold_results]
+    balanced_values = [fold["metrics"]["balanced_accuracy"] for fold in fold_results]
+    macro_f1_values = [fold["metrics"]["macro_f1"] for fold in fold_results]
+    best_epoch_values = [fold["best_epoch"] for fold in fold_results]
+    selected_final_fit_epochs = max(1, int(np.rint(np.median(best_epoch_values))))
+
+    print("\nFold metric summary:")
+    for metric_name, values in (
+        ("accuracy", accuracy_values),
+        ("balanced_accuracy", balanced_values),
+        ("macro_f1", macro_f1_values),
+        ("best_epoch", best_epoch_values),
+    ):
+        summary = _scalar_summary(values)
+        if summary is None:
+            continue
+        print(
+            f"  {metric_name}: mean {summary['mean']:.3f} | std {summary['std']:.3f} | "
+            f"min {summary['min']:.3f} | max {summary['max']:.3f}"
+        )
+
+    _print_eval_summary(
+        "Cross-validated out-of-fold metrics",
+        "cross-validated accuracy",
+        eval_artifacts,
+        labels,
+        index_to_label,
+    )
+
+    return {
+        "split_mode": "stratified-group-kfold",
+        "n_splits": int(n_splits),
+        "group_unit": "session_file",
+        "eval_artifacts": eval_artifacts,
+        "folds": fold_results,
+        "fold_metric_summary": {
+            "test_accuracy": _scalar_summary(accuracy_values),
+            "balanced_accuracy": _scalar_summary(balanced_values),
+            "macro_f1": _scalar_summary(macro_f1_values),
+            "best_epoch": _scalar_summary(best_epoch_values),
+        },
+        "selected_final_fit_epochs": int(selected_final_fit_epochs),
+    }
 
 
 # -- Train/eval/save -----------------------------------------------------------
@@ -684,102 +1023,37 @@ def _train_and_save(
 ):
     unique_groups = np.unique(groups)
     print(f"{X.shape[0]} windows across {len(unique_groups)} session file(s).")
-
-    if unique_groups.size >= 2:
-        splitter = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)
-        train_idx, test_idx = next(splitter.split(X, y_idx, groups))
-        split_mode = "group-file"
-    else:
-        indices = np.arange(X.shape[0])
-        train_idx, test_idx = train_test_split(
-            indices, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y_idx
-        )
-        split_mode = "stratified-random"
-
-    train_files = sorted({str(g) for g in groups[train_idx]})
-    test_files = sorted({str(g) for g in groups[test_idx]})
-    print(f"Train ({len(train_files)} files): {[Path(f).name for f in train_files]}")
-    print(f"Test  ({len(test_files)} files):  {[Path(f).name for f in test_files]}")
-    print(f"\nTraining GestureCNNv2 for {EPOCHS} epochs on {len(train_idx)} windows.")
-
-    model, mean, std, _ = train_eval_split(
-        X[train_idx], y_idx[train_idx],
-        X[test_idx], y_idx[test_idx],
-        channel_count, num_classes, EPOCHS, device,
+    cv_results = _run_grouped_cross_validation(
+        X,
+        y_idx,
+        groups,
+        channel_count,
+        num_classes,
+        device,
+        labels,
+        index_to_label,
+        permutation_groups,
+    )
+    selected_final_fit_epochs = cv_results["selected_final_fit_epochs"]
+    print(f"\n{'=' * 55}")
+    print(
+        f"Final per-subject fit on all windows for {selected_final_fit_epochs} epoch(s) "
+        f"(median best epoch from grouped CV)."
+    )
+    model, mean, std, final_fit_best_loss, final_fit_best_epoch = train_full_dataset(
+        X,
+        y_idx,
+        channel_count,
+        num_classes,
+        selected_final_fit_epochs,
+        device,
         permutation_groups=permutation_groups,
     )
 
-    model.eval()
-    X_test = _prepare_test_data(X[test_idx], mean, std)
-    test_loader = DataLoader(
-        TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_idx[test_idx])),
-        batch_size=BATCH_SIZE, shuffle=False,
-    )
-    all_preds = []
-    with torch.no_grad():
-        for xb, _ in test_loader:
-            all_preds.append(torch.argmax(model(xb.to(device)), dim=1).cpu().numpy())
-    y_pred = np.concatenate(all_preds)
-    y_test = y_idx[test_idx]
-
-    eval_artifacts = _compute_eval_artifacts(y_test, y_pred, index_to_label)
-    test_accuracy = float(eval_artifacts["test_accuracy"])
-    print(f"\nIn-distribution test accuracy: {test_accuracy:.3f}")
-    print("\nReport:\n", eval_artifacts["classification_report_text"])
-    _print_confusion_matrix(
-        "Confusion matrix (counts, rows=true, cols=pred):",
-        eval_artifacts["confusion_matrix_counts"],
-        [index_to_label[i] for i in range(len(labels))],
-        as_percent=False,
-    )
-    _print_confusion_matrix(
-        "Confusion matrix (row-normalized %, rows=true, cols=pred):",
-        eval_artifacts["confusion_matrix_row_norm"],
-        [index_to_label[i] for i in range(len(labels))],
-        as_percent=True,
-    )
-    _print_confusion_matrix(
-        "Confusion matrix (col-normalized %, rows=true, cols=pred):",
-        eval_artifacts["confusion_matrix_col_norm"],
-        [index_to_label[i] for i in range(len(labels))],
-        as_percent=True,
-    )
-
-    print("\nCore metrics:")
-    print(f"  balanced_accuracy: {eval_artifacts['balanced_accuracy']:.3f}")
-    print(
-        f"  macro P/R/F1: "
-        f"{eval_artifacts['macro_precision']:.3f} / "
-        f"{eval_artifacts['macro_recall']:.3f} / "
-        f"{eval_artifacts['macro_f1']:.3f}"
-    )
-    print(
-        f"  weighted P/R/F1: "
-        f"{eval_artifacts['weighted_precision']:.3f} / "
-        f"{eval_artifacts['weighted_recall']:.3f} / "
-        f"{eval_artifacts['weighted_f1']:.3f}"
-    )
-    if eval_artifacts["worst_class_recall_label"] is not None:
-        print(
-            f"  worst_class_recall: "
-            f"{eval_artifacts['worst_class_recall_label']} = "
-            f"{eval_artifacts['worst_class_recall']:.3f}"
-        )
-    if eval_artifacts["max_pr_gap_label"] is not None:
-        print(
-            f"  max_precision_recall_gap: "
-            f"{eval_artifacts['max_pr_gap_label']} = "
-            f"{eval_artifacts['max_pr_gap']:.3f}"
-        )
-    if eval_artifacts["confusion_to_neutral_rate"]:
-        print("  confusion_to_neutral_rate:")
-        for label, rate in sorted(eval_artifacts["confusion_to_neutral_rate"].items()):
-            print(f"    {label} -> neutral: {rate:.3f}")
-    if eval_artifacts["neutral_prediction_fp_rate"] is not None:
-        print(
-            f"  neutral_prediction_fp_rate: "
-            f"{eval_artifacts['neutral_prediction_fp_rate']:.3f}"
-        )
+    eval_artifacts = cv_results["eval_artifacts"]
+    metrics_payload = _serialize_eval_metrics(eval_artifacts)
+    train_files = [Path(str(f)).name for f in sorted(unique_groups)]
+    test_files = []
 
     bundle = {
         "model_state": model.state_dict(),
@@ -802,8 +1076,8 @@ def _train_and_save(
             "window_step_samples": WINDOW_STEP,
             "channel_count": int(channel_count),
             "labels": labels,
-            "split_mode": split_mode,
-            "test_size": float(TEST_SIZE),
+            "split_mode": cv_results["split_mode"],
+            "test_size": None,
             "calibration_used": bool(USE_CALIBRATION),
             "calibration_mvc_percentile": float(MVC_PERCENTILE),
             "use_instance_norm_input": True,
@@ -835,7 +1109,9 @@ def _train_and_save(
                 }
             ),
             "training": {
-                "epochs": int(EPOCHS),
+                "cv_max_epochs_per_fold": int(EPOCHS),
+                "final_fit_epochs": int(selected_final_fit_epochs),
+                "final_fit_epoch_selection": "median_best_epoch_from_grouped_cv",
                 "batch_size": int(BATCH_SIZE),
                 "lr": float(LR),
                 "amp_range": list(AMP_RANGE),
@@ -847,27 +1123,26 @@ def _train_and_save(
                 "label_smoothing": float(LABEL_SMOOTHING),
                 "use_mixup": False,
             },
-            "metrics": {
-                "test_accuracy": test_accuracy,
-                "balanced_accuracy": eval_artifacts["balanced_accuracy"],
-                "macro_precision": eval_artifacts["macro_precision"],
-                "macro_recall": eval_artifacts["macro_recall"],
-                "macro_f1": eval_artifacts["macro_f1"],
-                "weighted_precision": eval_artifacts["weighted_precision"],
-                "weighted_recall": eval_artifacts["weighted_recall"],
-                "weighted_f1": eval_artifacts["weighted_f1"],
-                "worst_class_recall_label": eval_artifacts["worst_class_recall_label"],
-                "worst_class_recall": eval_artifacts["worst_class_recall"],
-                "max_precision_recall_gap_label": eval_artifacts["max_pr_gap_label"],
-                "max_precision_recall_gap": eval_artifacts["max_pr_gap"],
-                "confusion_to_neutral_rate": eval_artifacts["confusion_to_neutral_rate"],
-                "neutral_prediction_fp_rate": eval_artifacts["neutral_prediction_fp_rate"],
-                "confusion_matrix_counts": eval_artifacts["confusion_matrix_counts"].tolist(),
-                "confusion_matrix_row_norm": eval_artifacts["confusion_matrix_row_norm"].tolist(),
-                "confusion_matrix_col_norm": eval_artifacts["confusion_matrix_col_norm"].tolist(),
+            "metrics": metrics_payload,
+            "cross_validation": {
+                "enabled": True,
+                "type": "StratifiedGroupKFold",
+                "group_unit": cv_results["group_unit"],
+                "n_splits": int(cv_results["n_splits"]),
+                "fold_metric_summary": cv_results["fold_metric_summary"],
+                "selected_final_fit_epochs": int(selected_final_fit_epochs),
+                "folds": cv_results["folds"],
             },
-            "train_files": [Path(f).name for f in train_files],
-            "test_files": [Path(f).name for f in test_files],
+            "final_fit": {
+                "fit_on_all_windows": True,
+                "train_windows": int(X.shape[0]),
+                "train_files": train_files,
+                "selected_epochs_from_cv": int(selected_final_fit_epochs),
+                "best_train_loss": float(final_fit_best_loss),
+                "best_train_loss_epoch": int(final_fit_best_epoch),
+            },
+            "train_files": train_files,
+            "test_files": test_files,
         },
     }
 

@@ -111,6 +111,8 @@ Evaluation workflow
 
 Current status
 - As of `2026-03-25`, fresh strict recollection, retraining, and standalone realtime testing are working again with the fixed strict sensor placement workflow.
+- As of `2026-03-26`, `train_per_subject.py` now uses grouped cross-validation over session files for its reported evaluation metrics instead of a single random holdout split.
+- As of `2026-03-26`, `train_cross_subject.py` has a reviewed LOSO path intended for true cross-subject evaluation; keep `LOSO_EVAL` explicit so LOSO can still be enabled or disabled per run.
 - Left-arm, right-arm, and dual-arm realtime runs have all worked with fresh data and updated models when all required strict pairs are present.
 - The current checked-in realtime defaults are focused on 3-gesture strict testing:
   - `MODE = "dual"`
@@ -124,15 +126,17 @@ Current status
 - Current named scenario preset maps are:
   - `lane_keep_5min` -> `Town04_Opt`
   - `highway_overtake` -> `Town04_Opt`
+- The named `lane_keep_5min` scenario now starts from a later route checkpoint via `start_checkpoint_index = 3` in `carla_integration/scenario_presets.py`.
 - The shared restored-display test launcher still passes `--map Town02_Opt`, but named scenarios override that map inside `manual_control_emg.py`; editing the server batch map alone is still not the reliable control point on this local CARLA install.
-- The active scenario HUD now shows only the current target checkpoint and a single active route guide segment instead of all future checkpoint markers and all checkpoint-to-checkpoint guide lines.
+- The active scenario HUD now shows only the current target checkpoint plus two active guide segments: the current route segment and one preview segment to the following checkpoint.
 - The named `lane_keep_5min` and `highway_overtake` scenarios no longer auto-fail on elapsed time; they now run until completed, manually exited, or another failure condition occurs.
 - The overtake scenario has been shortened from the earlier longer highway version by reducing lead spawn distance, route length, and checkpoint spacing/progression.
 - The overtake lead vehicle is intended to spawn in the same lane as the ego start lane, closer than before, and remain held at spawn until the scenario actually starts so calibration does not consume the overtake gap.
 - Runtime evaluation logging no longer writes collision fields into new CARLA drive CSVs.
 - Lane invasion logging now ignores permissive lane-change crossings and is intended to count only non-permissive lane-boundary violations.
 - Dual-arm CARLA reverse is now gesture-driven: both arms must publish `horn` at the same time to request reverse, and no horn action is emitted.
-- Next planned work for the next session is live tuning to reduce `neutral` flicker without making turn control too sticky or too weak.
+- A concrete implementation note for the next model-family experiment now lives in `project_notes/metric_tcn_implementation_plan_2026-03-26.md`.
+- Next planned work for the next session is to add a switchable `metric_tcn` model family (`MODEL_FAMILY = "cnn_v2"` or `"metric_tcn"`) with supervised contrastive training, prototype-based calibration, and optional calibrated LOSO reporting, then return to live tuning to reduce `neutral` flicker without making turn control too sticky or too weak.
 
 Realtime notes
 - `realtime_gesture_cnn.py` is the source of truth for live strict-layout behavior.
