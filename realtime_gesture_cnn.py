@@ -23,7 +23,7 @@ from AeroPy.DataManager import DataKernel
 
 from libemg import filtering as libemg_filter
 from emg.channel_layout import infer_channel_layout
-from emg.gesture_model_cnn import load_cnn_bundle, quick_finetune
+from emg.gesture_model_cnn import load_gesture_bundle, quick_finetune
 from emg.prototype_classifier import PrototypeClassifier
 from emg.runtime_tuning import REALTIME_TUNING, RUNTIME_TUNING_NAME
 from emg.strict_layout import (
@@ -447,6 +447,23 @@ def _bundle_channel_layout_meta(bundle):
     metadata = bundle.metadata if isinstance(bundle.metadata, dict) else {}
     layout_meta = metadata.get("channel_layout")
     return layout_meta if isinstance(layout_meta, dict) else {}
+
+
+def _bundle_model_family(bundle):
+    metadata = bundle.metadata if isinstance(bundle.metadata, dict) else {}
+    value = metadata.get("model_family")
+    return str(value).strip().lower() if value is not None else ""
+
+
+def _bundle_supports_prototype_calibration(bundle):
+    metadata = bundle.metadata if isinstance(bundle.metadata, dict) else {}
+    return bool(metadata.get("supports_prototype_calibration", False))
+
+
+def _bundle_decoder_preference(bundle):
+    metadata = bundle.metadata if isinstance(bundle.metadata, dict) else {}
+    value = metadata.get("decoder_preference")
+    return str(value).strip().lower() if value is not None else ""
 
 
 def _bundle_layout_mode(bundle):
@@ -1436,8 +1453,11 @@ def main(argv=None):
     )
 
     print("[gesture] right arm model:", model_right_path)
-    bundle_right = load_cnn_bundle(model_right_path, device=device)
+    bundle_right = load_gesture_bundle(model_right_path, device=device)
     use_strict_layout_right = _bundle_uses_strict_layout(bundle_right)
+    family_right = _bundle_model_family(bundle_right) or "legacy"
+    prototype_pref_right = _bundle_decoder_preference(bundle_right) == "prototype"
+    prototype_supported_right = _bundle_supports_prototype_calibration(bundle_right)
 
     model_channels = bundle_right.channel_count   # kept for single-arm compat
     index_to_label_right = _canonical_label_map(bundle_right.index_to_label)
@@ -1454,25 +1474,54 @@ def main(argv=None):
     use_strict_layout_left = False
     if dual_arm:
         print("[gesture] left arm model:", model_left_path)
-        bundle_left   = load_cnn_bundle(model_left_path, device=device)
+        bundle_left   = load_gesture_bundle(model_left_path, device=device)
         left_channels = bundle_left.channel_count
         use_strict_layout_left = _bundle_uses_strict_layout(bundle_left)
+        family_left = _bundle_model_family(bundle_left) or "legacy"
         index_to_label_left = _canonical_label_map(bundle_left.index_to_label)
         allowed_labels_left, allowed_indices_left = _resolve_allowed_labels(
             index_to_label_left, "left"
         )
+        prototype_pref_left = _bundle_decoder_preference(bundle_left) == "prototype"
+        prototype_supported_left = _bundle_supports_prototype_calibration(bundle_left)
         print(f"[gesture] dual-arm mode | right={RIGHT_ARM_CHANNELS}ch left={left_channels}ch")
     else:
+        family_left = ""
+        prototype_pref_left = False
+        prototype_supported_left = False
         print("[gesture] single-arm mode")
+    print(f"[gesture] right bundle family: {family_right}")
+    if dual_arm:
+        print(f"[gesture] left bundle family: {family_left}")
     if dual_arm and use_strict_layout_right != use_strict_layout_left:
         raise RuntimeError(
             "Dual-arm strict layout mismatch: right/left bundles must both use strict mode or both avoid it."
         )
 
-    use_prototype_classifier = bool(USE_PROTOTYPE_CLASSIFIER)
-    if use_prototype_classifier and (not CALIBRATE or not GESTURE_CALIB):
+    bundle_prefers_prototype = (
+        prototype_pref_right and prototype_supported_right
+    ) or (
+        dual_arm and prototype_pref_left and prototype_supported_left
+    )
+    gesture_calibration_enabled = bool(GESTURE_CALIB or bundle_prefers_prototype)
+    if bundle_prefers_prototype and not GESTURE_CALIB:
         print(
-            "[gesture] prototype classifier disabled: requires CALIBRATE=True and GESTURE_CALIB=True."
+            "[gesture] enabling per-gesture calibration because the loaded bundle "
+            "prefers prototype decoding."
+        )
+    use_prototype_classifier = bool(USE_PROTOTYPE_CLASSIFIER or bundle_prefers_prototype)
+    if dual_arm and not USE_PROTOTYPE_CLASSIFIER:
+        if (prototype_pref_right and prototype_supported_right) != (
+            prototype_pref_left and prototype_supported_left
+        ):
+            print(
+                "[gesture] prototype preference mismatch between right/left bundles; "
+                "falling back to softmax decoder."
+            )
+            use_prototype_classifier = False
+    if use_prototype_classifier and (not CALIBRATE or not gesture_calibration_enabled):
+        print(
+            "[gesture] prototype classifier disabled: requires CALIBRATE=True and per-gesture calibration."
         )
         use_prototype_classifier = False
     if use_prototype_classifier:
@@ -1979,11 +2028,11 @@ def main(argv=None):
         neutral_mean = neutral_mean_right
         mvc_scale    = mvc_scale_right
 
-    if dual_arm and GESTURE_CALIB and not use_prototype_classifier:
+    if dual_arm and gesture_calibration_enabled and not use_prototype_classifier:
         print("[gesture] dual-arm mode: skipping per-gesture fine-tuning calibration.")
     if (
         CALIBRATE
-        and GESTURE_CALIB
+        and gesture_calibration_enabled
         and filter_obj is not None
         and ((not dual_arm) or use_prototype_classifier)
     ):

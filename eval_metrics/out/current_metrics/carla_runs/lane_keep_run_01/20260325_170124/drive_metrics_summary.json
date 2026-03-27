@@ -1,0 +1,15 @@
+{
+  "full_route": {
+    "rows": 12003,
+    "scenario_name": "lane_keep_5min",
+    "scenario_kind": "lane_keep",
+    "scenario_status": "active",
+    "scenario_success": null,
+    "lane_error_mean_m": 0.7280504745235885,
+    "lane_error_rmse_m": 0.9734648939687522,
+    "lane_invasions": 41,
+    "completion_time_s": 511.28824270516634,
+    "steering_smoothness": 0.005184135937507978,
+    "command_success_rate": null
+  }
+}

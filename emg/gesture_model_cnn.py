@@ -8,6 +8,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from emg.gesture_model_metric_tcn import MetricTCN
+
 
 # ── Original architecture (kept for backward compatibility) ──────────────────
 
@@ -160,13 +162,14 @@ class GestureCNNv2(nn.Module):
 ARCHITECTURE_REGISTRY = {
     "GestureCNN": GestureCNN,
     "GestureCNNv2": GestureCNNv2,
+    "MetricTCN": MetricTCN,
 }
 
 
 # ── Bundle ───────────────────────────────────────────────────────────────────
 
 @dataclass
-class CnnBundle:
+class GestureModelBundle:
     model: nn.Module
     mean: np.ndarray
     std: np.ndarray
@@ -226,13 +229,36 @@ class CnnBundle:
 
 def _resolve_architecture(bundle: dict, in_channels: int, num_classes: int):
     arch = bundle.get("architecture") or {}
-    arch_type = arch.get("type", "GestureCNN")
+    metadata = bundle.get("metadata") or {}
+    arch_type = arch.get("type")
+    if not arch_type:
+        family = str(metadata.get("model_family", "")).strip().lower()
+        if family == "cnn_v2":
+            arch_type = "GestureCNNv2"
+        elif family == "metric_tcn":
+            arch_type = "MetricTCN"
+        else:
+            arch_type = "GestureCNN"
 
     if arch_type == "GestureCNNv2":
         dropout = float(arch.get("dropout", 0.3))
         return GestureCNNv2(
             in_channels=in_channels,
             num_classes=num_classes,
+            dropout=dropout,
+        )
+
+    if arch_type == "MetricTCN":
+        dropout = float(arch.get("dropout", 0.25))
+        channels = tuple(int(v) for v in arch.get("channels", [64, 64, 128, 128]))
+        kernel_size = int(arch.get("kernel_size", 5))
+        embedding_dim = int(arch.get("embedding_dim", 128))
+        return MetricTCN(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            channels=channels,
+            kernel_size=kernel_size,
+            embedding_dim=embedding_dim,
             dropout=dropout,
         )
 
@@ -261,11 +287,11 @@ def _torch_load_bundle(path: Path, device: str):
         return torch.load(path, map_location=device)
 
 
-def load_cnn_bundle(path: str | Path, device: str = "cpu") -> CnnBundle:
+def load_gesture_bundle(path: str | Path, device: str = "cpu") -> GestureModelBundle:
     path = Path(path)
     bundle = _torch_load_bundle(path, device)
     if not isinstance(bundle, dict):
-        raise ValueError(f"{path} is not a valid CNN bundle.")
+        raise ValueError(f"{path} is not a valid gesture model bundle.")
 
     state = bundle.get("model_state") or bundle.get("model")
     if state is None:
@@ -288,7 +314,7 @@ def load_cnn_bundle(path: str | Path, device: str = "cpu") -> CnnBundle:
     model.to(device)
     model.eval()
 
-    return CnnBundle(
+    return GestureModelBundle(
         model=model,
         mean=mean,
         std=std,
@@ -298,16 +324,20 @@ def load_cnn_bundle(path: str | Path, device: str = "cpu") -> CnnBundle:
     )
 
 
+def load_cnn_bundle(path: str | Path, device: str = "cpu") -> GestureModelBundle:
+    return load_gesture_bundle(path, device=device)
+
+
 # ── Quick fine-tune (standalone function, not a method) ──────────────────────
 
 def quick_finetune(
-    bundle: CnnBundle,
+    bundle: GestureModelBundle,
     calib_windows: np.ndarray,
     calib_labels: np.ndarray,
     device: str = "cpu",
     lr: float = 1e-4,
     epochs: int = 20,
-) -> CnnBundle:
+) -> GestureModelBundle:
     """Fine-tune only the classification head on a small calibration set.
 
     Freezes all parameters except the final linear layer so that ~70 s of
@@ -373,3 +403,6 @@ def quick_finetune(
     model.eval()
 
     return bundle
+
+
+CnnBundle = GestureModelBundle

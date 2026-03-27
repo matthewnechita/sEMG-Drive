@@ -1,8 +1,8 @@
-"""Cross-subject EMG gesture classifier training — Stream 2.
+"""Cross-subject EMG gesture classifier training.
 
-Uses GestureCNNv2 (503K params, InstanceNorm at input, energy bypass scalar).
-Trains one model on ALL subjects pooled; this model works on new participants
-without any retraining. LOSO evaluation is mandatory before deployment.
+Supports the existing `cnn_v2` path and the metric-learning `metric_tcn`
+variant. Zero-shot LOSO remains the baseline cross-subject metric, while the
+metric-TCN path can also run a prototype-based calibrated LOSO pass.
 
 Usage:
     python train_cross_subject.py
@@ -19,7 +19,7 @@ import datetime as dt
 import copy
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 import numpy as np
 import torch
@@ -29,12 +29,24 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from libemg.utils import get_windows
-from emg.gesture_model_cnn import GestureCNNv2
+from emg.model_family import (
+    ModelFamilyConfig,
+    build_architecture_metadata,
+    build_family_metadata,
+    build_model,
+    build_training_objectives,
+    compute_training_step,
+    prepare_train_eval_inputs,
+    standardize_windows,
+    supports_prototype_calibration,
+    validate_model_family,
+)
+from emg.prototype_classifier import PrototypeClassifier
 from emg.strict_layout import (
     resolve_strict_indices_from_metadata,
     strict_channel_count_for_arm,
@@ -43,10 +55,18 @@ from emg.strict_layout import (
 from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_root
 
 
+class SupportsExtractEmbedding(Protocol):
+    def extract_embedding(
+        self,
+        x: torch.Tensor,
+        l2_normalize: bool = False,
+    ) -> torch.Tensor: ...
+
+
 # ======== Config ========
 ARM        = "right"            # ← set to "right" or "left" before running, lowercase l
 DATA_ROOT  = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
-MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "v6_4_gestures.pt"
+MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "tcn_4_gestures.pt"
 PATTERN    = "*_filtered.npz"
 
 WINDOW_SIZE = 200
@@ -62,9 +82,8 @@ RANDOM_STATE = 42
 BATCH_SIZE   = 512
 
 # Cross-subject hyperparameters.
-# GestureCNNv2 at 503K params on ~122K training windows = ~4 params/sample.
-# More epochs than per-subject: larger model + larger dataset benefits from
-# longer training. Convergence argument, not wall-clock.
+# Keep these shared across model families unless a specific experiment needs
+# a model-family-specific override.
 EPOCHS  = 40
 LR      = 1e-4
 DROPOUT = 0.25
@@ -94,8 +113,28 @@ INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "hor
 # This measures true cross-subject accuracy (model vs subjects it never trained on).
 # Minimum recommended LOSO accuracy before deployment: 65%.
 LOSO_EVAL = True
+CALIBRATED_LOSO_EVAL = True
+TRAIN_FINAL_MODEL = True
+MODEL_FAMILY = "metric_tcn"  # "cnn_v2" or "metric_tcn"
+METRIC_TCN_CHANNELS = (64, 64, 128, 128)
+METRIC_TCN_KERNEL_SIZE = 5
+METRIC_TCN_EMBEDDING_DIM = 128
+SUPCON_WEIGHT = 0.20
+SUPCON_TEMPERATURE = 0.10
+PROTOTYPE_TEMPERATURE = 0.20
+PROTOTYPE_L2_NORMALIZE = True
 
 # ========================
+
+MODEL_FAMILY = validate_model_family(MODEL_FAMILY)
+FAMILY_CFG = ModelFamilyConfig(
+    model_family=MODEL_FAMILY,
+    metric_tcn_channels=METRIC_TCN_CHANNELS,
+    metric_tcn_kernel_size=METRIC_TCN_KERNEL_SIZE,
+    metric_tcn_embedding_dim=METRIC_TCN_EMBEDDING_DIM,
+    supcon_weight=SUPCON_WEIGHT,
+    supcon_temperature=SUPCON_TEMPERATURE,
+)
 
 
 # ── Label utilities ──────────────────────────────────────────────────────────
@@ -251,6 +290,28 @@ def _compute_eval_artifacts(y_true, y_pred, index_to_label):
         "max_pr_gap": max((item["pr_gap"] for item in per_class), default=None),
         "confusion_to_neutral_rate": confusion_to_neutral_rate,
         "neutral_prediction_fp_rate": neutral_prediction_fp_rate,
+    }
+
+
+def _serialize_eval_metrics(eval_artifacts: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "test_accuracy": float(eval_artifacts["test_accuracy"]),
+        "balanced_accuracy": float(eval_artifacts["balanced_accuracy"]),
+        "macro_precision": float(eval_artifacts["macro_precision"]),
+        "macro_recall": float(eval_artifacts["macro_recall"]),
+        "macro_f1": float(eval_artifacts["macro_f1"]),
+        "weighted_precision": float(eval_artifacts["weighted_precision"]),
+        "weighted_recall": float(eval_artifacts["weighted_recall"]),
+        "weighted_f1": float(eval_artifacts["weighted_f1"]),
+        "worst_class_recall_label": eval_artifacts["worst_class_recall_label"],
+        "worst_class_recall": eval_artifacts["worst_class_recall"],
+        "max_precision_recall_gap_label": eval_artifacts["max_pr_gap_label"],
+        "max_precision_recall_gap": eval_artifacts["max_pr_gap"],
+        "confusion_to_neutral_rate": eval_artifacts["confusion_to_neutral_rate"],
+        "neutral_prediction_fp_rate": eval_artifacts["neutral_prediction_fp_rate"],
+        "confusion_matrix_counts": eval_artifacts["confusion_matrix_counts"].tolist(),
+        "confusion_matrix_row_norm": eval_artifacts["confusion_matrix_row_norm"].tolist(),
+        "confusion_matrix_col_norm": eval_artifacts["confusion_matrix_col_norm"].tolist(),
     }
 
 
@@ -443,11 +504,8 @@ def load_dataset():
 
 
 # ── Normalisation ─────────────────────────────────────────────────────────────
-# GestureCNNv2 handles normalisation internally via InstanceNorm1d.
-# We pass raw float32; no external z-score applied.
-
 def _prepare_test_data(X, _mean, _std):
-    return X.astype(np.float32)
+    return standardize_windows(X, _mean, _std, model_family=MODEL_FAMILY)
 
 
 # ── Augmentation (GPU-native) ─────────────────────────────────────────────────
@@ -522,12 +580,38 @@ def make_subject_sample_weights(subjects: np.ndarray) -> np.ndarray:
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
-    """Always GestureCNNv2 for cross-subject training."""
-    return GestureCNNv2(
+    return build_model(
+        MODEL_FAMILY,
         in_channels=in_channels,
         num_classes=num_classes,
         dropout=DROPOUT,
-    ).to(device)
+        device=device,
+        family_cfg=FAMILY_CFG,
+    )
+
+
+def _embed_windows(model: nn.Module, X: np.ndarray, device, *, l2_normalize: bool) -> np.ndarray:
+    model.eval()
+    loader = DataLoader(TensorDataset(torch.from_numpy(X.astype(np.float32))), batch_size=BATCH_SIZE, shuffle=False)
+    chunks = []
+    with torch.no_grad():
+        for (xb,) in loader:
+            xb = xb.to(device)
+            extract_embedding = getattr(model, "extract_embedding", None)
+            if callable(extract_embedding):
+                emb_tensor = cast(SupportsExtractEmbedding, model).extract_embedding(
+                    xb,
+                    l2_normalize=l2_normalize,
+                )
+            else:
+                logits = model(xb)
+                emb_tensor = logits
+                if l2_normalize:
+                    emb_tensor = torch.nn.functional.normalize(emb_tensor, p=2, dim=1, eps=1e-8)
+            chunks.append(emb_tensor.detach().cpu().numpy())
+    if not chunks:
+        return np.empty((0, 0), dtype=np.float32)
+    return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -546,14 +630,9 @@ def train_eval_split(
     use_eval_for_model_selection=True,
     use_eval_for_scheduler=True,
 ):
-    # No z-score: GestureCNNv2 normalises internally via InstanceNorm.
-    # Compute mean/std for bundle compatibility (inference path checks metadata).
-    mean = X_train.mean(axis=(0, 2))
-    std  = X_train.std(axis=(0, 2))
-    std  = np.where(std < 1e-6, 1.0, std)
-
-    X_train_t = X_train.astype(np.float32)
-    X_eval_t  = X_eval.astype(np.float32)
+    X_train_t, X_eval_t, mean, std = prepare_train_eval_inputs(
+        MODEL_FAMILY, X_train, X_eval
+    )
 
     train_ds = TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train))
     eval_ds  = TensorDataset(torch.from_numpy(X_eval_t),  torch.from_numpy(y_eval))
@@ -574,7 +653,11 @@ def train_eval_split(
 
     model = _build_model(int(channels[0]), num_classes, device)
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=float(LABEL_SMOOTHING))
+    objectives = build_training_objectives(
+        MODEL_FAMILY,
+        label_smoothing=LABEL_SMOOTHING,
+        family_cfg=FAMILY_CFG,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     # patience=5: cross-subject dataset is large; loss moves slowly
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -594,8 +677,14 @@ def train_eval_split(
             if USE_AUGMENTATION:
                 xb = augment_emg_gpu(xb, p=AUG_PROB)
             optimizer.zero_grad()
-            logits = model(xb)
-            loss   = criterion(logits, yb)
+            logits, loss = compute_training_step(
+                MODEL_FAMILY,
+                model,
+                xb,
+                yb,
+                objectives=objectives,
+                family_cfg=FAMILY_CFG,
+            )
             loss.backward()
             optimizer.step()
             train_loss    += loss.item() * xb.size(0)
@@ -608,8 +697,14 @@ def train_eval_split(
         with torch.no_grad():
             for xb, yb in eval_loader:
                 xb, yb = xb.to(device), yb.to(device)
-                logits = model(xb)
-                l      = criterion(logits, yb)
+                logits, l = compute_training_step(
+                    MODEL_FAMILY,
+                    model,
+                    xb,
+                    yb,
+                    objectives=objectives,
+                    family_cfg=FAMILY_CFG,
+                )
                 eval_loss_sum  += l.item() * xb.size(0)
                 eval_correct   += (torch.argmax(logits, 1) == yb).sum().item()
                 eval_total     += xb.size(0)
@@ -658,12 +753,13 @@ def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_
     unique_subjects = sorted(np.unique(subjects))
     if len(unique_subjects) < 2:
         print("LOSO requires at least 2 subjects — skipping.")
-        return
+        return {"enabled": False, "reason": "requires_at_least_two_subjects"}
 
     print(f"\nLOSO evaluation over {len(unique_subjects)} subjects:")
     print("(Measures true cross-subject accuracy; lower than in-distribution is expected)")
     channels  = [int(channel_count), 32, 64, 128]
     loso_accs = []
+    fold_results = []
     for held_out in unique_subjects:
         train_mask = subjects != held_out
         test_mask  = subjects == held_out
@@ -687,8 +783,16 @@ def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_
             for xb, _ in test_loader:
                 all_preds.append(torch.argmax(model(xb.to(device)), dim=1).cpu().numpy())
         y_pred = np.concatenate(all_preds)
-        acc = float(accuracy_score(y_idx[test_mask], y_pred))
+        eval_artifacts = _compute_eval_artifacts(y_idx[test_mask], y_pred, index_to_label)
+        acc = float(eval_artifacts["test_accuracy"])
         loso_accs.append(acc)
+        fold_results.append(
+            {
+                "held_out_subject": str(held_out),
+                "test_windows": int(test_mask.sum()),
+                "metrics": _serialize_eval_metrics(eval_artifacts),
+            }
+        )
         print(f"    Accuracy: {acc:.3f}")
         print(classification_report(
             y_idx[test_mask], y_pred,
@@ -709,6 +813,202 @@ def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_
             "WARNING: Mean LOSO accuracy < 65%. The model may not generalise reliably "
             "to new subjects. Collect more diverse data before deploying."
         )
+    return {
+        "enabled": True,
+        "model_family": MODEL_FAMILY,
+        "folds": fold_results,
+        "summary": {
+            "mean_accuracy": float(loso_accs.mean()),
+            "std_accuracy": float(loso_accs.std()),
+            "min_accuracy": float(loso_accs.min()),
+            "max_accuracy": float(loso_accs.max()),
+        },
+    }
+
+
+def _predict_prototype_labels(
+    model: nn.Module,
+    X_support: np.ndarray,
+    y_support: np.ndarray,
+    X_query: np.ndarray,
+    *,
+    mean: np.ndarray,
+    std: np.ndarray,
+    device,
+    num_classes: int,
+) -> np.ndarray:
+    X_support_t = _prepare_test_data(X_support, mean, std)
+    X_query_t = _prepare_test_data(X_query, mean, std)
+    support_embeddings = _embed_windows(
+        model,
+        X_support_t,
+        device,
+        l2_normalize=PROTOTYPE_L2_NORMALIZE,
+    )
+    classifier = PrototypeClassifier.fit(
+        support_embeddings,
+        y_support,
+        temperature=PROTOTYPE_TEMPERATURE,
+        l2_normalize=PROTOTYPE_L2_NORMALIZE,
+    )
+    query_embeddings = _embed_windows(
+        model,
+        X_query_t,
+        device,
+        l2_normalize=PROTOTYPE_L2_NORMALIZE,
+    )
+    if query_embeddings.shape[0] == 0:
+        return np.empty((0,), dtype=np.int64)
+    probs = np.stack(
+        [
+            classifier.predict_proba(emb, num_classes=int(num_classes))
+            for emb in query_embeddings
+        ],
+        axis=0,
+    )
+    return np.argmax(probs, axis=1).astype(np.int64, copy=False)
+
+
+def calibrated_loso_evaluate(
+    X,
+    y_idx,
+    groups,
+    subjects,
+    channel_count,
+    num_classes,
+    device,
+    index_to_label,
+):
+    if not supports_prototype_calibration(MODEL_FAMILY):
+        print("\nCalibrated LOSO skipped: current model family does not prefer prototype calibration.")
+        return {"enabled": False, "reason": "prototype_calibration_not_supported"}
+
+    unique_subjects = sorted(np.unique(subjects))
+    if len(unique_subjects) < 2:
+        print("\nCalibrated LOSO skipped: requires at least 2 subjects.")
+        return {"enabled": False, "reason": "requires_at_least_two_subjects"}
+
+    print(f"\nCalibrated LOSO evaluation over {len(unique_subjects)} subjects:")
+    print("(Held-out session file = support set; remaining held-out sessions = query set)")
+
+    channels = [int(channel_count), 32, 64, 128]
+    required_labels = set(range(int(num_classes)))
+    all_true = []
+    all_pred = []
+    subject_results = []
+    fold_results = []
+
+    for held_out in unique_subjects:
+        train_mask = subjects != held_out
+        subject_mask = subjects == held_out
+        subject_groups = sorted({str(g) for g in groups[subject_mask]})
+        if len(subject_groups) < 2:
+            print(f"\n  Held-out: {held_out} skipped (needs at least 2 session files for support/query split).")
+            continue
+
+        print(f"\n  Held-out: {held_out}  (train {train_mask.sum()}, subject windows {subject_mask.sum()})")
+        model, mean, std, _ = train_eval_split(
+            X[train_mask], y_idx[train_mask],
+            X[subject_mask], y_idx[subject_mask],
+            channels, num_classes, EPOCHS, device,
+            subjects_train=subjects[train_mask],
+            use_eval_for_model_selection=False,
+            use_eval_for_scheduler=False,
+        )
+
+        subject_true = []
+        subject_pred = []
+        subject_fold_results = []
+        for support_group in subject_groups:
+            support_mask = subject_mask & (groups == support_group)
+            query_mask = subject_mask & (groups != support_group)
+            if not np.any(query_mask):
+                continue
+
+            support_labels = set(int(v) for v in np.unique(y_idx[support_mask]).tolist())
+            missing_labels = sorted(required_labels - support_labels)
+            if missing_labels:
+                missing_names = [index_to_label[idx] for idx in missing_labels]
+                print(
+                    f"    Support {Path(str(support_group)).name} skipped: "
+                    f"missing labels {missing_names}"
+                )
+                continue
+
+            y_pred = _predict_prototype_labels(
+                model,
+                X[support_mask],
+                y_idx[support_mask],
+                X[query_mask],
+                mean=mean,
+                std=std,
+                device=device,
+                num_classes=num_classes,
+            )
+            if y_pred.size == 0:
+                continue
+
+            y_true = y_idx[query_mask]
+            eval_artifacts = _compute_eval_artifacts(y_true, y_pred, index_to_label)
+            fold_payload = {
+                "held_out_subject": str(held_out),
+                "support_file": Path(str(support_group)).name,
+                "support_windows": int(support_mask.sum()),
+                "query_windows": int(query_mask.sum()),
+                "metrics": _serialize_eval_metrics(eval_artifacts),
+            }
+            fold_results.append(fold_payload)
+            subject_fold_results.append(fold_payload)
+            subject_true.append(y_true)
+            subject_pred.append(y_pred)
+            all_true.append(y_true)
+            all_pred.append(y_pred)
+            print(
+                f"    Support {Path(str(support_group)).name}: "
+                f"accuracy={eval_artifacts['test_accuracy']:.3f} "
+                f"macro_f1={eval_artifacts['macro_f1']:.3f}"
+            )
+
+        if subject_true:
+            y_true_subject = np.concatenate(subject_true)
+            y_pred_subject = np.concatenate(subject_pred)
+            subject_eval = _compute_eval_artifacts(y_true_subject, y_pred_subject, index_to_label)
+            subject_results.append(
+                {
+                    "held_out_subject": str(held_out),
+                    "support_unit": "session_file",
+                    "fold_count": int(len(subject_fold_results)),
+                    "metrics": _serialize_eval_metrics(subject_eval),
+                    "folds": subject_fold_results,
+                }
+            )
+            print(
+                f"    Subject summary: accuracy={subject_eval['test_accuracy']:.3f} "
+                f"macro_f1={subject_eval['macro_f1']:.3f}"
+            )
+        else:
+            print(f"    No valid support/query splits for {held_out}.")
+
+    if not all_true:
+        print("\nCalibrated LOSO produced no valid support/query folds.")
+        return {"enabled": False, "reason": "no_valid_support_query_splits"}
+
+    overall_true = np.concatenate(all_true)
+    overall_pred = np.concatenate(all_pred)
+    overall_eval = _compute_eval_artifacts(overall_true, overall_pred, index_to_label)
+    print(
+        f"\nCalibrated LOSO summary: accuracy={overall_eval['test_accuracy']:.3f} "
+        f"balanced_accuracy={overall_eval['balanced_accuracy']:.3f} "
+        f"macro_f1={overall_eval['macro_f1']:.3f}"
+    )
+    return {
+        "enabled": True,
+        "model_family": MODEL_FAMILY,
+        "support_unit": "session_file",
+        "subjects": subject_results,
+        "folds": fold_results,
+        "summary": _serialize_eval_metrics(overall_eval),
+    }
 
 
 # ── Save bundle ───────────────────────────────────────────────────────────────
@@ -743,7 +1043,7 @@ def _build_bundle(
         "test_size": float(TEST_SIZE),
         "calibration_used": bool(USE_CALIBRATION),
         "calibration_mvc_percentile": float(MVC_PERCENTILE),
-        "use_instance_norm_input": True,
+        **build_family_metadata(MODEL_FAMILY, family_cfg=FAMILY_CFG),
         "label_confidence_filter": {
             "enabled": bool(USE_MIN_LABEL_CONFIDENCE),
             "min_label_confidence": float(MIN_LABEL_CONFIDENCE),
@@ -788,11 +1088,12 @@ def _build_bundle(
         "normalization": {"mean": mean.tolist(), "std": std.tolist()},
         "label_to_index": label_to_index,
         "index_to_label": index_to_label,
-        "architecture": {
-            "type": "GestureCNNv2",
-            "in_channels": int(channel_count),
-            "dropout": float(DROPOUT),
-        },
+        "architecture": build_architecture_metadata(
+            MODEL_FAMILY,
+            int(channel_count),
+            dropout=DROPOUT,
+            family_cfg=FAMILY_CFG,
+        ),
         "metadata": metadata,
     }
 
@@ -810,6 +1111,7 @@ def _train_and_save(
     channel_count,
     model_out,
     layout_sources,
+    evaluation_metadata=None,
 ):
     unique_groups = np.unique(groups)
     print(f"{X.shape[0]} windows across {len(unique_groups)} session file(s).")
@@ -822,7 +1124,7 @@ def _train_and_save(
     test_files  = sorted({str(g) for g in groups[test_idx]})
     print(f"Train ({len(train_files)} files): {[Path(f).name for f in train_files]}")
     print(f"Test  ({len(test_files)} files):  {[Path(f).name for f in test_files]}")
-    print(f"\nTraining GestureCNNv2 for {EPOCHS} epochs on {len(train_idx)} windows.")
+    print(f"\nTraining {MODEL_FAMILY} for {EPOCHS} epochs on {len(train_idx)} windows.")
 
     model, mean, std, _ = train_eval_split(
         X[train_idx], y_idx[train_idx],
@@ -926,6 +1228,10 @@ def _train_and_save(
                 "kind_counts": {},
             }
         }
+    if evaluation_metadata:
+        if extra_metadata is None:
+            extra_metadata = {}
+        extra_metadata["evaluation"] = evaluation_metadata
 
     bundle = _build_bundle(
         model=model,
@@ -956,6 +1262,9 @@ def main():
         raise ValueError(
             f"CHANNEL_LAYOUT_MODE must be 'strict' or 'none', got {CHANNEL_LAYOUT_MODE!r}"
         )
+    validate_model_family(MODEL_FAMILY)
+    if CALIBRATED_LOSO_EVAL and not LOSO_EVAL:
+        raise ValueError("CALIBRATED_LOSO_EVAL requires LOSO_EVAL = True.")
     confirm = input(f"Training {ARM} arm cross-subject model — continue? [y/N] ").strip().lower()
     if confirm != "y":
         print("Aborted.")
@@ -971,6 +1280,7 @@ def main():
         f"{len(np.unique(y))} classes, {len(unique_subjects)} subject(s): "
         f"{unique_subjects}"
     )
+    print(f"Model family: {MODEL_FAMILY}")
     if CHANNEL_LAYOUT_MODE == "strict":
         expected_channels = strict_channel_count_for_arm(ARM)
         if channel_count != expected_channels:
@@ -996,8 +1306,26 @@ def main():
 
     # LOSO runs first so you can assess cross-subject accuracy before committing
     # to the final model weights.
+    evaluation_metadata = {}
     if LOSO_EVAL:
-        loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_to_label)
+        evaluation_metadata["zero_shot_loso"] = loso_evaluate(
+            X, y_idx, subjects, channel_count, num_classes, device, index_to_label
+        )
+        if CALIBRATED_LOSO_EVAL:
+            evaluation_metadata["calibrated_loso"] = calibrated_loso_evaluate(
+                X,
+                y_idx,
+                groups,
+                subjects,
+                channel_count,
+                num_classes,
+                device,
+                index_to_label,
+            )
+
+    if not TRAIN_FINAL_MODEL:
+        print("\nTRAIN_FINAL_MODEL = False; skipping pooled final fit.")
+        return
 
     print(f"\n{'=' * 55}")
     print("Final cross-subject model (all subjects pooled)")
@@ -1007,6 +1335,7 @@ def main():
         labels, label_to_index, index_to_label, channel_count,
         model_out=MODEL_OUT,
         layout_sources=layout_sources,
+        evaluation_metadata=evaluation_metadata or None,
     )
 
     print(f"\n{'=' * 55}")

@@ -1,8 +1,7 @@
-"""Single-subject EMG gesture classifier training (cross-subject-aligned).
+"""Single-subject EMG gesture classifier training.
 
-Uses GestureCNNv2 (InstanceNorm input + energy bypass) with the same core
-training/evaluation style as train_cross_subject.py, but trains exactly one
-model for TARGET_SUBJECT.
+Supports the existing `cnn_v2` path and the metric-learning `metric_tcn`
+variant while keeping the same grouped-session evaluation workflow.
 
 Usage:
     python train_per_subject.py
@@ -31,7 +30,18 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from libemg.utils import get_windows
 from emg.channel_layout import CANONICAL_BLOCK_ORDER, infer_channel_layout, reorder_by_layout
-from emg.gesture_model_cnn import GestureCNNv2
+from emg.model_family import (
+    ModelFamilyConfig,
+    build_architecture_metadata,
+    build_family_metadata,
+    build_model,
+    build_training_objectives,
+    compute_training_step,
+    prepare_train_eval_inputs,
+    prepare_train_inputs,
+    standardize_windows,
+    validate_model_family,
+)
 from emg.strict_layout import (
     resolve_strict_indices_from_metadata,
     strict_channel_count_for_arm,
@@ -41,12 +51,12 @@ from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_
 
 
 # ======== Config ========
-ARM = "left"  # set to "right" or "left" before running
+ARM = "right"  # set to "right" or "left" before running
 TARGET_SUBJECT = "Matthew"
 
 DATA_ROOT = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
 PATTERN = "*_filtered.npz"
-MODEL_OUT = STRICT_MODELS_ROOT / "per_subject" / ARM / f"{TARGET_SUBJECT}v6_4_gestures.pt"
+MODEL_OUT = STRICT_MODELS_ROOT / "per_subject" / ARM / f"{TARGET_SUBJECT}_tcn_4_gestures.pt"
 
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
@@ -59,9 +69,9 @@ MIN_LABEL_CONFIDENCE = 0.85
 RANDOM_STATE = 42
 BATCH_SIZE = 512
 # Session-grouped k-fold CV for unbiased per-subject metrics.
-PER_SUBJECT_CV_FOLDS = 5
+PER_SUBJECT_CV_FOLDS = 2
 
-EPOCHS = 30
+EPOCHS = 40
 LR = 1e-4
 DROPOUT = 0.25
 LABEL_SMOOTHING = 0.05
@@ -75,7 +85,23 @@ USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION = CHANNEL_LAYOUT_MODE == "salvage"
 
 EXCLUDED_SUBJECTS: list[str] = []  # Keep empty for Matthew-only runs unless you need to blacklist a subject.
 INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "horn"}  # Example subset: {"neutral", "left_turn", "right_turn"}.
+MODEL_FAMILY = "metric_tcn"  # "cnn_v2" or "metric_tcn"
+METRIC_TCN_CHANNELS = (64, 64, 128, 128)
+METRIC_TCN_KERNEL_SIZE = 5
+METRIC_TCN_EMBEDDING_DIM = 128
+SUPCON_WEIGHT = 0.20
+SUPCON_TEMPERATURE = 0.10
 # ========================
+
+MODEL_FAMILY = validate_model_family(MODEL_FAMILY)
+FAMILY_CFG = ModelFamilyConfig(
+    model_family=MODEL_FAMILY,
+    metric_tcn_channels=METRIC_TCN_CHANNELS,
+    metric_tcn_kernel_size=METRIC_TCN_KERNEL_SIZE,
+    metric_tcn_embedding_dim=METRIC_TCN_EMBEDDING_DIM,
+    supcon_weight=SUPCON_WEIGHT,
+    supcon_temperature=SUPCON_TEMPERATURE,
+)
 
 
 # -- Label utilities -----------------------------------------------------------
@@ -563,8 +589,7 @@ def load_dataset(target_subject: str):
 # -- Normalisation -------------------------------------------------------------
 
 def _prepare_test_data(X, _mean, _std):
-    # GestureCNNv2 handles normalisation internally via InstanceNorm1d.
-    return X.astype(np.float32)
+    return standardize_windows(X, _mean, _std, model_family=MODEL_FAMILY)
 
 
 # -- Augmentation --------------------------------------------------------------
@@ -650,11 +675,14 @@ def augment_emg_gpu(
 # -- Training ------------------------------------------------------------------
 
 def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
-    return GestureCNNv2(
+    return build_model(
+        MODEL_FAMILY,
         in_channels=in_channels,
         num_classes=num_classes,
         dropout=DROPOUT,
-    ).to(device)
+        device=device,
+        family_cfg=FAMILY_CFG,
+    )
 
 
 def train_eval_split(
@@ -662,12 +690,9 @@ def train_eval_split(
     channel_count, num_classes, epochs, device,
     permutation_groups=None,
 ):
-    mean = X_train.mean(axis=(0, 2))
-    std = X_train.std(axis=(0, 2))
-    std = np.where(std < 1e-6, 1.0, std)
-
-    X_train_t = X_train.astype(np.float32)
-    X_eval_t = X_eval.astype(np.float32)
+    X_train_t, X_eval_t, mean, std = prepare_train_eval_inputs(
+        MODEL_FAMILY, X_train, X_eval
+    )
 
     train_ds = TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train))
     eval_ds = TensorDataset(torch.from_numpy(X_eval_t), torch.from_numpy(y_eval))
@@ -682,7 +707,11 @@ def train_eval_split(
 
     model = _build_model(int(channel_count), num_classes, device)
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    objectives = build_training_objectives(
+        MODEL_FAMILY,
+        label_smoothing=LABEL_SMOOTHING,
+        family_cfg=FAMILY_CFG,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5, threshold=1e-4, min_lr=1e-6
@@ -715,8 +744,14 @@ def train_eval_split(
                 )
 
             optimizer.zero_grad()
-            logits = model(xb)
-            loss = criterion(logits, yb)
+            logits, loss = compute_training_step(
+                MODEL_FAMILY,
+                model,
+                xb,
+                yb,
+                objectives=objectives,
+                family_cfg=FAMILY_CFG,
+            )
             loss.backward()
             optimizer.step()
 
@@ -733,8 +768,14 @@ def train_eval_split(
             for xb, yb in eval_loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
-                logits = model(xb)
-                loss = criterion(logits, yb)
+                logits, loss = compute_training_step(
+                    MODEL_FAMILY,
+                    model,
+                    xb,
+                    yb,
+                    objectives=objectives,
+                    family_cfg=FAMILY_CFG,
+                )
                 eval_loss += loss.item() * xb.size(0)
                 preds = torch.argmax(logits, dim=1)
                 eval_correct += (preds == yb).sum().item()
@@ -781,18 +822,18 @@ def train_full_dataset(
     device,
     permutation_groups=None,
 ):
-    mean = X_train.mean(axis=(0, 2))
-    std = X_train.std(axis=(0, 2))
-    std = np.where(std < 1e-6, 1.0, std)
-
-    X_train_t = X_train.astype(np.float32)
+    X_train_t, mean, std = prepare_train_inputs(MODEL_FAMILY, X_train)
     train_ds = TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train))
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, pin_memory=True
     )
 
     model = _build_model(int(channel_count), num_classes, device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    objectives = build_training_objectives(
+        MODEL_FAMILY,
+        label_smoothing=LABEL_SMOOTHING,
+        family_cfg=FAMILY_CFG,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5, threshold=1e-4, min_lr=1e-6
@@ -825,8 +866,14 @@ def train_full_dataset(
                 )
 
             optimizer.zero_grad()
-            logits = model(xb)
-            loss = criterion(logits, yb)
+            logits, loss = compute_training_step(
+                MODEL_FAMILY,
+                model,
+                xb,
+                yb,
+                objectives=objectives,
+                family_cfg=FAMILY_CFG,
+            )
             loss.backward()
             optimizer.step()
 
@@ -861,9 +908,9 @@ def train_full_dataset(
     return model, mean, std, float(best_loss), int(best_epoch)
 
 
-def _predict_labels(model, X, device):
+def _predict_labels(model, X, device, mean, std):
     model.eval()
-    X_test = _prepare_test_data(X, None, None)
+    X_test = _prepare_test_data(X, mean, std)
     test_loader = DataLoader(
         TensorDataset(torch.from_numpy(X_test)),
         batch_size=BATCH_SIZE,
@@ -929,9 +976,9 @@ def _run_grouped_cross_validation(
         print(f"\nCV fold {fold_idx}/{n_splits}")
         print(f"Train ({len(train_files)} files): {[Path(f).name for f in train_files]}")
         print(f"Test  ({len(test_files)} files):  {[Path(f).name for f in test_files]}")
-        print(f"Training GestureCNNv2 for {EPOCHS} epochs on {len(train_idx)} windows.")
+        print(f"Training {MODEL_FAMILY} for {EPOCHS} epochs on {len(train_idx)} windows.")
 
-        model, _, _, _, best_epoch = train_eval_split(
+        model, mean, std, _, best_epoch = train_eval_split(
             X[train_idx],
             y_idx[train_idx],
             X[test_idx],
@@ -943,7 +990,7 @@ def _run_grouped_cross_validation(
             permutation_groups=permutation_groups,
         )
 
-        y_pred = _predict_labels(model, X[test_idx], device)
+        y_pred = _predict_labels(model, X[test_idx], device, mean, std)
         oof_pred[test_idx] = y_pred
         fold_eval = _compute_eval_artifacts(y_idx[test_idx], y_pred, index_to_label)
         fold_metrics = _serialize_eval_metrics(fold_eval)
@@ -1061,9 +1108,12 @@ def _train_and_save(
         "label_to_index": label_to_index,
         "index_to_label": index_to_label,
         "architecture": {
-            "type": "GestureCNNv2",
-            "in_channels": int(channel_count),
-            "dropout": float(DROPOUT),
+            **build_architecture_metadata(
+                MODEL_FAMILY,
+                int(channel_count),
+                dropout=DROPOUT,
+                family_cfg=FAMILY_CFG,
+            ),
         },
         "metadata": {
             "created_at": dt.datetime.now().isoformat(),
@@ -1080,7 +1130,7 @@ def _train_and_save(
             "test_size": None,
             "calibration_used": bool(USE_CALIBRATION),
             "calibration_mvc_percentile": float(MVC_PERCENTILE),
-            "use_instance_norm_input": True,
+            **build_family_metadata(MODEL_FAMILY, family_cfg=FAMILY_CFG),
             "label_confidence_filter": {
                 "enabled": bool(USE_MIN_LABEL_CONFIDENCE),
                 "min_label_confidence": float(MIN_LABEL_CONFIDENCE),
@@ -1160,6 +1210,7 @@ def main():
         raise ValueError(
             f"CHANNEL_LAYOUT_MODE must be 'strict', 'salvage', or 'none', got {CHANNEL_LAYOUT_MODE!r}"
         )
+    validate_model_family(MODEL_FAMILY)
 
     confirm = input(
         f"Training {ARM} arm single-subject model for '{TARGET_SUBJECT}' - continue? [y/N] "
@@ -1180,6 +1231,7 @@ def main():
         f"{len(np.unique(y))} classes, {len(unique_subjects)} subject(s): "
         f"{unique_subjects}"
     )
+    print(f"Model family: {MODEL_FAMILY}")
     if CHANNEL_LAYOUT_MODE == "strict":
         expected_channels = strict_channel_count_for_arm(ARM)
         if channel_count != expected_channels:

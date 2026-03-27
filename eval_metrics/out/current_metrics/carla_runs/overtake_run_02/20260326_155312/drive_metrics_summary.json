@@ -1,0 +1,15 @@
+{
+  "full_route": {
+    "rows": 1929,
+    "scenario_name": "highway_overtake",
+    "scenario_kind": "overtake",
+    "scenario_status": "finish_gate_pending",
+    "scenario_success": null,
+    "lane_error_mean_m": 0.32687618870992485,
+    "lane_error_rmse_m": 0.5221620473803722,
+    "lane_invasions": 8,
+    "completion_time_s": 78.29290307313204,
+    "steering_smoothness": 0.0029668049322618983,
+    "command_success_rate": null
+  }
+}

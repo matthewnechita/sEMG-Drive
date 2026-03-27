@@ -1,0 +1,63 @@
+{
+  "models_root": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\models\\strict",
+  "output_root": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics",
+  "realtime_behavior_ready_logs": [],
+  "realtime_behavior_skipped_logs": [
+    "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\logs\\2026-03-18\\realtime_dual_baseline.csv",
+    "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\logs\\2026-03-18\\realtime_dual_baseline_all_gestures.csv"
+  ],
+  "carla_run_pairs": [
+    {
+      "run_dir": "lane_keep_run_01",
+      "stamp": "20260325_165855",
+      "realtime_log": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\lane_keep_run_01\\realtime_predictions_20260325_165855.csv",
+      "carla_log": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\lane_keep_run_01\\carla_drive_20260325_165855.csv",
+      "latency_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\lane_keep_run_01\\20260325_165855\\latency_summary.json",
+      "latency_csv": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\lane_keep_run_01\\20260325_165855\\latency_joined.csv",
+      "drive_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\lane_keep_run_01\\20260325_165855\\drive_metrics_summary.json"
+    },
+    {
+      "run_dir": "lane_keep_run_01",
+      "stamp": "20260325_170124",
+      "realtime_log": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\lane_keep_run_01\\realtime_predictions_20260325_170124.csv",
+      "carla_log": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\lane_keep_run_01\\carla_drive_20260325_170124.csv",
+      "latency_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\lane_keep_run_01\\20260325_170124\\latency_summary.json",
+      "latency_csv": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\lane_keep_run_01\\20260325_170124\\latency_joined.csv",
+      "drive_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\lane_keep_run_01\\20260325_170124\\drive_metrics_summary.json"
+    },
+    {
+      "run_dir": "lane_keep_run_02",
+      "stamp": "20260326_154343",
+      "realtime_log": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\lane_keep_run_02\\realtime_predictions_20260326_154343.csv",
+      "carla_log": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\lane_keep_run_02\\carla_drive_20260326_154343.csv",
+      "latency_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\lane_keep_run_02\\20260326_154343\\latency_summary.json",
+      "latency_csv": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\lane_keep_run_02\\20260326_154343\\latency_joined.csv",
+      "drive_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\lane_keep_run_02\\20260326_154343\\drive_metrics_summary.json"
+    },
+    {
+      "run_dir": "overtake_run_01",
+      "stamp": "20260325_171243",
+      "realtime_log": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\overtake_run_01\\realtime_predictions_20260325_171243.csv",
+      "carla_log": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\overtake_run_01\\carla_drive_20260325_171243.csv",
+      "latency_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\overtake_run_01\\20260325_171243\\latency_summary.json",
+      "latency_csv": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\overtake_run_01\\20260325_171243\\latency_joined.csv",
+      "drive_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\overtake_run_01\\20260325_171243\\drive_metrics_summary.json"
+    },
+    {
+      "run_dir": "overtake_run_02",
+      "stamp": "20260326_155312",
+      "realtime_log": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\overtake_run_02\\realtime_predictions_20260326_155312.csv",
+      "carla_log": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\overtake_run_02\\carla_drive_20260326_155312.csv",
+      "latency_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\overtake_run_02\\20260326_155312\\latency_summary.json",
+      "latency_csv": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\overtake_run_02\\20260326_155312\\latency_joined.csv",
+      "drive_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_runs\\overtake_run_02\\20260326_155312\\drive_metrics_summary.json"
+    }
+  ],
+  "outputs": {
+    "model_metrics_csv": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\model_metrics.csv",
+    "model_metrics_json": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\model_metrics.json",
+    "manifest_template": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\table_manifest_template.csv",
+    "realtime_behavior_index_csv": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\realtime_behavior_index.csv",
+    "carla_run_index_csv": "C:\\Users\\matth\\Desktop\\capstone\\capstone-emg\\eval_metrics\\out\\current_metrics\\carla_run_index.csv"
+  }
+}
