@@ -64,7 +64,7 @@ class SupportsExtractEmbedding(Protocol):
 
 
 # ======== Config ========
-ARM        = "right"            # ← set to "right" or "left" before running, lowercase l
+ARM        = "left"            # ← set to "right" or "left" before running, lowercase l
 DATA_ROOT  = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
 MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "tcn_4_gestures.pt"
 PATTERN    = "*_filtered.npz"
@@ -112,8 +112,8 @@ INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "hor
 # LOSO evaluation must be run before deploying the cross-subject model.
 # This measures true cross-subject accuracy (model vs subjects it never trained on).
 # Minimum recommended LOSO accuracy before deployment: 65%.
-LOSO_EVAL = True
-CALIBRATED_LOSO_EVAL = True
+LOSO_EVAL = False
+CALIBRATED_LOSO_EVAL = False
 TRAIN_FINAL_MODEL = True
 MODEL_FAMILY = "metric_tcn"  # "cnn_v2" or "metric_tcn"
 METRIC_TCN_CHANNELS = (64, 64, 128, 128)

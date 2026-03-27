@@ -290,7 +290,7 @@ MODEL_RIGHT = os.path.join(
     "strict",
     "cross_subject",
     "right",
-    "v6_4_gestures.pt",
+    "tcn_4_gestures.pt",
 )
 
 MODEL_LEFT = os.path.join(
@@ -299,7 +299,7 @@ MODEL_LEFT = os.path.join(
     "strict",
     "cross_subject",
     "left",
-    "v6_4_gestures.pt",
+    "tcn_4_gestures.pt",
 )
 # ================================
 
