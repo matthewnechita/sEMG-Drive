@@ -66,7 +66,7 @@ class SupportsExtractEmbedding(Protocol):
 # ======== Config ========
 ARM        = "left"            # ← set to "right" or "left" before running, lowercase l
 DATA_ROOT  = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
-MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "tcn_4_gestures.pt"
+MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "metrics_test.pt"
 PATTERN    = "*_filtered.npz"
 
 WINDOW_SIZE = 200
@@ -84,7 +84,7 @@ BATCH_SIZE   = 512
 # Cross-subject hyperparameters.
 # Keep these shared across model families unless a specific experiment needs
 # a model-family-specific override.
-EPOCHS  = 40
+EPOCHS  = 50
 LR      = 1e-4
 DROPOUT = 0.25
 LABEL_SMOOTHING = 0.05
@@ -112,10 +112,10 @@ INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "hor
 # LOSO evaluation must be run before deploying the cross-subject model.
 # This measures true cross-subject accuracy (model vs subjects it never trained on).
 # Minimum recommended LOSO accuracy before deployment: 65%.
-LOSO_EVAL = False
+LOSO_EVAL = True
 CALIBRATED_LOSO_EVAL = False
 TRAIN_FINAL_MODEL = True
-MODEL_FAMILY = "metric_tcn"  # "cnn_v2" or "metric_tcn"
+MODEL_FAMILY = "cnn_v2"  # "cnn_v2" or "metric_tcn"
 METRIC_TCN_CHANNELS = (64, 64, 128, 128)
 METRIC_TCN_KERNEL_SIZE = 5
 METRIC_TCN_EMBEDDING_DIM = 128

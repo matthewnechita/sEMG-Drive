@@ -1015,7 +1015,7 @@ Reverse toggle protections:
 - checkpoint spacing: `25.0 m`
 - route length: `420.0 m`
 - timeout: `None`
-- lead spawn distance: `25.0 m`
+- lead spawn distance: `130.0 m`
 - `lead_hold_until_start = True`
 - lead speed reduction: `60%`
 

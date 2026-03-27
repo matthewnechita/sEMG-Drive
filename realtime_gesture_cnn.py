@@ -288,18 +288,18 @@ MODEL_RIGHT = os.path.join(
     BASE_DIR,
     "models",
     "strict",
-    "cross_subject",
+    "per_subject",
     "right",
-    "tcn_4_gestures.pt",
+    "Matthewv6_4_gestures.pt",
 )
 
 MODEL_LEFT = os.path.join(
     BASE_DIR,
     "models",
     "strict",
-    "cross_subject",
+    "per_subject",
     "left",
-    "tcn_4_gestures.pt",
+    "Matthewv6_4_gestures.pt",
 )
 # ================================
 

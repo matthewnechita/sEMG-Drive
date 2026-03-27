@@ -9,6 +9,10 @@ top-level training and realtime entrypoints.
   - Scan saved model bundles and export their stored offline metrics.
   - Useful for building the 3-gesture / 5-gesture and per-subject / cross-subject tables.
 
+- `plot_model_accuracy_bars.py`
+  - Plot harvested offline accuracy bars from `model_metrics.csv`.
+  - Useful for replotting per-subject vs cross-subject model comparisons after filtering to one model family.
+
 - `plot_filter_effect.py`
   - Compare one raw `.npz` file against its filtered `.npz` counterpart.
   - Saves a figure with a time-domain overlay and PSD comparison.
@@ -33,6 +37,10 @@ top-level training and realtime entrypoints.
 - `analyze_drive_metrics.py`
   - Summarize CARLA run logs into lane-keeping, timing, and steering metrics.
   - Consumes the per-tick CARLA CSV emitted by `carla wheel z.py`.
+
+- `plot_drive_lane_error.py`
+  - Plot `lane_error_m` over time from a CARLA run CSV.
+  - Adds a rolling mean overlay, lane-invasion markers, and summary stats.
 
 - `build_eval_tables.py`
   - Merge offline model metrics with optional realtime/latency/drive summaries into copyable tables.
@@ -68,7 +76,8 @@ Table assembly
    `diagnose_session_recall.py` to summarize and inspect those runs.
 5. Add or collect realtime/CARLA logs.
 6. Use `analyze_latency.py` and `analyze_drive_metrics.py` on those logs.
-7. Use `plot_filter_effect.py` to generate signal-processing figures.
+7. Use `plot_drive_lane_error.py` to render the lane error trace for a CARLA run.
+8. Use `plot_filter_effect.py` to generate signal-processing figures.
 
 ## Notes
 
