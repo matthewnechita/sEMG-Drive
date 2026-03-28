@@ -50,7 +50,7 @@ Example runtime flow
 
 1. Start CARLA with `carla_integration/test_start_carla_server_0_9_16.bat`
 2. Run a named scenario wrapper or `python carla_integration\manual_control_emg.py --scenario ...`
-3. Keep traffic generation as a separate process if needed
+3. For free-roam practice, use `test_run_manual_control_emg_0_9_16.bat`; it now starts with moderate ambient traffic by default unless `--scenario ...` is passed
 
 Scenario CLI commands
 
@@ -92,11 +92,14 @@ Optional direct CLI examples:
 python carla_integration\manual_control_emg.py --scenario lane_keep_5min --show-hud
 python carla_integration\manual_control_emg.py --scenario lane_keep_5min --eval-log-dir eval_metrics\out\lane_keep_run_01
 python carla_integration\manual_control_emg.py --scenario highway_overtake --eval-log-dir eval_metrics\out\overtake_run_01
+python carla_integration\manual_control_emg.py --map Town03_Opt --ambient-vehicles 10 --ambient-pedestrians 18 --show-hud
 ```
 
 Notes:
 
 - Scenario presets set their own map, so `--scenario lane_keep_5min` and `--scenario highway_overtake` automatically load `Town04_Opt`.
 - `lane_keep_5min` currently starts from checkpoint index `3`, so the scenario START is intentionally moved farther up the route instead of beginning at the first physical checkpoint.
+- `manual_control_emg.py` now supports `--ambient-vehicles` and `--ambient-pedestrians` for integrated background traffic and walkers.
+- `test_run_manual_control_emg_0_9_16.bat` applies default free-roam practice traffic only when no named `--scenario` is requested, so the evaluation wrappers keep their existing behavior.
 
 The maps and simulator binaries are intentionally not stored in Git here.

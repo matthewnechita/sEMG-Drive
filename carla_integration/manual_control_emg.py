@@ -287,6 +287,8 @@ class DriveCSVLogger(object):
             'scenario_next_checkpoint_distance_m',
             'scenario_lead_distance_m',
             'scenario_lead_gap_m',
+            'scenario_lead_response_active',
+            'scenario_lead_speed_reduction_pct',
             'scenario_current_lane_id',
             'scenario_target_lane_id',
             'published_labels',
@@ -307,6 +309,14 @@ def _location_distance(a, b):
         (float(a.x) - float(b.x)) ** 2
         + (float(a.y) - float(b.y)) ** 2
         + (float(a.z) - float(b.z)) ** 2
+    )
+
+
+def _velocity_speed_mps(velocity):
+    return math.sqrt(
+        float(velocity.x) ** 2
+        + float(velocity.y) ** 2
+        + float(velocity.z) ** 2
     )
 
 
@@ -356,8 +366,35 @@ class ScenarioRuntime(object):
         self._last_sim_time = 0.0
         self._should_exit = False
         self._lead_autopilot_enabled = False
+        self._lead_response_active = False
+        self._lead_speed_reduction_pct = None
 
     def get_ego_spawn_transform(self, carla_map):
+        anchor_transform = self._get_anchor_spawn_transform(carla_map)
+        spawn_before_start_m = max(
+            0.0,
+            float(getattr(self.preset, "ego_spawn_before_start_checkpoint_m", 0.0) or 0.0),
+        )
+        if spawn_before_start_m <= 0.0:
+            return anchor_transform
+
+        anchor_waypoint = self._get_anchor_waypoint(carla_map)
+        if anchor_waypoint is None:
+            return anchor_transform
+
+        route_waypoints, route_progress = self._build_route(anchor_waypoint)
+        if not route_waypoints or not route_progress:
+            return anchor_transform
+
+        start_checkpoint_progress = self._resolve_start_checkpoint_progress(route_waypoints, route_progress)
+        if start_checkpoint_progress is None:
+            return anchor_transform
+
+        target_progress = max(0.0, float(start_checkpoint_progress) - spawn_before_start_m)
+        spawn_transform = self._transform_at_route_progress(route_waypoints, route_progress, target_progress)
+        return spawn_transform if spawn_transform is not None else anchor_transform
+
+    def _get_anchor_spawn_transform(self, carla_map):
         spawn_points = list(carla_map.get_spawn_points())
         if not spawn_points:
             return carla.Transform()
@@ -373,6 +410,73 @@ class ScenarioRuntime(object):
                 pitch=float(selected.rotation.pitch),
                 yaw=float(selected.rotation.yaw),
                 roll=float(selected.rotation.roll),
+            ),
+        )
+
+    def _get_anchor_waypoint(self, carla_map):
+        anchor_transform = self._get_anchor_spawn_transform(carla_map)
+        return carla_map.get_waypoint(
+            anchor_transform.location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+
+    def _resolve_start_checkpoint_progress(self, route_waypoints, route_progress):
+        if not route_waypoints or not route_progress:
+            return None
+        start_checkpoint_index = max(
+            0,
+            int(getattr(self.preset, "start_checkpoint_index", 0) or 0),
+        )
+
+        explicit_progress = [
+            float(x)
+            for x in getattr(self.preset, 'checkpoint_progress_m', ())
+            if x is not None
+        ]
+        if explicit_progress:
+            if start_checkpoint_index >= len(explicit_progress):
+                return None
+            return min(float(route_progress[-1]), explicit_progress[start_checkpoint_index])
+
+        explicit_locations = self._locations_from_explicit_checkpoints()
+        if explicit_locations:
+            if start_checkpoint_index >= len(explicit_locations):
+                return None
+            checkpoint_location = explicit_locations[start_checkpoint_index]
+            best_progress = None
+            best_distance = None
+            for waypoint, progress in zip(route_waypoints, route_progress):
+                distance = _location_distance(checkpoint_location, waypoint.transform.location)
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    best_progress = float(progress)
+            return best_progress
+
+        checkpoint_spacing_m = max(10.0, float(self.preset.checkpoint_spacing_m))
+        start_progress = float(self.preset.start_offset_m) + start_checkpoint_index * checkpoint_spacing_m
+        return min(float(route_progress[-1]), start_progress)
+
+    def _transform_at_route_progress(self, route_waypoints, route_progress, target_progress_m):
+        if not route_waypoints or not route_progress:
+            return None
+        target_progress = max(0.0, float(target_progress_m))
+        route_index = len(route_progress) - 1
+        for idx, progress in enumerate(route_progress):
+            if float(progress) >= target_progress:
+                route_index = idx
+                break
+        waypoint = route_waypoints[route_index]
+        return carla.Transform(
+            carla.Location(
+                x=float(waypoint.transform.location.x),
+                y=float(waypoint.transform.location.y),
+                z=float(waypoint.transform.location.z) + 0.2,
+            ),
+            carla.Rotation(
+                pitch=float(waypoint.transform.rotation.pitch),
+                yaw=float(waypoint.transform.rotation.yaw),
+                roll=float(waypoint.transform.rotation.roll),
             ),
         )
 
@@ -726,14 +830,117 @@ class ScenarioRuntime(object):
             self._traffic_manager.distance_to_leading_vehicle(actor, 1.0)
         except RuntimeError:
             pass
-        try:
-            self._traffic_manager.vehicle_percentage_speed_difference(
-                actor,
-                float(self.preset.lead_speed_reduction_pct),
-            )
-        except RuntimeError:
-            pass
+        self._lead_response_active = False
+        self._set_lead_speed_reduction_pct(float(self.preset.lead_speed_reduction_pct))
         self._lead_autopilot_enabled = True
+
+    def _set_lead_speed_reduction_pct(self, reduction_pct):
+        actor = self._lead_vehicle
+        if actor is None or not actor.is_alive or self._traffic_manager is None:
+            return
+        reduction_pct = max(0.0, min(100.0, float(reduction_pct)))
+        if (
+            self._lead_speed_reduction_pct is not None
+            and abs(float(self._lead_speed_reduction_pct) - reduction_pct) < 0.25
+        ):
+            return
+        try:
+            self._traffic_manager.vehicle_percentage_speed_difference(actor, reduction_pct)
+        except RuntimeError:
+            return
+        self._lead_speed_reduction_pct = float(reduction_pct)
+
+    def _update_lead_speed_response(self, ego_waypoint, ego_speed_mps):
+        base_reduction_pct = float(self.preset.lead_speed_reduction_pct)
+        if not bool(getattr(self.preset, "lead_reactive_speed_enabled", False)):
+            self._lead_response_active = False
+            self._set_lead_speed_reduction_pct(base_reduction_pct)
+            return
+
+        actor = self._lead_vehicle
+        if actor is None or not actor.is_alive or self._traffic_manager is None:
+            self._lead_response_active = False
+            return
+
+        lead_gap_m = self._last_lead_gap_m
+        lead_distance_m = self._last_lead_distance_m
+        if lead_gap_m is None or lead_distance_m is None or ego_waypoint is None:
+            self._lead_response_active = False
+            self._set_lead_speed_reduction_pct(base_reduction_pct)
+            return
+
+        trigger_distance_m = max(1.0, float(getattr(self.preset, "lead_reactive_trigger_distance_m", 24.0)))
+        trigger_gap_m = max(1.0, float(getattr(self.preset, "lead_reactive_trigger_gap_m", 28.0)))
+        release_gap_m = max(0.0, float(getattr(self.preset, "lead_reactive_release_gap_m", 6.0)))
+
+        in_start_lane = (
+            self._start_lane_id is not None
+            and self._start_road_id is not None
+            and int(ego_waypoint.road_id) == int(self._start_road_id)
+            and int(ego_waypoint.lane_id) == int(self._start_lane_id)
+        )
+        in_passing_lane = (
+            self._start_lane_id is not None
+            and self._start_road_id is not None
+            and int(ego_waypoint.road_id) == int(self._start_road_id)
+            and int(ego_waypoint.lane_id) != int(self._start_lane_id)
+        )
+
+        close_behind = (
+            in_start_lane
+            and lead_gap_m >= 0.0
+            and lead_gap_m <= trigger_gap_m
+            and lead_distance_m <= trigger_distance_m
+        )
+        passing_attempt = (
+            in_passing_lane
+            and lead_gap_m >= -release_gap_m
+            and lead_gap_m <= (trigger_gap_m + 10.0)
+            and lead_distance_m <= (trigger_distance_m + 8.0)
+        )
+        keep_active = (
+            self._lead_response_active
+            and lead_gap_m > -release_gap_m
+            and lead_distance_m <= (trigger_distance_m + 8.0)
+        )
+        response_active = bool(close_behind or passing_attempt or keep_active)
+        if not response_active:
+            self._lead_response_active = False
+            self._set_lead_speed_reduction_pct(base_reduction_pct)
+            return
+
+        speed_limit_kph = float(actor.get_speed_limit())
+        speed_limit_mps = float(speed_limit_kph) / 3.6 if speed_limit_kph > 1.0 else 0.0
+        if speed_limit_mps <= 0.0:
+            self._lead_response_active = False
+            self._set_lead_speed_reduction_pct(base_reduction_pct)
+            return
+
+        base_target_speed_mps = speed_limit_mps * max(0.0, 1.0 - (base_reduction_pct / 100.0))
+        match_ratio = max(0.0, min(1.0, float(getattr(self.preset, "lead_reactive_match_ratio", 0.85))))
+        ego_margin_mps = max(0.5, float(getattr(self.preset, "lead_reactive_ego_margin_mps", 2.5)))
+        fastest_allowed_reduction_pct = max(
+            0.0,
+            min(100.0, float(getattr(self.preset, "lead_reactive_min_reduction_pct", 22.0))),
+        )
+
+        ego_challenge_speed_mps = max(base_target_speed_mps, float(ego_speed_mps) - ego_margin_mps)
+        desired_target_speed_mps = base_target_speed_mps + (
+            max(0.0, ego_challenge_speed_mps - base_target_speed_mps) * match_ratio
+        )
+        desired_target_speed_mps = min(
+            desired_target_speed_mps,
+            ego_challenge_speed_mps,
+            speed_limit_mps * max(0.0, 1.0 - (fastest_allowed_reduction_pct / 100.0)),
+        )
+        if desired_target_speed_mps <= (base_target_speed_mps + 0.1):
+            self._lead_response_active = False
+            self._set_lead_speed_reduction_pct(base_reduction_pct)
+            return
+
+        desired_reduction_pct = 100.0 * (1.0 - (desired_target_speed_mps / speed_limit_mps))
+        self._lead_response_active = True
+        self._set_lead_speed_reduction_pct(desired_reduction_pct)
 
     def _freeze_lead_vehicle(self):
         actor = self._lead_vehicle
@@ -751,6 +958,7 @@ class ScenarioRuntime(object):
         except RuntimeError:
             pass
         self._lead_autopilot_enabled = False
+        self._lead_response_active = False
 
     def destroy(self):
         for actor in reversed(self._actors):
@@ -762,6 +970,8 @@ class ScenarioRuntime(object):
         self._actors = []
         self._lead_vehicle = None
         self._lead_autopilot_enabled = False
+        self._lead_response_active = False
+        self._lead_speed_reduction_pct = None
 
     def setup(self, world):
         self.destroy()
@@ -790,12 +1000,16 @@ class ScenarioRuntime(object):
         self._last_sim_time = 0.0
         self._should_exit = False
         self._lead_autopilot_enabled = False
+        self._lead_response_active = False
+        self._lead_speed_reduction_pct = None
 
-        start_waypoint = world.world.get_map().get_waypoint(
-            world.player.get_location(),
-            project_to_road=True,
-            lane_type=carla.LaneType.Driving,
-        )
+        start_waypoint = self._get_anchor_waypoint(world.world.get_map())
+        if start_waypoint is None:
+            start_waypoint = world.world.get_map().get_waypoint(
+                world.player.get_location(),
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
         if start_waypoint is None:
             self._status = "setup_failed"
             self._failure_reason = "no_start_waypoint"
@@ -947,12 +1161,14 @@ class ScenarioRuntime(object):
             return
 
         lead_location = self._lead_vehicle.get_location()
+        ego_speed_mps = _velocity_speed_mps(world.player.get_velocity())
         self._last_lead_distance_m = _location_distance(ego_location, lead_location)
         lead_progress_m = self._project_progress_m(lead_location)
         if self._last_progress_m is not None and lead_progress_m is not None:
             self._last_lead_gap_m = float(lead_progress_m - self._last_progress_m)
         else:
             self._last_lead_gap_m = None
+        self._update_lead_speed_response(ego_waypoint, ego_speed_mps)
 
         in_start_lane = True
         if bool(self.preset.require_return_to_start_lane) and ego_waypoint is not None:
@@ -1032,6 +1248,12 @@ class ScenarioRuntime(object):
                 if self._last_lead_gap_m is not None
                 else None
             ),
+            "scenario_lead_response_active": bool(self._lead_response_active),
+            "scenario_lead_speed_reduction_pct": (
+                float(self._lead_speed_reduction_pct)
+                if self._lead_speed_reduction_pct is not None
+                else None
+            ),
             "scenario_current_lane_id": (
                 int(self._last_current_lane_id)
                 if self._last_current_lane_id is not None
@@ -1071,9 +1293,247 @@ class ScenarioRuntime(object):
             lines.append(
                 "Overtake objective: %s" % ("done" if self._overtake_objective_met else "pending")
             )
+            if self._lead_speed_reduction_pct is not None:
+                lines.append(
+                    "Lead response: %s (TM %.1f%%)"
+                    % (
+                        "active" if self._lead_response_active else "base",
+                        float(self._lead_speed_reduction_pct),
+                    )
+                )
         if self._last_lead_distance_m is not None:
             lines.append("Lead distance: %.1fm" % self._last_lead_distance_m)
         return lines
+
+
+class AmbientTrafficManager(object):
+    def __init__(self, client, carla_world, traffic_manager=None, vehicle_count=0, pedestrian_count=0):
+        self._client = client
+        self._world = carla_world
+        self._traffic_manager = traffic_manager
+        self._target_vehicle_count = max(0, int(vehicle_count or 0))
+        self._target_pedestrian_count = max(0, int(pedestrian_count or 0))
+        self._vehicle_actor_ids = []
+        self._walker_actor_ids = []
+        self._walker_controller_ids = []
+        self._spawned_vehicle_count = 0
+        self._spawned_pedestrian_count = 0
+
+    def enabled(self):
+        return self._target_vehicle_count > 0 or self._target_pedestrian_count > 0
+
+    def summary_text(self):
+        if not self.enabled():
+            return ""
+        return "Ambient traffic: %d vehicles, %d pedestrians" % (
+            int(self._spawned_vehicle_count),
+            int(self._spawned_pedestrian_count),
+        )
+
+    def spawn(self, hero_actor=None):
+        self.destroy()
+        if not self.enabled():
+            return
+        hero_location = hero_actor.get_location() if hero_actor is not None else None
+        self._spawned_vehicle_count = self._spawn_vehicles(hero_location)
+        self._spawned_pedestrian_count = self._spawn_pedestrians(hero_location)
+
+    def destroy(self):
+        controller_ids = list(self._walker_controller_ids)
+        for controller_id in controller_ids:
+            controller = self._world.get_actor(int(controller_id))
+            if controller is None:
+                continue
+            try:
+                controller.stop()
+            except RuntimeError:
+                pass
+
+        destroy_ids = controller_ids + list(self._walker_actor_ids) + list(self._vehicle_actor_ids)
+        if self._client is not None and destroy_ids:
+            try:
+                self._client.apply_batch([carla.command.DestroyActor(actor_id) for actor_id in destroy_ids])
+            except RuntimeError:
+                pass
+
+        self._vehicle_actor_ids = []
+        self._walker_actor_ids = []
+        self._walker_controller_ids = []
+        self._spawned_vehicle_count = 0
+        self._spawned_pedestrian_count = 0
+
+    def _spawn_vehicles(self, hero_location):
+        if self._target_vehicle_count <= 0 or self._client is None or self._traffic_manager is None:
+            return 0
+
+        spawn_points = list(self._world.get_map().get_spawn_points())
+        if not spawn_points:
+            return 0
+
+        if hero_location is not None:
+            filtered_spawn_points = [
+                spawn_point
+                for spawn_point in spawn_points
+                if _location_distance(spawn_point.location, hero_location) >= 20.0
+            ]
+            if filtered_spawn_points:
+                spawn_points = filtered_spawn_points
+
+        random.shuffle(spawn_points)
+        blueprints = [
+            blueprint
+            for blueprint in self._world.get_blueprint_library().filter('vehicle.*')
+            if (
+                not blueprint.has_attribute('number_of_wheels')
+                or int(blueprint.get_attribute('number_of_wheels')) == 4
+            )
+        ]
+        if not blueprints:
+            return 0
+
+        tm_port = int(self._traffic_manager.get_port())
+        batch = []
+        for spawn_point in spawn_points[: self._target_vehicle_count]:
+            blueprint = random.choice(blueprints)
+            if blueprint.has_attribute('color'):
+                colors = list(blueprint.get_attribute('color').recommended_values)
+                if colors:
+                    blueprint.set_attribute('color', random.choice(colors))
+            if blueprint.has_attribute('driver_id'):
+                driver_ids = list(blueprint.get_attribute('driver_id').recommended_values)
+                if driver_ids:
+                    blueprint.set_attribute('driver_id', random.choice(driver_ids))
+            if blueprint.has_attribute('role_name'):
+                blueprint.set_attribute('role_name', 'ambient_traffic')
+            batch.append(
+                carla.command.SpawnActor(blueprint, spawn_point).then(
+                    carla.command.SetAutopilot(carla.command.FutureActor, True, tm_port)
+                )
+            )
+
+        spawned_ids = []
+        for response in self._client.apply_batch_sync(batch, False):
+            if response.error:
+                continue
+            spawned_ids.append(int(response.actor_id))
+        self._vehicle_actor_ids = spawned_ids
+        return len(spawned_ids)
+
+    def _sample_pedestrian_spawn_points(self, hero_location):
+        spawn_points = []
+        attempts_remaining = max(20, int(self._target_pedestrian_count) * 8)
+        while len(spawn_points) < self._target_pedestrian_count and attempts_remaining > 0:
+            attempts_remaining -= 1
+            location = self._world.get_random_location_from_navigation()
+            if location is None:
+                continue
+            if hero_location is not None and _location_distance(location, hero_location) < 12.0:
+                continue
+            if any(_location_distance(location, point.location) < 1.5 for point in spawn_points):
+                continue
+            spawn_points.append(
+                carla.Transform(
+                    carla.Location(
+                        x=float(location.x),
+                        y=float(location.y),
+                        z=float(location.z) + 0.5,
+                    )
+                )
+            )
+        return spawn_points
+
+    def _spawn_pedestrians(self, hero_location):
+        if self._target_pedestrian_count <= 0 or self._client is None:
+            return 0
+
+        walker_blueprints = list(self._world.get_blueprint_library().filter('walker.pedestrian.*'))
+        if not walker_blueprints:
+            return 0
+
+        try:
+            controller_blueprint = self._world.get_blueprint_library().find('controller.ai.walker')
+        except RuntimeError:
+            return 0
+
+        walker_spawn_points = self._sample_pedestrian_spawn_points(hero_location)
+        if not walker_spawn_points:
+            return 0
+
+        pedestrian_running_fraction = 0.05
+        pedestrian_crossing_fraction = 0.20
+        walker_speeds = []
+        walker_batch = []
+        for spawn_point in walker_spawn_points:
+            walker_blueprint = random.choice(walker_blueprints)
+            if walker_blueprint.has_attribute('is_invincible'):
+                walker_blueprint.set_attribute('is_invincible', 'false')
+            speed = 1.4
+            if walker_blueprint.has_attribute('speed'):
+                speed_values = list(walker_blueprint.get_attribute('speed').recommended_values)
+                if speed_values:
+                    walk_speed = float(speed_values[1]) if len(speed_values) > 1 else float(speed_values[0])
+                    run_speed = float(speed_values[2]) if len(speed_values) > 2 else walk_speed
+                    speed = run_speed if random.random() < pedestrian_running_fraction else walk_speed
+            walker_speeds.append(float(speed))
+            walker_batch.append(carla.command.SpawnActor(walker_blueprint, spawn_point))
+
+        spawned_walkers = []
+        for response, speed in zip(self._client.apply_batch_sync(walker_batch, False), walker_speeds):
+            if response.error:
+                continue
+            spawned_walkers.append((int(response.actor_id), float(speed)))
+        if not spawned_walkers:
+            return 0
+
+        controller_batch = []
+        for walker_actor_id, _ in spawned_walkers:
+            controller_batch.append(
+                carla.command.SpawnActor(controller_blueprint, carla.Transform(), walker_actor_id)
+            )
+
+        walker_actor_ids = []
+        walker_controller_ids = []
+        walker_controller_speeds = []
+        failed_walker_ids = []
+        for response, (walker_actor_id, speed) in zip(
+            self._client.apply_batch_sync(controller_batch, False),
+            spawned_walkers,
+        ):
+            if response.error:
+                failed_walker_ids.append(int(walker_actor_id))
+                continue
+            walker_actor_ids.append(int(walker_actor_id))
+            walker_controller_ids.append(int(response.actor_id))
+            walker_controller_speeds.append(float(speed))
+
+        if failed_walker_ids:
+            try:
+                self._client.apply_batch([carla.command.DestroyActor(actor_id) for actor_id in failed_walker_ids])
+            except RuntimeError:
+                pass
+
+        self._walker_actor_ids = walker_actor_ids
+        self._walker_controller_ids = walker_controller_ids
+
+        try:
+            self._world.set_pedestrians_cross_factor(float(pedestrian_crossing_fraction))
+        except RuntimeError:
+            pass
+
+        for controller_id, speed in zip(self._walker_controller_ids, walker_controller_speeds):
+            controller = self._world.get_actor(int(controller_id))
+            if controller is None:
+                continue
+            try:
+                controller.start()
+                destination = self._world.get_random_location_from_navigation()
+                if destination is not None:
+                    controller.go_to_location(destination)
+                controller.set_max_speed(float(speed))
+            except RuntimeError:
+                pass
+
+        return len(self._walker_actor_ids)
 
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
@@ -1110,7 +1570,16 @@ def parse_resolution(value):
 
 
 class World(object):
-    def __init__(self, carla_world, hud, actor_filter, client=None, scenario_preset=None):
+    def __init__(
+        self,
+        carla_world,
+        hud,
+        actor_filter,
+        client=None,
+        scenario_preset=None,
+        ambient_vehicle_count=0,
+        ambient_pedestrian_count=0,
+    ):
         self.world = carla_world
         self.hud = hud
         self.player = None
@@ -1125,6 +1594,13 @@ class World(object):
         self._traffic_manager = client.get_trafficmanager() if client is not None else None
         self._scenario_preset = scenario_preset
         self._scenario_runtime = ScenarioRuntime(scenario_preset, self._traffic_manager) if scenario_preset else None
+        self._ambient_traffic = AmbientTrafficManager(
+            client,
+            carla_world,
+            self._traffic_manager,
+            vehicle_count=ambient_vehicle_count,
+            pedestrian_count=ambient_pedestrian_count,
+        )
         self._scenario_exit_requested = False
         self._apply_runtime_world_settings()
         self.restart()
@@ -1191,6 +1667,12 @@ class World(object):
         self.hud.notification(actor_type)
         if self._scenario_runtime is not None:
             self._scenario_runtime.setup(self)
+        if self._ambient_traffic.enabled():
+            self._ambient_traffic.spawn(self.player)
+            summary_text = self._ambient_traffic.summary_text()
+            if summary_text:
+                self.hud.notification(summary_text, seconds=4.0)
+                print("[traffic] %s" % summary_text)
 
     def next_weather(self, reverse=False):
         self._weather_index += -1 if reverse else 1
@@ -1225,6 +1707,8 @@ class World(object):
     def destroy(self):
         if self._scenario_runtime is not None:
             self._scenario_runtime.destroy()
+        if self._ambient_traffic is not None:
+            self._ambient_traffic.destroy()
         sensors = [
             self.camera_manager.sensor if self.camera_manager is not None else None,
             self.collision_sensor.sensor if self.collision_sensor is not None else None,
@@ -1920,6 +2404,8 @@ class DualControl(object):
             'scenario_next_checkpoint_distance_m': scenario.get('scenario_next_checkpoint_distance_m', ''),
             'scenario_lead_distance_m': scenario.get('scenario_lead_distance_m', ''),
             'scenario_lead_gap_m': scenario.get('scenario_lead_gap_m', ''),
+            'scenario_lead_response_active': scenario.get('scenario_lead_response_active', ''),
+            'scenario_lead_speed_reduction_pct': scenario.get('scenario_lead_speed_reduction_pct', ''),
             'scenario_current_lane_id': scenario.get('scenario_current_lane_id', ''),
             'scenario_target_lane_id': scenario.get('scenario_target_lane_id', ''),
             'published_labels': published_labels,
@@ -2445,6 +2931,8 @@ def game_loop(args):
             args.filter,
             client=client,
             scenario_preset=getattr(args, 'scenario_preset', None),
+            ambient_vehicle_count=getattr(args, 'ambient_vehicles', 0),
+            ambient_pedestrian_count=getattr(args, 'ambient_pedestrians', 0),
         )
         controller = DualControl(
             world,
@@ -2527,6 +3015,18 @@ def main():
         default='',
         help='Optional named CARLA evaluation scenario.')
     argparser.add_argument(
+        '--ambient-vehicles',
+        metavar='N',
+        default=0,
+        type=int,
+        help='Number of ambient autopilot vehicles to spawn (default: 0)')
+    argparser.add_argument(
+        '--ambient-pedestrians',
+        metavar='N',
+        default=0,
+        type=int,
+        help='Number of ambient pedestrians to spawn (default: 0)')
+    argparser.add_argument(
         '--graphics',
         choices=['low', 'normal'],
         default='low' if DEFAULT_LOW_GRAPHICS_MODE else 'normal',
@@ -2576,6 +3076,10 @@ def main():
 
     if args.show_hud and args.hide_hud:
         argparser.error('use only one of --show-hud or --hide-hud')
+    if args.ambient_vehicles < 0:
+        argparser.error('--ambient-vehicles must be >= 0')
+    if args.ambient_pedestrians < 0:
+        argparser.error('--ambient-pedestrians must be >= 0')
 
     global CLIENT_FPS_LIMIT
     global LOW_GRAPHICS_MODE
