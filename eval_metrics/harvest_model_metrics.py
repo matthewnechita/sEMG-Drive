@@ -9,18 +9,11 @@ import torch
 
 
 CORE_METRIC_KEYS = [
-    "test_accuracy",
     "balanced_accuracy",
     "macro_precision",
     "macro_recall",
     "macro_f1",
-    "weighted_precision",
-    "weighted_recall",
-    "weighted_f1",
-    "worst_class_recall_label",
     "worst_class_recall",
-    "max_precision_recall_gap_label",
-    "max_precision_recall_gap",
 ]
 
 
@@ -80,20 +73,6 @@ def _arm_from_path(path: Path):
     return ""
 
 
-def _model_family(metadata, path: Path):
-    if isinstance(metadata, dict):
-        family = str(metadata.get("model_family") or "").strip().lower()
-        if family:
-            return family
-
-    name = path.name.lower()
-    if "tcn" in name:
-        return "metric_tcn"
-    if "cnn" in name or "v6" in name:
-        return "cnn_v2"
-    return "unknown"
-
-
 def _load_pt_bundle(path: Path):
     obj = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(obj, dict):
@@ -134,7 +113,6 @@ def summarize_bundle(path: Path):
         "filename": path.name,
         "suffix": path.suffix.lower(),
         "bundle_scope": _bundle_type_from_stream(stream),
-        "model_family": _model_family(metadata, path),
         "stream": stream,
         "arm": _arm_from_path(path),
         "subject": metadata.get("subject") or metadata.get("target_subject") or "",

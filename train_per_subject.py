@@ -1,51 +1,39 @@
-"""Single-subject EMG gesture classifier training.
-
-Supports the existing `cnn_v2` path and the metric-learning `metric_tcn`
-variant while keeping the same grouped-session evaluation workflow.
-
-Usage:
-    python train_per_subject.py
-
-To run realtime inference with the trained model:
-    python realtime_gesture_cnn.py --model models/strict/per_subject/right/Matthew_3_gesture.pt
-"""
 import copy
 import datetime as dt
 import time
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as _F
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    classification_report,
-    confusion_matrix,
-)
+from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedGroupKFold
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from libemg.utils import get_windows
-from emg.channel_layout import CANONICAL_BLOCK_ORDER, infer_channel_layout, reorder_by_layout
-from emg.model_family import (
-    ModelFamilyConfig,
+from emg.cnn_training import (
     build_architecture_metadata,
-    build_family_metadata,
+    build_model_metadata,
     build_model,
-    build_training_objectives,
+    build_training_objective,
     compute_training_step,
     prepare_train_eval_inputs,
     prepare_train_inputs,
     standardize_windows,
-    validate_model_family,
 )
-from emg.strict_layout import (
-    resolve_strict_indices_from_metadata,
-    strict_channel_count_for_arm,
-    strict_layout_bundle_metadata,
+from emg.eval_utils import (
+    compute_eval_artifacts,
+    print_eval_summary,
+    scalar_summary,
+    serialize_eval_metrics,
+)
+from emg.strict_layout import strict_channel_count_for_arm, strict_layout_bundle_metadata
+from emg.training_data import (
+    DEFAULT_MVC_MIN_RATIO,
+    load_strict_windows_from_file,
+    print_missing_calibration_warning,
+    subject_from_path,
+    validate_calibration_data,
 )
 from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_root
 
@@ -56,7 +44,7 @@ TARGET_SUBJECT = "Matthew"
 
 DATA_ROOT = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
 PATTERN = "*_filtered.npz"
-MODEL_OUT = STRICT_MODELS_ROOT / "per_subject" / ARM / f"{TARGET_SUBJECT}_tcn_4_gestures.pt"
+MODEL_OUT = STRICT_MODELS_ROOT / "per_subject" / ARM / f"{TARGET_SUBJECT}v6_4_gestures.pt"
 
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
@@ -79,414 +67,12 @@ LABEL_SMOOTHING = 0.05
 USE_AUGMENTATION = True
 AMP_RANGE = (0.7, 1.4)
 AUG_PROB = 0.4
-CHANNEL_LAYOUT_MODE = "strict"  # "strict", "salvage", or "none"
-USE_SENSOR_TYPE_CANONICALIZATION = CHANNEL_LAYOUT_MODE == "salvage"
-USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION = CHANNEL_LAYOUT_MODE == "salvage"
 
 EXCLUDED_SUBJECTS: list[str] = []  # Keep empty for Matthew-only runs unless you need to blacklist a subject.
 INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "horn"}  # Example subset: {"neutral", "left_turn", "right_turn"}.
-MODEL_FAMILY = "metric_tcn"  # "cnn_v2" or "metric_tcn"
-METRIC_TCN_CHANNELS = (64, 64, 128, 128)
-METRIC_TCN_KERNEL_SIZE = 5
-METRIC_TCN_EMBEDDING_DIM = 128
-SUPCON_WEIGHT = 0.20
-SUPCON_TEMPERATURE = 0.10
 # ========================
 
-MODEL_FAMILY = validate_model_family(MODEL_FAMILY)
-FAMILY_CFG = ModelFamilyConfig(
-    model_family=MODEL_FAMILY,
-    metric_tcn_channels=METRIC_TCN_CHANNELS,
-    metric_tcn_kernel_size=METRIC_TCN_KERNEL_SIZE,
-    metric_tcn_embedding_dim=METRIC_TCN_EMBEDDING_DIM,
-    supcon_weight=SUPCON_WEIGHT,
-    supcon_temperature=SUPCON_TEMPERATURE,
-)
-
-
-# -- Label utilities -----------------------------------------------------------
-
-def majority_label_with_confidence(segment):
-    if segment.size == 0:
-        return None, 0.0
-    flat = segment.reshape(-1)
-    if flat.dtype == object:
-        cleaned = []
-        for x in flat:
-            if x is None:
-                continue
-            if isinstance(x, bytes):
-                try:
-                    x = x.decode("utf-8")
-                except Exception:
-                    continue
-            if isinstance(x, np.str_):
-                x = str(x)
-            cleaned.append(x)
-        flat = np.array(cleaned, dtype=object)
-        if flat.size == 0:
-            return None, 0.0
-    if flat.dtype.kind in "fc":
-        flat = flat[~np.isnan(flat)]
-    if flat.size == 0:
-        return None, 0.0
-    values, counts = np.unique(flat, return_counts=True)
-    if counts.size == 0:
-        return None, 0.0
-    idx = counts.argmax()
-    total = counts.sum()
-    confidence = float(counts[idx] / total) if total > 0 else 0.0
-    return values[idx], confidence
-
-
-def _normalize_rows(cm: np.ndarray) -> np.ndarray:
-    row_sums = cm.sum(axis=1, keepdims=True).astype(float)
-    out = np.zeros_like(cm, dtype=float)
-    np.divide(cm, row_sums, out=out, where=row_sums != 0)
-    return out
-
-
-def _normalize_cols(cm: np.ndarray) -> np.ndarray:
-    col_sums = cm.sum(axis=0, keepdims=True).astype(float)
-    out = np.zeros_like(cm, dtype=float)
-    np.divide(cm, col_sums, out=out, where=col_sums != 0)
-    return out
-
-
-def _print_confusion_matrix(title: str, matrix: np.ndarray, label_names: list[str], as_percent: bool):
-    row_w = max(8, max(len(name) for name in label_names))
-    cell_w = max(8, max(len(name) for name in label_names))
-    header = " " * (row_w + 3) + " ".join(f"{name:>{cell_w}}" for name in label_names)
-    print(f"\n{title}")
-    print(header)
-    for i, name in enumerate(label_names):
-        if as_percent:
-            row = " ".join(f"{(100.0 * float(v)):>{cell_w}.1f}" for v in matrix[i])
-        else:
-            row = " ".join(f"{int(v):>{cell_w}d}" for v in matrix[i])
-        print(f"{name:>{row_w}} | {row}")
-
-
-def _compute_eval_artifacts(y_true, y_pred, index_to_label):
-    label_indices = list(range(len(index_to_label)))
-    label_names = [index_to_label[i] for i in label_indices]
-
-    report_text = classification_report(
-        y_true,
-        y_pred,
-        target_names=label_names,
-        zero_division=0,
-    )
-    report_dict_raw = classification_report(
-        y_true,
-        y_pred,
-        target_names=label_names,
-        output_dict=True,
-        zero_division=0,
-    )
-    if not isinstance(report_dict_raw, dict):
-        raise TypeError("classification_report(output_dict=True) did not return a dict.")
-    report_dict: dict[str, Any] = {str(k): v for k, v in report_dict_raw.items()}
-
-    cm_counts = confusion_matrix(y_true, y_pred, labels=label_indices)
-    cm_row_norm = _normalize_rows(cm_counts)
-    cm_col_norm = _normalize_cols(cm_counts)
-
-    per_class = []
-    for name in label_names:
-        stats_obj = report_dict.get(name, {})
-        stats = stats_obj if isinstance(stats_obj, dict) else {}
-        precision = float(stats.get("precision", 0.0))
-        recall = float(stats.get("recall", 0.0))
-        f1 = float(stats.get("f1-score", 0.0))
-        per_class.append(
-            {
-                "label": name,
-                "precision": precision,
-                "recall": recall,
-                "f1": f1,
-                "pr_gap": abs(precision - recall),
-            }
-        )
-
-    worst_recall = min(per_class, key=lambda item: item["recall"]) if per_class else None
-
-    confusion_to_neutral_rate = {}
-    neutral_prediction_fp_rate = None
-    if "neutral" in label_names:
-        neutral_idx = label_names.index("neutral")
-        for i, name in enumerate(label_names):
-            if i == neutral_idx:
-                continue
-            row_total = int(cm_counts[i].sum())
-            rate = float(cm_counts[i, neutral_idx] / row_total) if row_total > 0 else 0.0
-            confusion_to_neutral_rate[name] = rate
-
-        pred_neutral_total = int(cm_counts[:, neutral_idx].sum())
-        neutral_tp = int(cm_counts[neutral_idx, neutral_idx])
-        neutral_fp = pred_neutral_total - neutral_tp
-        neutral_prediction_fp_rate = (
-            float(neutral_fp / pred_neutral_total) if pred_neutral_total > 0 else 0.0
-        )
-
-    macro_avg_obj = report_dict.get("macro avg", {})
-    macro_avg = macro_avg_obj if isinstance(macro_avg_obj, dict) else {}
-    weighted_avg_obj = report_dict.get("weighted avg", {})
-    weighted_avg = weighted_avg_obj if isinstance(weighted_avg_obj, dict) else {}
-
-    return {
-        "classification_report_text": report_text,
-        "classification_report_dict": report_dict,
-        "confusion_matrix_counts": cm_counts,
-        "confusion_matrix_row_norm": cm_row_norm,
-        "confusion_matrix_col_norm": cm_col_norm,
-        "per_class": per_class,
-        "test_accuracy": float(accuracy_score(y_true, y_pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "macro_precision": float(macro_avg.get("precision", 0.0)),
-        "macro_recall": float(macro_avg.get("recall", 0.0)),
-        "macro_f1": float(macro_avg.get("f1-score", 0.0)),
-        "weighted_precision": float(weighted_avg.get("precision", 0.0)),
-        "weighted_recall": float(weighted_avg.get("recall", 0.0)),
-        "weighted_f1": float(weighted_avg.get("f1-score", 0.0)),
-        "worst_class_recall_label": worst_recall["label"] if worst_recall else None,
-        "worst_class_recall": worst_recall["recall"] if worst_recall else None,
-        "max_pr_gap_label": max(per_class, key=lambda item: item["pr_gap"])["label"] if per_class else None,
-        "max_pr_gap": max((item["pr_gap"] for item in per_class), default=None),
-        "confusion_to_neutral_rate": confusion_to_neutral_rate,
-        "neutral_prediction_fp_rate": neutral_prediction_fp_rate,
-    }
-
-
-def _scalar_summary(values):
-    arr = np.asarray(values, dtype=float)
-    if arr.size == 0:
-        return None
-    return {
-        "mean": float(arr.mean()),
-        "std": float(arr.std()),
-        "min": float(arr.min()),
-        "max": float(arr.max()),
-    }
-
-
-def _serialize_eval_metrics(eval_artifacts):
-    return {
-        "test_accuracy": float(eval_artifacts["test_accuracy"]),
-        "balanced_accuracy": float(eval_artifacts["balanced_accuracy"]),
-        "macro_precision": float(eval_artifacts["macro_precision"]),
-        "macro_recall": float(eval_artifacts["macro_recall"]),
-        "macro_f1": float(eval_artifacts["macro_f1"]),
-        "weighted_precision": float(eval_artifacts["weighted_precision"]),
-        "weighted_recall": float(eval_artifacts["weighted_recall"]),
-        "weighted_f1": float(eval_artifacts["weighted_f1"]),
-        "worst_class_recall_label": eval_artifacts["worst_class_recall_label"],
-        "worst_class_recall": eval_artifacts["worst_class_recall"],
-        "max_precision_recall_gap_label": eval_artifacts["max_pr_gap_label"],
-        "max_precision_recall_gap": eval_artifacts["max_pr_gap"],
-        "confusion_to_neutral_rate": eval_artifacts["confusion_to_neutral_rate"],
-        "neutral_prediction_fp_rate": eval_artifacts["neutral_prediction_fp_rate"],
-        "confusion_matrix_counts": eval_artifacts["confusion_matrix_counts"].tolist(),
-        "confusion_matrix_row_norm": eval_artifacts["confusion_matrix_row_norm"].tolist(),
-        "confusion_matrix_col_norm": eval_artifacts["confusion_matrix_col_norm"].tolist(),
-    }
-
-
-def _print_eval_summary(title, accuracy_label, eval_artifacts, labels, index_to_label):
-    accuracy = float(eval_artifacts["test_accuracy"])
-    print(f"\n{title}: {accuracy_label} {accuracy:.3f}")
-    print("\nReport:\n", eval_artifacts["classification_report_text"])
-    _print_confusion_matrix(
-        "Confusion matrix (counts, rows=true, cols=pred):",
-        eval_artifacts["confusion_matrix_counts"],
-        [index_to_label[i] for i in range(len(labels))],
-        as_percent=False,
-    )
-    _print_confusion_matrix(
-        "Confusion matrix (row-normalized %, rows=true, cols=pred):",
-        eval_artifacts["confusion_matrix_row_norm"],
-        [index_to_label[i] for i in range(len(labels))],
-        as_percent=True,
-    )
-    _print_confusion_matrix(
-        "Confusion matrix (col-normalized %, rows=true, cols=pred):",
-        eval_artifacts["confusion_matrix_col_norm"],
-        [index_to_label[i] for i in range(len(labels))],
-        as_percent=True,
-    )
-
-    print("\nCore metrics:")
-    print(f"  balanced_accuracy: {eval_artifacts['balanced_accuracy']:.3f}")
-    print(
-        f"  macro P/R/F1: "
-        f"{eval_artifacts['macro_precision']:.3f} / "
-        f"{eval_artifacts['macro_recall']:.3f} / "
-        f"{eval_artifacts['macro_f1']:.3f}"
-    )
-    print(
-        f"  weighted P/R/F1: "
-        f"{eval_artifacts['weighted_precision']:.3f} / "
-        f"{eval_artifacts['weighted_recall']:.3f} / "
-        f"{eval_artifacts['weighted_f1']:.3f}"
-    )
-    if eval_artifacts["worst_class_recall_label"] is not None:
-        print(
-            f"  worst_class_recall: "
-            f"{eval_artifacts['worst_class_recall_label']} = "
-            f"{eval_artifacts['worst_class_recall']:.3f}"
-        )
-    if eval_artifacts["max_pr_gap_label"] is not None:
-        print(
-            f"  max_precision_recall_gap: "
-            f"{eval_artifacts['max_pr_gap_label']} = "
-            f"{eval_artifacts['max_pr_gap']:.3f}"
-        )
-    if eval_artifacts["confusion_to_neutral_rate"]:
-        print("  confusion_to_neutral_rate:")
-        for label, rate in sorted(eval_artifacts["confusion_to_neutral_rate"].items()):
-            print(f"    {label} -> neutral: {rate:.3f}")
-    if eval_artifacts["neutral_prediction_fp_rate"] is not None:
-        print(
-            f"  neutral_prediction_fp_rate: "
-            f"{eval_artifacts['neutral_prediction_fp_rate']:.3f}"
-        )
-
-
-# -- Calibration ---------------------------------------------------------------
-
-MVC_QUALITY_MIN_RATIO = 1.5
-
-
-def compute_calibration(neutral_emg, mvc_emg, percentile):
-    neutral = np.asarray(neutral_emg, dtype=float)
-    mvc = np.asarray(mvc_emg, dtype=float)
-    if neutral.size == 0 or mvc.size == 0:
-        return None, None
-
-    neutral_rms = np.sqrt(np.mean(neutral ** 2, axis=0))
-    mvc_rms = np.sqrt(np.mean(mvc ** 2, axis=0))
-    ratio = np.where(neutral_rms < 1e-9, 1.0, mvc_rms / neutral_rms)
-    median_ratio = float(np.median(ratio))
-
-    if median_ratio < MVC_QUALITY_MIN_RATIO:
-        print(
-            f"  [calib] SKIP: median MVC/neutral ratio={median_ratio:.2f}x "
-            f"(< {MVC_QUALITY_MIN_RATIO}x threshold). "
-            "MVC calibration failed - normalization not applied for this session."
-        )
-        return None, None
-
-    neutral_mean = np.mean(neutral, axis=0)
-    mvc_scale = np.percentile(mvc, percentile, axis=0)
-    mvc_scale = np.where(mvc_scale < 1e-6, 1.0, mvc_scale)
-    return neutral_mean, mvc_scale
-
-
-def validate_calibration_data(files):
-    missing = []
-    for fp in files:
-        try:
-            data = np.load(fp, allow_pickle=True)
-            if data.get("calib_neutral_emg") is None or data.get("calib_mvc_emg") is None:
-                missing.append(fp)
-        except Exception:
-            missing.append(fp)
-    if missing:
-        print(
-            f"WARNING: {len(missing)} file(s) lack calibration data "
-            "(calib_neutral_emg / calib_mvc_emg). "
-            "Calibration normalisation will be skipped for these sessions."
-        )
-        for fp in missing[:5]:
-            print(f"  {fp}")
-        if len(missing) > 5:
-            print(f"  ... and {len(missing) - 5} more.")
-
-
-# -- Data loading --------------------------------------------------------------
-
-def subject_from_path(path: Path) -> str:
-    return path.parent.parent.name
-
-
-def _keep_gesture_label(label) -> bool:
-    if label is None:
-        return False
-    label = str(label)
-    if INCLUDED_GESTURES is not None and label not in INCLUDED_GESTURES:
-        return False
-    return True
-
-
-def load_windows_from_file(path):
-    data = np.load(path, allow_pickle=True)
-    if "emg" not in data.files or "y" not in data.files:
-        return None
-    emg = np.asarray(data["emg"], dtype=float)
-    timestamps = np.asarray(data["timestamps"], dtype=float) if "timestamps" in data.files else None
-    metadata = data.get("metadata")
-    layout = None
-    strict_layout = None
-    if CHANNEL_LAYOUT_MODE == "strict":
-        strict_layout = resolve_strict_indices_from_metadata(metadata, arm=ARM)
-        if emg.shape[1] != strict_layout.ordered_indices.size:
-            raise ValueError(
-                f"{path.name}: strict layout resolved {strict_layout.ordered_indices.size} channels "
-                f"for {ARM}, but file has {emg.shape[1]}."
-            )
-        emg = emg[:, strict_layout.ordered_indices]
-    elif USE_SENSOR_TYPE_CANONICALIZATION:
-        layout = infer_channel_layout(
-            metadata=metadata,
-            channel_count=emg.shape[1],
-            timestamps=timestamps,
-        )
-        emg = reorder_by_layout(emg, layout)
-
-    if USE_CALIBRATION:
-        calib_neutral = data.get("calib_neutral_emg")
-        calib_mvc = data.get("calib_mvc_emg")
-        if calib_neutral is not None and calib_mvc is not None:
-            calib_neutral = np.asarray(calib_neutral, dtype=float)
-            calib_mvc = np.asarray(calib_mvc, dtype=float)
-            if strict_layout is not None:
-                calib_neutral = calib_neutral[:, strict_layout.ordered_indices]
-                calib_mvc = calib_mvc[:, strict_layout.ordered_indices]
-            elif layout is not None:
-                calib_neutral = reorder_by_layout(calib_neutral, layout)
-                calib_mvc = reorder_by_layout(calib_mvc, layout)
-            neutral_mean, mvc_scale = compute_calibration(
-                calib_neutral, calib_mvc, MVC_PERCENTILE
-            )
-            if neutral_mean is not None and mvc_scale is not None:
-                emg = (emg - neutral_mean) / mvc_scale
-
-    windows = get_windows(emg, WINDOW_SIZE, WINDOW_STEP)
-    labels = np.asarray(data["y"], dtype=object)
-
-    n_windows = windows.shape[0]
-    starts = np.arange(n_windows) * WINDOW_STEP
-    ends = starts + WINDOW_SIZE
-
-    window_labels = []
-    for s, e in zip(starts, ends):
-        lbl, confidence = majority_label_with_confidence(labels[s:e])
-        if lbl == "neutral_buffer":
-            lbl = None
-        if USE_MIN_LABEL_CONFIDENCE and lbl is not None and confidence < MIN_LABEL_CONFIDENCE:
-            lbl = None
-        if lbl is not None and not _keep_gesture_label(lbl):
-            lbl = None
-        window_labels.append(lbl)
-
-    window_labels = np.asarray(window_labels, dtype=object)
-    keep = window_labels != None  # noqa: E711
-    windows = windows[keep]
-    window_labels = window_labels[keep]
-
-    if windows.size == 0:
-        return None
-    return windows.astype(np.float32), window_labels, layout, strict_layout
+MVC_QUALITY_MIN_RATIO = DEFAULT_MVC_MIN_RATIO
 
 
 def load_dataset(target_subject: str):
@@ -509,63 +95,51 @@ def load_dataset(target_subject: str):
         print(f"Including gestures only: {sorted(INCLUDED_GESTURES)}")
 
     if USE_CALIBRATION:
-        validate_calibration_data(files)
+        print_missing_calibration_warning(validate_calibration_data(files))
 
     X_list, y_list, groups_list, subjects_list, channel_counts = [], [], [], [], []
-    permutation_groups = None
     layout_sources: dict[str, int] = {}
-    layout_kind_counts = None
     strict_pair_order = None
     strict_slot_order = None
     strict_channel_counts = None
     for fp in files:
-        result = load_windows_from_file(fp)
-        if result is None:
+        windowed = load_strict_windows_from_file(
+            fp,
+            arm=ARM,
+            window_size=WINDOW_SIZE,
+            window_step=WINDOW_STEP,
+            use_calibration=USE_CALIBRATION,
+            mvc_percentile=MVC_PERCENTILE,
+            mvc_min_ratio=MVC_QUALITY_MIN_RATIO,
+            use_min_label_confidence=USE_MIN_LABEL_CONFIDENCE,
+            min_label_confidence=MIN_LABEL_CONFIDENCE,
+            included_gestures=INCLUDED_GESTURES,
+            verbose_calibration_skip=True,
+        )
+        if windowed is None:
             continue
-        windows, labels, layout, strict_layout = result
+        windows = windowed.windows
+        labels = windowed.labels
+        strict_layout = windowed.strict_layout
         X_list.append(windows)
         y_list.append(labels)
         groups_list.append(np.array([str(fp)] * len(labels), dtype=object))
         subjects_list.append(np.array([subject_from_path(fp)] * len(labels), dtype=object))
         channel_counts.append(int(windows.shape[1]))
-        if CHANNEL_LAYOUT_MODE == "strict":
-            if strict_layout is None:
-                raise ValueError(f"{fp.name}: strict layout resolution failed unexpectedly.")
-            layout_sources["emg_channel_labels"] = layout_sources.get("emg_channel_labels", 0) + 1
-            if strict_pair_order is None:
-                strict_pair_order = tuple(strict_layout.pair_numbers)
-                strict_slot_order = tuple(strict_layout.slot_names)
-                strict_channel_counts = tuple(strict_layout.channel_counts)
-            elif (
-                tuple(strict_layout.pair_numbers) != strict_pair_order
-                or tuple(strict_layout.slot_names) != strict_slot_order
-                or tuple(strict_layout.channel_counts) != strict_channel_counts
-            ):
-                raise ValueError(
-                    f"Inconsistent strict slot mapping while loading {fp.name}: "
-                    f"pairs={tuple(strict_layout.pair_numbers)}"
-                )
-        elif layout is not None:
-            layout_sources[layout.source] = layout_sources.get(layout.source, 0) + 1
-            layout_groups = [list(group) for group in layout.permutation_groups]
-            if permutation_groups is None and layout_groups:
-                permutation_groups = layout_groups
-            elif permutation_groups is not None and layout_groups and layout_groups != permutation_groups:
-                raise ValueError(
-                    f"Inconsistent permutation groups while loading {fp.name}: "
-                    f"{layout_groups} vs {permutation_groups}"
-                )
-            if layout_kind_counts is None and layout.kind_counts:
-                layout_kind_counts = dict(layout.kind_counts)
-            elif (
-                layout_kind_counts is not None
-                and layout.kind_counts
-                and layout.kind_counts != layout_kind_counts
-            ):
-                raise ValueError(
-                    f"Inconsistent canonical channel kind counts while loading {fp.name}: "
-                    f"{layout.kind_counts} vs {layout_kind_counts}"
-                )
+        layout_sources["emg_channel_labels"] = layout_sources.get("emg_channel_labels", 0) + 1
+        if strict_pair_order is None:
+            strict_pair_order = tuple(strict_layout.pair_numbers)
+            strict_slot_order = tuple(strict_layout.slot_names)
+            strict_channel_counts = tuple(strict_layout.channel_counts)
+        elif (
+            tuple(strict_layout.pair_numbers) != strict_pair_order
+            or tuple(strict_layout.slot_names) != strict_slot_order
+            or tuple(strict_layout.channel_counts) != strict_channel_counts
+        ):
+            raise ValueError(
+                f"Inconsistent strict slot mapping while loading {fp.name}: "
+                f"pairs={tuple(strict_layout.pair_numbers)}"
+            )
 
     if not X_list:
         raise ValueError(f"No labeled windows found for TARGET_SUBJECT={target_subject!r}.")
@@ -580,54 +154,26 @@ def load_dataset(target_subject: str):
         np.concatenate(groups_list),
         np.concatenate(subjects_list),
         unique_counts[0],
-        permutation_groups or [],
         layout_sources,
-        layout_kind_counts or {},
     )
 
 
 # -- Normalisation -------------------------------------------------------------
 
 def _prepare_test_data(X, _mean, _std):
-    return standardize_windows(X, _mean, _std, model_family=MODEL_FAMILY)
+    return standardize_windows(X, _mean, _std)
 
 
 # -- Augmentation --------------------------------------------------------------
 
-def _apply_permutation_groups_gpu(
-    xb: torch.Tensor,
-    permutation_groups: list[list[int]] | None,
-    p: float,
-) -> torch.Tensor:
-    if not permutation_groups or p <= 0.0:
-        return xb
-    bsz = xb.shape[0]
-    dev = xb.device
-    for group in permutation_groups:
-        if len(group) <= 1:
-            continue
-        mask = torch.rand(bsz, device=dev) < p
-        batch_idx = torch.nonzero(mask, as_tuple=False).flatten()
-        if batch_idx.numel() == 0:
-            continue
-        group_idx = torch.as_tensor(group, device=dev, dtype=torch.long)
-        original = xb[batch_idx][:, group_idx, :].clone()
-        for row in range(batch_idx.numel()):
-            perm = torch.randperm(group_idx.numel(), device=dev)
-            xb[batch_idx[row], group_idx, :] = original[row, perm, :]
-    return xb
-
-
 def augment_emg_gpu(
     xb: torch.Tensor,
     p: float,
-    permutation_groups: list[list[int]] | None = None,
 ) -> torch.Tensor:
     """In-place-safe GPU augmentation. xb: (B, C, T) float32 on device."""
     bsz, channels, t_len = xb.shape
     dev = xb.device
     xb = xb.clone()
-    xb = _apply_permutation_groups_gpu(xb, permutation_groups, p)
 
     mask = torch.rand(bsz, device=dev) < p
     if mask.any():
@@ -676,23 +222,18 @@ def augment_emg_gpu(
 
 def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
     return build_model(
-        MODEL_FAMILY,
         in_channels=in_channels,
         num_classes=num_classes,
         dropout=DROPOUT,
         device=device,
-        family_cfg=FAMILY_CFG,
     )
 
 
 def train_eval_split(
     X_train, y_train, X_eval, y_eval,
     channel_count, num_classes, epochs, device,
-    permutation_groups=None,
 ):
-    X_train_t, X_eval_t, mean, std = prepare_train_eval_inputs(
-        MODEL_FAMILY, X_train, X_eval
-    )
+    X_train_t, X_eval_t, mean, std = prepare_train_eval_inputs(X_train, X_eval)
 
     train_ds = TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train))
     eval_ds = TensorDataset(torch.from_numpy(X_eval_t), torch.from_numpy(y_eval))
@@ -707,11 +248,7 @@ def train_eval_split(
 
     model = _build_model(int(channel_count), num_classes, device)
 
-    objectives = build_training_objectives(
-        MODEL_FAMILY,
-        label_smoothing=LABEL_SMOOTHING,
-        family_cfg=FAMILY_CFG,
-    )
+    objective = build_training_objective(label_smoothing=LABEL_SMOOTHING)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5, threshold=1e-4, min_lr=1e-6
@@ -733,24 +270,14 @@ def train_eval_split(
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             if USE_AUGMENTATION:
-                xb = augment_emg_gpu(
-                    xb,
-                    p=AUG_PROB,
-                    permutation_groups=(
-                        permutation_groups
-                        if USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION
-                        else None
-                    ),
-                )
+                xb = augment_emg_gpu(xb, p=AUG_PROB)
 
             optimizer.zero_grad()
             logits, loss = compute_training_step(
-                MODEL_FAMILY,
                 model,
                 xb,
                 yb,
-                objectives=objectives,
-                family_cfg=FAMILY_CFG,
+                objective=objective,
             )
             loss.backward()
             optimizer.step()
@@ -769,12 +296,10 @@ def train_eval_split(
                 xb = xb.to(device)
                 yb = yb.to(device)
                 logits, loss = compute_training_step(
-                    MODEL_FAMILY,
                     model,
                     xb,
                     yb,
-                    objectives=objectives,
-                    family_cfg=FAMILY_CFG,
+                    objective=objective,
                 )
                 eval_loss += loss.item() * xb.size(0)
                 preds = torch.argmax(logits, dim=1)
@@ -820,20 +345,15 @@ def train_full_dataset(
     num_classes,
     epochs,
     device,
-    permutation_groups=None,
 ):
-    X_train_t, mean, std = prepare_train_inputs(MODEL_FAMILY, X_train)
+    X_train_t, mean, std = prepare_train_inputs(X_train)
     train_ds = TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train))
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, pin_memory=True
     )
 
     model = _build_model(int(channel_count), num_classes, device)
-    objectives = build_training_objectives(
-        MODEL_FAMILY,
-        label_smoothing=LABEL_SMOOTHING,
-        family_cfg=FAMILY_CFG,
-    )
+    objective = build_training_objective(label_smoothing=LABEL_SMOOTHING)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5, threshold=1e-4, min_lr=1e-6
@@ -855,24 +375,14 @@ def train_full_dataset(
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             if USE_AUGMENTATION:
-                xb = augment_emg_gpu(
-                    xb,
-                    p=AUG_PROB,
-                    permutation_groups=(
-                        permutation_groups
-                        if USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION
-                        else None
-                    ),
-                )
+                xb = augment_emg_gpu(xb, p=AUG_PROB)
 
             optimizer.zero_grad()
             logits, loss = compute_training_step(
-                MODEL_FAMILY,
                 model,
                 xb,
                 yb,
-                objectives=objectives,
-                family_cfg=FAMILY_CFG,
+                objective=objective,
             )
             loss.backward()
             optimizer.step()
@@ -934,7 +444,6 @@ def _run_grouped_cross_validation(
     device,
     labels,
     index_to_label,
-    permutation_groups,
 ):
     unique_groups = np.unique(groups)
     if unique_groups.size < 2:
@@ -976,7 +485,7 @@ def _run_grouped_cross_validation(
         print(f"\nCV fold {fold_idx}/{n_splits}")
         print(f"Train ({len(train_files)} files): {[Path(f).name for f in train_files]}")
         print(f"Test  ({len(test_files)} files):  {[Path(f).name for f in test_files]}")
-        print(f"Training {MODEL_FAMILY} for {EPOCHS} epochs on {len(train_idx)} windows.")
+        print(f"Training GestureCNNv2 for {EPOCHS} epochs on {len(train_idx)} windows.")
 
         model, mean, std, _, best_epoch = train_eval_split(
             X[train_idx],
@@ -987,13 +496,12 @@ def _run_grouped_cross_validation(
             num_classes,
             EPOCHS,
             device,
-            permutation_groups=permutation_groups,
         )
 
         y_pred = _predict_labels(model, X[test_idx], device, mean, std)
         oof_pred[test_idx] = y_pred
-        fold_eval = _compute_eval_artifacts(y_idx[test_idx], y_pred, index_to_label)
-        fold_metrics = _serialize_eval_metrics(fold_eval)
+        fold_eval = compute_eval_artifacts(y_idx[test_idx], y_pred, index_to_label)
+        fold_metrics = serialize_eval_metrics(fold_eval)
         fold_results.append(
             {
                 "fold_index": int(fold_idx),
@@ -1015,7 +523,7 @@ def _run_grouped_cross_validation(
         missing = int(np.sum(oof_pred < 0))
         raise RuntimeError(f"Cross-validation left {missing} window(s) without predictions.")
 
-    eval_artifacts = _compute_eval_artifacts(y_idx, oof_pred, index_to_label)
+    eval_artifacts = compute_eval_artifacts(y_idx, oof_pred, index_to_label)
     accuracy_values = [fold["metrics"]["test_accuracy"] for fold in fold_results]
     balanced_values = [fold["metrics"]["balanced_accuracy"] for fold in fold_results]
     macro_f1_values = [fold["metrics"]["macro_f1"] for fold in fold_results]
@@ -1029,7 +537,7 @@ def _run_grouped_cross_validation(
         ("macro_f1", macro_f1_values),
         ("best_epoch", best_epoch_values),
     ):
-        summary = _scalar_summary(values)
+        summary = scalar_summary(values)
         if summary is None:
             continue
         print(
@@ -1037,12 +545,11 @@ def _run_grouped_cross_validation(
             f"min {summary['min']:.3f} | max {summary['max']:.3f}"
         )
 
-    _print_eval_summary(
+    print_eval_summary(
         "Cross-validated out-of-fold metrics",
         "cross-validated accuracy",
         eval_artifacts,
-        labels,
-        index_to_label,
+        [index_to_label[i] for i in range(len(labels))],
     )
 
     return {
@@ -1052,10 +559,10 @@ def _run_grouped_cross_validation(
         "eval_artifacts": eval_artifacts,
         "folds": fold_results,
         "fold_metric_summary": {
-            "test_accuracy": _scalar_summary(accuracy_values),
-            "balanced_accuracy": _scalar_summary(balanced_values),
-            "macro_f1": _scalar_summary(macro_f1_values),
-            "best_epoch": _scalar_summary(best_epoch_values),
+            "test_accuracy": scalar_summary(accuracy_values),
+            "balanced_accuracy": scalar_summary(balanced_values),
+            "macro_f1": scalar_summary(macro_f1_values),
+            "best_epoch": scalar_summary(best_epoch_values),
         },
         "selected_final_fit_epochs": int(selected_final_fit_epochs),
     }
@@ -1066,7 +573,7 @@ def _run_grouped_cross_validation(
 def _train_and_save(
     X, y_idx, groups, subjects, channel_count, num_classes, device,
     labels, label_to_index, index_to_label, model_out, subject_tag,
-    permutation_groups, layout_sources, layout_kind_counts,
+    layout_sources,
 ):
     unique_groups = np.unique(groups)
     print(f"{X.shape[0]} windows across {len(unique_groups)} session file(s).")
@@ -1079,7 +586,6 @@ def _train_and_save(
         device,
         labels,
         index_to_label,
-        permutation_groups,
     )
     selected_final_fit_epochs = cv_results["selected_final_fit_epochs"]
     print(f"\n{'=' * 55}")
@@ -1094,11 +600,10 @@ def _train_and_save(
         num_classes,
         selected_final_fit_epochs,
         device,
-        permutation_groups=permutation_groups,
     )
 
     eval_artifacts = cv_results["eval_artifacts"]
-    metrics_payload = _serialize_eval_metrics(eval_artifacts)
+    metrics_payload = serialize_eval_metrics(eval_artifacts)
     train_files = [Path(str(f)).name for f in sorted(unique_groups)]
     test_files = []
 
@@ -1109,10 +614,8 @@ def _train_and_save(
         "index_to_label": index_to_label,
         "architecture": {
             **build_architecture_metadata(
-                MODEL_FAMILY,
                 int(channel_count),
                 dropout=DROPOUT,
-                family_cfg=FAMILY_CFG,
             ),
         },
         "metadata": {
@@ -1130,34 +633,15 @@ def _train_and_save(
             "test_size": None,
             "calibration_used": bool(USE_CALIBRATION),
             "calibration_mvc_percentile": float(MVC_PERCENTILE),
-            **build_family_metadata(MODEL_FAMILY, family_cfg=FAMILY_CFG),
+            **build_model_metadata(),
             "label_confidence_filter": {
                 "enabled": bool(USE_MIN_LABEL_CONFIDENCE),
                 "min_label_confidence": float(MIN_LABEL_CONFIDENCE),
             },
-            "channel_layout": (
-                {
-                    **strict_layout_bundle_metadata(ARM),
-                    "type_canonicalization_enabled": False,
-                    "canonical_block_order": [],
-                    "permutation_groups": [],
-                    "permutation_augmentation_enabled": False,
-                    "layout_inference_sources": dict(layout_sources),
-                    "kind_counts": {},
-                }
-                if CHANNEL_LAYOUT_MODE == "strict"
-                else {
-                    "layout_mode": CHANNEL_LAYOUT_MODE,
-                    "type_canonicalization_enabled": bool(USE_SENSOR_TYPE_CANONICALIZATION),
-                    "canonical_block_order": list(CANONICAL_BLOCK_ORDER),
-                    "permutation_groups": [list(group) for group in permutation_groups],
-                    "permutation_augmentation_enabled": bool(
-                        USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION
-                    ),
-                    "layout_inference_sources": dict(layout_sources),
-                    "kind_counts": dict(layout_kind_counts),
-                }
-            ),
+            "channel_layout": {
+                **strict_layout_bundle_metadata(ARM),
+                "layout_inference_sources": dict(layout_sources),
+            },
             "training": {
                 "cv_max_epochs_per_fold": int(EPOCHS),
                 "final_fit_epochs": int(selected_final_fit_epochs),
@@ -1166,9 +650,6 @@ def _train_and_save(
                 "lr": float(LR),
                 "amp_range": list(AMP_RANGE),
                 "use_augmentation": bool(USE_AUGMENTATION),
-                "use_single_block_permutation_augmentation": bool(
-                    USE_SINGLE_BLOCK_PERMUTATION_AUGMENTATION
-                ),
                 "use_balanced_sampling": False,
                 "label_smoothing": float(LABEL_SMOOTHING),
                 "use_mixup": False,
@@ -1206,11 +687,6 @@ def _train_and_save(
 def main():
     if ARM not in ("right", "left"):
         raise ValueError(f"ARM must be 'right' or 'left', got {ARM!r}")
-    if CHANNEL_LAYOUT_MODE not in ("strict", "salvage", "none"):
-        raise ValueError(
-            f"CHANNEL_LAYOUT_MODE must be 'strict', 'salvage', or 'none', got {CHANNEL_LAYOUT_MODE!r}"
-        )
-    validate_model_family(MODEL_FAMILY)
 
     confirm = input(
         f"Training {ARM} arm single-subject model for '{TARGET_SUBJECT}' - continue? [y/N] "
@@ -1222,36 +698,22 @@ def main():
     np.random.seed(RANDOM_STATE)
     torch.manual_seed(RANDOM_STATE)
 
-    X, y, groups, subjects, channel_count, permutation_groups, layout_sources, layout_kind_counts = load_dataset(
-        target_subject=TARGET_SUBJECT
-    )
+    X, y, groups, subjects, channel_count, layout_sources = load_dataset(target_subject=TARGET_SUBJECT)
     unique_subjects = sorted(np.unique(subjects))
     print(
         f"Loaded {X.shape[0]} windows, {channel_count} channels, "
         f"{len(np.unique(y))} classes, {len(unique_subjects)} subject(s): "
         f"{unique_subjects}"
     )
-    print(f"Model family: {MODEL_FAMILY}")
-    if CHANNEL_LAYOUT_MODE == "strict":
-        expected_channels = strict_channel_count_for_arm(ARM)
-        if channel_count != expected_channels:
-            raise ValueError(
-                f"Strict layout for {ARM} expects {expected_channels} channels, got {channel_count}."
-            )
-        print(
-            f"Channel layout mode: STRICT ({ARM}) | pairs={strict_layout_bundle_metadata(ARM)['pair_order']}"
+    expected_channels = strict_channel_count_for_arm(ARM)
+    if channel_count != expected_channels:
+        raise ValueError(
+            f"Strict layout for {ARM} expects {expected_channels} channels, got {channel_count}."
         )
-    elif USE_SENSOR_TYPE_CANONICALIZATION:
-        source_parts = ", ".join(
-            f"{key}={value}" for key, value in sorted(layout_sources.items())
-        ) or "none"
-        print(f"Channel layout canonicalization: ON ({source_parts})")
-        if layout_kind_counts:
-            print(f"Canonical channel kind counts: {layout_kind_counts}")
-        if permutation_groups:
-            print(f"Exchangeable channel groups: {permutation_groups}")
-    else:
-        print("Channel layout mode: NONE")
+    print("Model architecture: GestureCNNv2")
+    print(
+        f"Channel layout mode: STRICT ({ARM}) | pairs={strict_layout_bundle_metadata(ARM)['pair_order']}"
+    )
 
     labels = sorted({str(lbl) for lbl in np.unique(y)})
     label_to_index = {label: idx for idx, label in enumerate(labels)}
@@ -1266,7 +728,7 @@ def main():
     _train_and_save(
         X, y_idx, groups, subjects, channel_count, num_classes, device,
         labels, label_to_index, index_to_label, MODEL_OUT, TARGET_SUBJECT,
-        permutation_groups, layout_sources, layout_kind_counts,
+        layout_sources,
     )
 
     print(f"\n{'=' * 55}")

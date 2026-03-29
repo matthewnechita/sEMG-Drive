@@ -42,10 +42,9 @@ def _summary_lane_error(rows):
     vals = [_to_float(row.get("lane_error_m")) for row in rows]
     vals = [v for v in vals if v is not None]
     if not vals:
-        return {"mean_m": None, "rmse_m": None}
+        return {"rmse_m": None}
     arr = np.asarray(vals, dtype=float)
     return {
-        "mean_m": float(arr.mean()),
         "rmse_m": float(np.sqrt(np.mean(np.square(arr)))),
     }
 
@@ -55,6 +54,10 @@ def _completion_time_s(rows):
     sim_vals = [v for v in sim_vals if v is not None]
     if sim_vals:
         return float(max(sim_vals) - min(sim_vals))
+    control_vals = [_to_float(row.get("control_apply_ts")) for row in rows]
+    control_vals = [v for v in control_vals if v is not None]
+    if control_vals:
+        return float(max(control_vals) - min(control_vals))
     wall_vals = [_to_float(row.get("wall_time_s")) for row in rows]
     wall_vals = [v for v in wall_vals if v is not None]
     if wall_vals:
@@ -83,15 +86,6 @@ def _scenario_success(rows):
     return None
 
 
-def _steering_smoothness(rows):
-    steer = [_to_float(row.get("steer")) for row in rows]
-    steer = [v for v in steer if v is not None]
-    if len(steer) < 2:
-        return None
-    diffs = np.diff(np.asarray(steer, dtype=float))
-    return float(np.mean(np.abs(diffs)))
-
-
 def _event_count(rows, *candidate_columns):
     for column in candidate_columns:
         if any(column in row for row in rows):
@@ -115,19 +109,21 @@ def summarize_rows(rows):
     lane = _summary_lane_error(rows)
     scenario_name = _last_nonempty(rows, "scenario_name")
     scenario_completion_s = _scenario_completion_time_s(rows) if scenario_name else None
-    return {
+    summary = {
         "rows": len(rows),
         "scenario_name": scenario_name,
         "scenario_kind": _last_nonempty(rows, "scenario_kind"),
         "scenario_status": _last_nonempty(rows, "scenario_status"),
         "scenario_success": _scenario_success(rows),
-        "lane_error_mean_m": lane["mean_m"],
         "lane_error_rmse_m": lane["rmse_m"],
         "lane_invasions": _event_count(rows, "lane_invasion_event", "lane_invasion"),
         "completion_time_s": scenario_completion_s if scenario_completion_s is not None else _completion_time_s(rows),
-        "steering_smoothness": _steering_smoothness(rows),
-        "command_success_rate": _command_success_rate(rows),
     }
+    if str(scenario_name or "").strip().lower() == "highway_overtake":
+        command_success_rate = _command_success_rate(rows)
+        if command_success_rate is not None:
+            summary["command_success_rate"] = command_success_rate
+    return summary
 
 
 def build_parser():

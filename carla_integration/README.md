@@ -1,105 +1,108 @@
 # CARLA Integration
 
-This folder is the repo-owned home for the CARLA pieces we actually maintain.
+This folder contains the Python-side CARLA files that are maintained in the repo. The simulator install itself stays outside the repo.
 
-Do not edit the external CARLA install directly unless you are intentionally testing
-something temporary. Permanent changes should live here and be tracked with Git.
-
-Current clean runtime reference
-
-- Version: `CARLA 0.9.15`
-- Clean local install used as the reference source: `C:\Users\matth\Desktop\CARLA_0.9.15`
-
-Files in this folder
+## Canonical entrypoint
 
 - `manual_control_emg.py`
-  - Current EMG/CARLA control script copied from the repo root `carla wheel z.py`.
-  - This should become the maintained CARLA control entrypoint going forward.
-- `wheel_config.ini`
-  - Wheel config kept next to the control script.
-- `upstream/manual_control_steeringwheel.py`
-  - Clean upstream CARLA example copied from the untouched install.
-- `upstream/generate_traffic.py`
-  - Clean upstream traffic-generation example copied from the untouched install.
+  - Maintained EMG/CARLA client.
+  - Loads named scenarios, starts realtime inference, and can write evaluation logs.
+  - Uses keyboard + EMG vehicle control only in the maintained repo state.
+
+## Wrapper scripts
+
 - `test_start_carla_server_0_9_16.bat`
-  - Restored-display test server launcher for the external CARLA install.
-- `test_run_lane_keep_5min_emg_0_9_16.cmd`
+  - Restored-display CARLA server launcher.
+- `test_run_manual_control_emg_0_9_16.bat`
+  - Free-roam practice launcher.
+  - Defaults to `Town03_Opt` with `10` vehicles and `18` pedestrians.
+- `lane_keep_5min.cmd`
   - Named lane-keep scenario wrapper.
-- `test_run_highway_overtake_emg_0_9_16.cmd`
+- `highway_overtake.cmd`
   - Named highway-overtake scenario wrapper.
-- `CARLA_VERSION.txt`
-  - Records the runtime version and reference install path.
+- `lane_keep_5min_eval.cmd`
+  - Lane-keep evaluation wrapper with `--eval-log-dir`.
+- `highway_overtake_eval.cmd`
+  - Highway-overtake evaluation wrapper with `--eval-log-dir`.
 
-Recommended workflow
+## Named scenarios
 
-1. Keep the full CARLA simulator outside this repo.
-2. Treat `C:\Users\matth\Desktop\CARLA_0.9.15` as the clean runtime install.
-3. Make Python-side CARLA changes in this folder, not inside the install.
-4. If you need a fresh simulator elsewhere, copy or unzip the clean install.
-5. Commit changes here so CARLA-side edits can be reverted normally with Git.
+- `lane_keep_5min`
+  - Map: `Town04_Opt`
+  - Ego spawns about `15 m` before the first active checkpoint.
+- `highway_overtake`
+  - Map: `Town04_Opt`
+  - Lead vehicle reacts during passing attempts to make the overtake less static.
 
-Suggested next cleanup
+## Common commands
 
-- Pick one canonical script path for future use:
-  - either keep using the repo root `carla wheel z.py`
-  - or switch to `carla_integration/manual_control_emg.py`
-- Once the team agrees, remove the duplicate or turn one into a wrapper so the two
-  copies do not drift.
-
-Example runtime flow
-
-1. Start CARLA with `carla_integration/test_start_carla_server_0_9_16.bat`
-2. Run a named scenario wrapper or `python carla_integration\manual_control_emg.py --scenario ...`
-3. For free-roam practice, use `test_run_manual_control_emg_0_9_16.bat`; it now starts with moderate ambient traffic by default unless `--scenario ...` is passed
-
-Scenario CLI commands
-
-Start the restored-display CARLA server:
+Start the CARLA server:
 
 ```bat
 carla_integration\test_start_carla_server_0_9_16.bat
 ```
 
-Run the named lane-keep scenario:
+Run free-roam practice:
 
 ```bat
-carla_integration\test_run_lane_keep_5min_emg_0_9_16.cmd
+carla_integration\test_run_manual_control_emg_0_9_16.bat
 ```
 
-Run the named overtake scenario:
+Run the lane-keep scenario:
 
 ```bat
-carla_integration\test_run_highway_overtake_emg_0_9_16.cmd
+carla_integration\lane_keep_5min.cmd
 ```
 
-Run either named scenario with evaluation logging enabled:
+Run the lane-keep scenario with evaluation logging:
 
 ```bat
-carla_integration\test_run_lane_keep_5min_emg_0_9_16.cmd --eval-log-dir eval_metrics\out\lane_keep_run_01
-carla_integration\test_run_highway_overtake_emg_0_9_16.cmd --eval-log-dir eval_metrics\out\overtake_run_01
+carla_integration\lane_keep_5min_eval.cmd
 ```
 
-Run the maintained Python entrypoint directly:
+Run the overtake scenario:
+
+```bat
+carla_integration\highway_overtake.cmd
+```
+
+Run the overtake scenario with evaluation logging:
+
+```bat
+carla_integration\highway_overtake_eval.cmd
+```
+
+Run a scenario directly:
 
 ```bat
 python carla_integration\manual_control_emg.py --scenario lane_keep_5min
 python carla_integration\manual_control_emg.py --scenario highway_overtake
 ```
 
-Optional direct CLI examples:
+Enable evaluation logging:
 
 ```bat
-python carla_integration\manual_control_emg.py --scenario lane_keep_5min --show-hud
-python carla_integration\manual_control_emg.py --scenario lane_keep_5min --eval-log-dir eval_metrics\out\lane_keep_run_01
-python carla_integration\manual_control_emg.py --scenario highway_overtake --eval-log-dir eval_metrics\out\overtake_run_01
-python carla_integration\manual_control_emg.py --map Town03_Opt --ambient-vehicles 10 --ambient-pedestrians 18 --show-hud
+python carla_integration\manual_control_emg.py --scenario lane_keep_5min --eval-log-dir eval_metrics\out\lane_keep_eval
+python carla_integration\manual_control_emg.py --scenario highway_overtake --eval-log-dir eval_metrics\out\highway_overtake_eval
 ```
 
-Notes:
+The dedicated eval wrappers above apply those `--eval-log-dir` arguments automatically.
 
-- Scenario presets set their own map, so `--scenario lane_keep_5min` and `--scenario highway_overtake` automatically load `Town04_Opt`.
-- `lane_keep_5min` currently starts from checkpoint index `3`, so the scenario START is intentionally moved farther up the route instead of beginning at the first physical checkpoint.
-- `manual_control_emg.py` now supports `--ambient-vehicles` and `--ambient-pedestrians` for integrated background traffic and walkers.
-- `test_run_manual_control_emg_0_9_16.bat` applies default free-roam practice traffic only when no named `--scenario` is requested, so the evaluation wrappers keep their existing behavior.
+## Controls
 
-The maps and simulator binaries are intentionally not stored in Git here.
+- `Backspace`
+  - Restart the vehicle.
+  - In free roam, this respawns a random vehicle.
+- `C`
+  - Next weather preset.
+- `Shift+C`
+  - Previous weather preset.
+- `F1`
+  - Toggle the HUD.
+
+## Notes
+
+- For evaluation runs, prefer the named scenario wrappers and eval wrappers instead of typing long CLI commands manually.
+- Named scenario presets choose their own maps.
+- `manual_control_emg.py` also supports direct free-roam runs with `--map`, `--ambient-vehicles`, and `--ambient-pedestrians`.
+- The maintained camera path is a single standard RGB camera view.

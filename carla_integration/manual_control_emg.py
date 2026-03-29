@@ -8,15 +8,7 @@
 # Allows controlling a vehicle with a keyboard. For a simpler and more
 # documented example, please take a look at tutorial.py.
 
-"""
-Welcome to CARLA manual control with steering wheel Logitech G29.
-
-To drive start by preshing the brake pedal.
-Change your wheel_config.ini according to your steering wheel.
-
-To find out the values of your steering wheel use jstest-gtk in Ubuntu.
-
-"""
+"""CARLA manual control adapted for EMG-driven vehicle testing."""
 
 from __future__ import print_function
 
@@ -67,41 +59,22 @@ from pathlib import Path
 from carla_integration.scenario_presets import get_scenario_preset, scenario_choices
 from emg.runtime_tuning import CARLA_TUNING, RUNTIME_TUNING_NAME
 
-if sys.version_info >= (3, 0):
-
-    from configparser import ConfigParser
-
-else:
-
-    from ConfigParser import RawConfigParser as ConfigParser
-
 try:
     import pygame
     from pygame.locals import KMOD_CTRL
     from pygame.locals import KMOD_SHIFT
-    from pygame.locals import K_0
-    from pygame.locals import K_9
-    from pygame.locals import K_BACKQUOTE
     from pygame.locals import K_BACKSPACE
     from pygame.locals import K_COMMA
     from pygame.locals import K_DOWN
     from pygame.locals import K_ESCAPE
     from pygame.locals import K_F1
-    from pygame.locals import K_LEFT
     from pygame.locals import K_PERIOD
-    from pygame.locals import K_RIGHT
-    from pygame.locals import K_SLASH
     from pygame.locals import K_SPACE
-    from pygame.locals import K_TAB
     from pygame.locals import K_UP
-    from pygame.locals import K_a
     from pygame.locals import K_c
-    from pygame.locals import K_d
-    from pygame.locals import K_h
     from pygame.locals import K_m
     from pygame.locals import K_p
     from pygame.locals import K_q
-    from pygame.locals import K_r
     from pygame.locals import K_s
     from pygame.locals import K_w
 except ImportError:
@@ -139,17 +112,6 @@ CAMERA_IMAGE_HEIGHT = 360
 CAMERA_SENSOR_TICK_S = 1.0 / DEFAULT_CAMERA_FPS
 DEFAULT_HUD_VISIBLE = False
 HUD_VISIBLE_BY_DEFAULT = DEFAULT_HUD_VISIBLE
-CONTROL_POLICY_NAME = "split_strength_latched_aux_v1"
-CONTROL_POLICY_OPTIONS = {
-    "split_strength_latched_aux_v1": (
-        "Left arm is strong steering, right arm is weak steering."
-    ),
-    "collapsed_strength_latched_aux_v1": (
-        "Matching turns become strong steering; a single-arm turn is weak steering."
-    ),
-}
-SIGNAL_TOGGLE_TIMEOUT_S = 0.0
-SIGNAL_TOGGLE_COOLDOWN_S = 0.75
 REVERSE_TOGGLE_COOLDOWN_S = 1.0
 REVERSE_TOGGLE_MAX_SPEED_MPS = 0.75
 
@@ -161,39 +123,17 @@ def _now_stamp():
 def _resolve_dual_arm_steer_key(left_label: str, right_label: str) -> str:
     left_label = str(left_label)
     right_label = str(right_label)
-    policy_name = str(CONTROL_POLICY_NAME).strip()
-    labels = {left_label, right_label}
-    has_left_turn = "left_turn" in labels
-    has_right_turn = "right_turn" in labels
-
-    if policy_name == "split_strength_latched_aux_v1":
-        if left_label == "left_turn":
-            return "left_strong"
-        if left_label == "right_turn":
-            return "right_strong"
-        if right_label == "left_turn":
-            return "left"
-        if right_label == "right_turn":
-            return "right"
-        return "neutral"
-
-    if policy_name == "collapsed_strength_latched_aux_v1":
-        if has_left_turn and has_right_turn:
-            return "neutral"
-        if left_label == "left_turn" and right_label == "left_turn":
-            return "left_strong"
-        if left_label == "right_turn" and right_label == "right_turn":
-            return "right_strong"
-        if has_left_turn:
-            return "left"
-        if has_right_turn:
-            return "right"
-        return "neutral"
-
-    valid = ", ".join(sorted(CONTROL_POLICY_OPTIONS))
-    raise ValueError(
-        f"Unknown CONTROL_POLICY_NAME={policy_name!r}. Valid options: {valid}"
-    )
+    # Final dual-arm steering contract: left arm drives strong steering,
+    # right arm drives weak steering.
+    if left_label == "left_turn":
+        return "left_strong"
+    if left_label == "right_turn":
+        return "right_strong"
+    if right_label == "left_turn":
+        return "left"
+    if right_label == "right_turn":
+        return "right"
+    return "neutral"
 
 
 def _map_basename(map_name):
@@ -232,66 +172,27 @@ class DriveCSVLogger(object):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         self._file = out_path.open('w', newline='', encoding='utf-8')
         self._fieldnames = [
-            'runtime_preset',
-            'control_policy',
             'timestamp',
-            'wall_time_s',
             'control_apply_ts',
             'simulation_time',
-            'frame',
             'prediction_seq',
-            'window_end_ts',
-            'prediction_ts',
-            'publish_ts',
-            'gesture_age_s',
-            'gesture_fresh',
-            'published_mode',
-            'pred_label',
-            'pred_conf',
-            'right_label',
-            'right_conf',
-            'left_label',
-            'left_conf',
             'steer_key',
             'applied_steer_key',
-            'steer_dwell_pending_key',
-            'steer_dwell_pending_count',
-            'steer_dwell_required',
-            'signal_state',
-            'horn_on',
             'steer',
             'throttle',
             'brake',
             'reverse',
             'hand_brake',
-            'vehicle_x',
-            'vehicle_y',
-            'vehicle_z',
-            'speed_mps',
             'lane_error_m',
             'lane_invasion_event',
-            'lane_invasion_count_total',
             'scenario_name',
             'scenario_kind',
             'scenario_status',
-            'scenario_started',
             'scenario_finished',
             'scenario_success',
             'scenario_failure_reason',
             'scenario_elapsed_s',
             'scenario_completion_time_s',
-            'scenario_checkpoint_index',
-            'scenario_checkpoint_count',
-            'scenario_progress_m',
-            'scenario_objective_met',
-            'scenario_next_checkpoint_distance_m',
-            'scenario_lead_distance_m',
-            'scenario_lead_gap_m',
-            'scenario_lead_response_active',
-            'scenario_lead_speed_reduction_pct',
-            'scenario_current_lane_id',
-            'scenario_target_lane_id',
-            'published_labels',
         ]
         self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames)
         self._writer.writeheader()
@@ -1585,7 +1486,6 @@ class World(object):
         self.player = None
         self.collision_sensor = None
         self.lane_invasion_sensor = None
-        self.gnss_sensor = None
         self.camera_manager = None
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
@@ -1634,9 +1534,6 @@ class World(object):
             self.world.apply_settings(settings)
 
     def restart(self):
-        # Keep same camera config if the camera manager exists.
-        cam_index = self.camera_manager.index if self.camera_manager is not None else 0
-        cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
         self._scenario_exit_requested = False
         if self.player is not None:
             self.destroy()
@@ -1659,10 +1556,7 @@ class World(object):
         # Set up the sensors.
         self.collision_sensor = CollisionSensor(self.player, self.hud)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
-        self.gnss_sensor = GnssSensor(self.player)
         self.camera_manager = CameraManager(self.player, self.hud)
-        self.camera_manager.transform_index = cam_pos_index
-        self.camera_manager.set_sensor(cam_index, notify=False)
         actor_type = get_actor_display_name(self.player)
         self.hud.notification(actor_type)
         if self._scenario_runtime is not None:
@@ -1713,7 +1607,7 @@ class World(object):
             self.camera_manager.sensor if self.camera_manager is not None else None,
             self.collision_sensor.sensor if self.collision_sensor is not None else None,
             self.lane_invasion_sensor.sensor if self.lane_invasion_sensor is not None else None,
-            self.gnss_sensor.sensor if self.gnss_sensor is not None else None]
+        ]
         for sensor in sensors:
             if sensor is not None:
                 sensor.stop()
@@ -1730,39 +1624,10 @@ class World(object):
 class DualControl(object):
     def __init__(self, world, start_in_autopilot, carla_log_path='', realtime_log_path=''):
         self._autopilot_enabled = start_in_autopilot
-        if isinstance(world.player, carla.Vehicle):
-            self._control = carla.VehicleControl()
-            world.player.set_autopilot(self._autopilot_enabled)
-        elif isinstance(world.player, carla.Walker):
-            self._control = carla.WalkerControl()
-            self._autopilot_enabled = False
-            self._rotation = world.player.get_transform().rotation
-        else:
+        if not isinstance(world.player, carla.Vehicle):
             raise NotImplementedError("Actor type not supported")
-        self._steer_cache = 0.0
-        world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
-
-        # initialize steering wheel
-        pygame.joystick.init()
-
-        joystick_count = pygame.joystick.get_count()
-        if joystick_count > 1:
-            raise ValueError("Please Connect Just One Joystick")
-
-        self._joystick = pygame.joystick.Joystick(0)
-        self._joystick.init()
-
-        self._parser = ConfigParser()
-        wheel_config_path = os.path.join(SCRIPT_DIR, 'wheel_config.ini')
-        self._parser.read(wheel_config_path)
-        self._steer_idx = int(
-            self._parser.get('G29 Racing Wheel', 'steering_wheel'))
-        self._throttle_idx = int(
-            self._parser.get('G29 Racing Wheel', 'throttle'))
-        self._brake_idx = int(self._parser.get('G29 Racing Wheel', 'brake'))
-        self._reverse_idx = int(self._parser.get('G29 Racing Wheel', 'reverse'))
-        self._handbrake_idx = int(
-            self._parser.get('G29 Racing Wheel', 'handbrake'))
+        self._control = carla.VehicleControl()
+        world.player.set_autopilot(self._autopilot_enabled)
         
         # Store references so gesture actions can affect vehicle + HUD
         self._player = world.player
@@ -1770,25 +1635,9 @@ class DualControl(object):
         
         # Gesture freshness (optional safety: ignore stale labels)
         self._gesture_max_age = float(CARLA_TUNING.gesture_max_age_s)
-        self._client_fps = 0.0
-        self._last_applied_gesture = None
-        self._last_gesture_debug_t = 0.0
         self._latest_published = None
-        self._latest_gesture_age = float('inf')
-        self._latest_right_label = "neutral"
-        self._latest_right_conf = 0.0
-        self._latest_left_label = "neutral"
-        self._latest_left_conf = 0.0
-        self._latest_pred_label = "neutral"
-        self._latest_pred_conf = 0.0
         self._latest_steer_key = "neutral"
         self._latest_applied_steer_key = "neutral"
-        self._latest_steer_dwell_pending_key = ""
-        self._latest_steer_dwell_pending_count = 0
-        self._latest_steer_dwell_required = 1
-        self._latest_signal_state = "off"
-        self._latest_horn_on = False
-        self._latest_gesture_fresh = False
         self._last_lane_invasion_count = 0
         self._drive_logger = DriveCSVLogger(carla_log_path) if carla_log_path else None
         self._realtime_log_path = str(realtime_log_path or '').strip()
@@ -1806,34 +1655,21 @@ class DualControl(object):
         self._applied_steer_key = "neutral"
         self._pending_steer_key = None
         self._pending_steer_count = 0
-        self._signal_toggle_timeout_s = float(SIGNAL_TOGGLE_TIMEOUT_S)
-        self._signal_toggle_cooldown_s = float(SIGNAL_TOGGLE_COOLDOWN_S)
         self._reverse_toggle_cooldown_s = float(REVERSE_TOGGLE_COOLDOWN_S)
         self._reverse_toggle_max_speed_mps = float(REVERSE_TOGGLE_MAX_SPEED_MPS)
-        if str(CONTROL_POLICY_NAME).strip() not in CONTROL_POLICY_OPTIONS:
-            valid = ", ".join(sorted(CONTROL_POLICY_OPTIONS))
-            raise ValueError(
-                f"Unknown CONTROL_POLICY_NAME={CONTROL_POLICY_NAME!r}. Valid options: {valid}"
-            )
-        self._signal_expiry_ts = None
-        self._last_left_signal_toggle_ts = -1e9
-        self._last_right_signal_toggle_ts = -1e9
         self._last_reverse_toggle_ts = -1e9
-        self._prev_left_signal_active = False
-        self._prev_right_signal_active = False
         self._prev_reverse_toggle_active = False
         print(
             f"[gesture] runtime tuning: {RUNTIME_TUNING_NAME} "
             f"(gesture_max_age={self._gesture_max_age:.2f}s, "
             f"active_dwell={self._active_steer_dwell_frames}, "
-            f"neutral_dwell={self._neutral_steer_dwell_frames}, "
-            f"control_policy={CONTROL_POLICY_NAME})"
+            f"neutral_dwell={self._neutral_steer_dwell_frames})"
         )
         scenario_name = getattr(getattr(world, "_scenario_preset", None), "name", "")
         if scenario_name:
             print(f"[scenario] active scenario: {scenario_name}")
         
-        # Signals and reverse are edge-triggered so a brief gesture can latch a state.
+        # Strong steering holds the indicators on; reverse is edge-triggered.
         self._signal_state = "off"  # "off" | "left" | "right"
         
         self._gesture_thread = None
@@ -1854,22 +1690,13 @@ class DualControl(object):
 
     def _reset_vehicle_state_for_respawn(self):
         self._signal_state = "off"
-        self._signal_expiry_ts = None
-        self._last_left_signal_toggle_ts = -1e9
-        self._last_right_signal_toggle_ts = -1e9
         self._last_reverse_toggle_ts = -1e9
         self._last_lane_invasion_count = 0
-        self._clear_discrete_gesture_states()
+        self._prev_reverse_toggle_active = False
         self._reset_steer_dwell_candidate()
         self._applied_steer_key = "neutral"
         self._latest_steer_key = "neutral"
         self._latest_applied_steer_key = "neutral"
-        self._latest_steer_dwell_pending_key = ""
-        self._latest_steer_dwell_pending_count = 0
-        self._latest_steer_dwell_required = 1
-        self._latest_signal_state = "off"
-        self._latest_horn_on = False
-        self._latest_gesture_fresh = False
 
     def _sync_world_refs(self, world, reset_state_on_change: bool = False):
         self._hud = getattr(world, "hud", None)
@@ -1878,47 +1705,23 @@ class DualControl(object):
             return False
 
         self._player = player
-        if isinstance(player, carla.Vehicle):
-            try:
-                self._control = player.get_control()
-            except RuntimeError:
-                self._control = carla.VehicleControl()
-            player.set_autopilot(self._autopilot_enabled)
-        elif isinstance(player, carla.Walker):
-            try:
-                self._control = player.get_control()
-            except RuntimeError:
-                self._control = carla.WalkerControl()
-            self._autopilot_enabled = False
-            try:
-                self._rotation = player.get_transform().rotation
-            except RuntimeError:
-                pass
+        if not isinstance(player, carla.Vehicle):
+            raise NotImplementedError("Vehicle actor required")
+        try:
+            self._control = player.get_control()
+        except RuntimeError:
+            self._control = carla.VehicleControl()
+        player.set_autopilot(self._autopilot_enabled)
 
         if reset_state_on_change:
             self._reset_vehicle_state_for_respawn()
         return True
 
     def parse_events(self, world, clock):
-        self._client_fps = float(clock.get_fps())
         self._sync_world_refs(world, reset_state_on_change=True)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return True
-            elif event.type == pygame.JOYBUTTONDOWN:
-                if event.button == 0:
-                    world.restart()
-                elif event.button == 1:
-                    world.hud.toggle_info()
-                elif event.button == 2:
-                    world.camera_manager.toggle_camera()
-                elif event.button == 3:
-                    world.next_weather()
-                elif event.button == self._reverse_idx:
-                    self._control.gear = 1 if self._control.reverse else -1
-                elif event.button == 23:
-                    world.camera_manager.next_sensor()
-
             elif event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
                     return True
@@ -1926,46 +1729,31 @@ class DualControl(object):
                     world.restart()
                 elif event.key == K_F1:
                     world.hud.toggle_info()
-                elif event.key == K_h or (event.key == K_SLASH and pygame.key.get_mods() & KMOD_SHIFT):
-                    world.hud.help.toggle()
-                elif event.key == K_TAB:
-                    world.camera_manager.toggle_camera()
                 elif event.key == K_c and pygame.key.get_mods() & KMOD_SHIFT:
                     world.next_weather(reverse=True)
                 elif event.key == K_c:
                     world.next_weather()
-                elif event.key == K_BACKQUOTE:
-                    world.camera_manager.next_sensor()
-                elif event.key > K_0 and event.key <= K_9:
-                    world.camera_manager.set_sensor(event.key - 1 - K_0)
-                elif event.key == K_r:
-                    world.camera_manager.toggle_recording()
-                if isinstance(self._control, carla.VehicleControl):
-                    if event.key == K_q:
-                        self._control.gear = 1 if self._control.reverse else -1
-                    elif event.key == K_m:
-                        self._control.manual_gear_shift = not self._control.manual_gear_shift
-                        self._control.gear = world.player.get_control().gear
-                        world.hud.notification('%s Transmission' %
-                                               ('Manual' if self._control.manual_gear_shift else 'Automatic'))
-                    elif self._control.manual_gear_shift and event.key == K_COMMA:
-                        self._control.gear = max(-1, self._control.gear - 1)
-                    elif self._control.manual_gear_shift and event.key == K_PERIOD:
-                        self._control.gear = self._control.gear + 1
-                    elif event.key == K_p:
-                        self._autopilot_enabled = not self._autopilot_enabled
-                        world.player.set_autopilot(self._autopilot_enabled)
-                        world.hud.notification('Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
+                elif event.key == K_q:
+                    self._control.gear = 1 if self._control.reverse else -1
+                elif event.key == K_m:
+                    self._control.manual_gear_shift = not self._control.manual_gear_shift
+                    self._control.gear = world.player.get_control().gear
+                    world.hud.notification('%s Transmission' %
+                                           ('Manual' if self._control.manual_gear_shift else 'Automatic'))
+                elif self._control.manual_gear_shift and event.key == K_COMMA:
+                    self._control.gear = max(-1, self._control.gear - 1)
+                elif self._control.manual_gear_shift and event.key == K_PERIOD:
+                    self._control.gear = self._control.gear + 1
+                elif event.key == K_p:
+                    self._autopilot_enabled = not self._autopilot_enabled
+                    world.player.set_autopilot(self._autopilot_enabled)
+                    world.hud.notification('Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
 
         self._sync_world_refs(world, reset_state_on_change=True)
         if not self._autopilot_enabled:
-            if isinstance(self._control, carla.VehicleControl):
-                self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
-                self._parse_vehicle_wheel()
-                self._apply_gesture_override()
-                self._control.reverse = self._control.gear < 0
-            elif isinstance(self._control, carla.WalkerControl):
-                self._parse_walker_keys(pygame.key.get_pressed(), clock.get_time())
+            self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
+            self._apply_gesture_override()
+            self._control.reverse = self._control.gear < 0
             world.player.apply_control(self._control)
             self._log_drive_step(world)
 
@@ -1973,52 +1761,6 @@ class DualControl(object):
         self._control.throttle = 1.0 if keys[K_UP] or keys[K_w] else 0.0
         self._control.brake = 1.0 if keys[K_DOWN] or keys[K_s] else 0.0
         self._control.hand_brake = keys[K_SPACE]
-
-    def _parse_vehicle_wheel(self):
-        numAxes = self._joystick.get_numaxes()
-        jsInputs = [float(self._joystick.get_axis(i)) for i in range(numAxes)]
-        # print (jsInputs)
-        jsButtons = [float(self._joystick.get_button(i)) for i in
-                     range(self._joystick.get_numbuttons())]
-
-        
-        K2 = 1.6  # 1.6
-        throttleCmd = K2 + (2.05 * math.log10(
-            -0.7 * jsInputs[self._throttle_idx] + 1.4) - 1.2) / 0.92
-        if throttleCmd <= 0:
-            throttleCmd = 0
-        elif throttleCmd > 1:
-            throttleCmd = 1
-
-        brakeCmd = 1.6 + (2.05 * math.log10(
-            -0.7 * jsInputs[self._brake_idx] + 1.4) - 1.2) / 0.92
-        if brakeCmd <= 0:
-            brakeCmd = 0
-        elif brakeCmd > 1:
-            brakeCmd = 1
-
-        self._control.brake = brakeCmd
-        self._control.throttle = throttleCmd
-
-        #toggle = jsButtons[self._reverse_idx]
-
-        self._control.hand_brake = bool(jsButtons[self._handbrake_idx])
-
-    def _parse_walker_keys(self, keys, milliseconds):
-        self._control.speed = 0.0
-        if keys[K_DOWN] or keys[K_s]:
-            self._control.speed = 0.0
-        if keys[K_LEFT] or keys[K_a]:
-            self._control.speed = .01
-            self._rotation.yaw -= 0.08 * milliseconds
-        if keys[K_RIGHT] or keys[K_d]:
-            self._control.speed = .01
-            self._rotation.yaw += 0.08 * milliseconds
-        if keys[K_UP] or keys[K_w]:
-            self._control.speed = 5.556 if pygame.key.get_mods() & KMOD_SHIFT else 2.778
-        self._control.jump = keys[K_SPACE]
-        self._rotation.yaw = round(self._rotation.yaw, 1)
-        self._control.direction = self._rotation.get_forward_vector()
 
     def _start_gesture_thread(self):
         if realtime_gesture is None:
@@ -2042,25 +1784,15 @@ class DualControl(object):
         """
         Returns:
             steer_key: "left", "right", "left_strong", "right_strong", or "neutral"
-            left_signal_toggle_requested: bool
-            right_signal_toggle_requested: bool
             reverse_toggle_requested: bool
         """
         left_label = str(left_label)
         right_label = str(right_label)
 
         reverse_toggle_requested = left_label == "horn" and right_label == "horn"
-        left_signal_toggle_requested = False
-        right_signal_toggle_requested = False
-
         steer_key = _resolve_dual_arm_steer_key(left_label, right_label)
 
-        return (
-            steer_key,
-            left_signal_toggle_requested,
-            right_signal_toggle_requested,
-            reverse_toggle_requested,
-        )
+        return steer_key, reverse_toggle_requested
 
     def _reset_steer_dwell_candidate(self):
         self._pending_steer_key = None
@@ -2078,9 +1810,6 @@ class DualControl(object):
 
         if requested_steer_key == applied_steer_key:
             self._reset_steer_dwell_candidate()
-            self._latest_steer_dwell_pending_key = ""
-            self._latest_steer_dwell_pending_count = 0
-            self._latest_steer_dwell_required = dwell_required
             return applied_steer_key
 
         if self._pending_steer_key == requested_steer_key:
@@ -2089,72 +1818,11 @@ class DualControl(object):
             self._pending_steer_key = requested_steer_key
             self._pending_steer_count = 1
 
-        self._latest_steer_dwell_pending_key = str(self._pending_steer_key or "")
-        self._latest_steer_dwell_pending_count = int(self._pending_steer_count)
-        self._latest_steer_dwell_required = int(dwell_required)
-
         if self._pending_steer_count >= dwell_required:
             self._applied_steer_key = requested_steer_key
             applied_steer_key = requested_steer_key
             self._reset_steer_dwell_candidate()
-            self._latest_steer_dwell_pending_key = ""
-            self._latest_steer_dwell_pending_count = 0
         return applied_steer_key
-
-    def _clear_discrete_gesture_states(self):
-        self._prev_left_signal_active = False
-        self._prev_right_signal_active = False
-        self._prev_reverse_toggle_active = False
-
-    def _expire_signal_if_needed(self, now: float | None = None):
-        now = time.monotonic() if now is None else float(now)
-        if self._signal_state == "off" or self._signal_expiry_ts is None:
-            return
-        if now < float(self._signal_expiry_ts):
-            return
-        self._set_turn_signal("off")
-        self._signal_expiry_ts = None
-
-    def _toggle_signal_state(self, requested_side: str, now: float):
-        requested_side = str(requested_side)
-        current_side = str(self._signal_state)
-        if requested_side == current_side:
-            self._set_turn_signal("off")
-            self._signal_expiry_ts = None
-            return
-        self._set_turn_signal(requested_side)
-        if self._signal_toggle_timeout_s > 0.0:
-            self._signal_expiry_ts = float(now + self._signal_toggle_timeout_s)
-        else:
-            self._signal_expiry_ts = None
-
-    def _update_signal_toggles(
-        self,
-        left_signal_toggle_requested: bool,
-        right_signal_toggle_requested: bool,
-    ):
-        now = time.monotonic()
-        self._set_turn_signal("off")
-
-        left_active = bool(left_signal_toggle_requested)
-        right_active = bool(right_signal_toggle_requested)
-        left_edge = left_active and not self._prev_left_signal_active
-        right_edge = right_active and not self._prev_right_signal_active
-
-        if left_edge and right_edge:
-            self._set_turn_signal("off")
-            self._signal_expiry_ts = None
-            self._last_left_signal_toggle_ts = float(now)
-            self._last_right_signal_toggle_ts = float(now)
-        elif left_edge and (now - self._last_left_signal_toggle_ts) >= self._signal_toggle_cooldown_s:
-            self._toggle_signal_state("left", now)
-            self._last_left_signal_toggle_ts = float(now)
-        elif right_edge and (now - self._last_right_signal_toggle_ts) >= self._signal_toggle_cooldown_s:
-            self._toggle_signal_state("right", now)
-            self._last_right_signal_toggle_ts = float(now)
-
-        self._prev_left_signal_active = left_active
-        self._prev_right_signal_active = right_active
 
     def _update_reverse_toggle(self, reverse_toggle_requested: bool):
         reverse_active = bool(reverse_toggle_requested)
@@ -2194,35 +1862,22 @@ class DualControl(object):
 
     def _apply_gesture_override(self):
         if realtime_gesture is None:
-            self._latest_gesture_fresh = False
             self._reset_steer_dwell_candidate()
-            self._latest_steer_dwell_pending_key = ""
-            self._latest_steer_dwell_pending_count = 0
             self._set_turn_signal("off")
-            self._clear_discrete_gesture_states()
-            self._latest_signal_state = self._signal_state
-            self._latest_horn_on = False
+            self._prev_reverse_toggle_active = False
             return
     
         # Read the new published dual-arm output from realtime_gesture_cnn.py
         published, age = realtime_gesture.get_latest_published_gestures()
         self._latest_published = published
-        self._latest_gesture_age = float(age)
         if age > self._gesture_max_age:
-            self._latest_gesture_fresh = False
             self._reset_steer_dwell_candidate()
-            self._latest_steer_dwell_pending_key = ""
-            self._latest_steer_dwell_pending_count = 0
-            self._expire_signal_if_needed()
-            self._clear_discrete_gesture_states()
-            self._latest_signal_state = self._signal_state
-            self._latest_horn_on = False
+            self._set_turn_signal("off")
+            self._prev_reverse_toggle_active = False
             return
     
         left_label = "neutral"
         right_label = "neutral"
-        left_conf = 0.0
-        right_conf = 0.0
     
         gestures = tuple(getattr(published, "gestures", ()))
     
@@ -2230,57 +1885,32 @@ class DualControl(object):
             for gesture in gestures:
                 arm = str(getattr(gesture, "arm", "")).lower()
                 label = str(getattr(gesture, "label", "neutral"))
-                confidence = float(getattr(gesture, "confidence", 0.0))
                 if arm == "left":
                     left_label = label
-                    left_conf = confidence
                 elif arm == "right":
                     right_label = label
-                    right_conf = confidence
         else:
             # single output means both arms agreed, or only one arm is active/published
             if gestures:
                 label = str(getattr(gestures[0], "label", "neutral"))
                 arm = str(getattr(gestures[0], "arm", "")).lower()
-                confidence = float(getattr(gestures[0], "confidence", 0.0))
     
                 if arm == "left":
                     left_label = label
-                    left_conf = confidence
                 elif arm == "right":
                     right_label = label
-                    right_conf = confidence
                 elif arm == "dual":
                     left_label = label
                     right_label = label
-                    left_conf = confidence
-                    right_conf = confidence
                 else:
                     # safe fallback
                     left_label = label
                     right_label = label
-                    left_conf = confidence
-                    right_conf = confidence
-
-        self._latest_left_label = left_label
-        self._latest_left_conf = left_conf
-        self._latest_right_label = right_label
-        self._latest_right_conf = right_conf
     
-        (
-            steer_key,
-            left_signal_toggle_requested,
-            right_signal_toggle_requested,
-            reverse_toggle_requested,
-        ) = self._resolve_dual_arm_actions(left_label, right_label)
+        steer_key, reverse_toggle_requested = self._resolve_dual_arm_actions(left_label, right_label)
         self._latest_steer_key = steer_key
         applied_steer_key = self._apply_steer_dwell(steer_key)
         self._latest_applied_steer_key = applied_steer_key
-        self._latest_pred_label = "split" if getattr(published, "mode", "single") == "split" else (
-            left_label if left_label == right_label else right_label
-        )
-        self._latest_pred_conf = max(left_conf, right_conf)
-        self._latest_gesture_fresh = True
     
         # Apply steering
         self._control.steer = float(self._gesture_to_steer[applied_steer_key])
@@ -2298,8 +1928,6 @@ class DualControl(object):
 
         # Reverse is a dual-horn toggle, not a hold-to-reverse action.
         self._update_reverse_toggle(reverse_toggle_requested)
-        self._latest_signal_state = self._signal_state
-        self._latest_horn_on = bool(reverse_toggle_requested)
 
     def _estimate_lane_error_m(self, world):
         try:
@@ -2323,92 +1951,34 @@ class DualControl(object):
         if published is None:
             published = getattr(realtime_gesture, "PublishedGestureOutput", None)
             published = published() if callable(published) else None
-        transform = world.player.get_transform()
-        velocity = world.player.get_velocity()
-        speed_mps = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2)
         lane_invasion_count = int(getattr(world.lane_invasion_sensor, "event_count", 0))
         lane_invasion_event = lane_invasion_count > self._last_lane_invasion_count
         self._last_lane_invasion_count = lane_invasion_count
 
-        gestures = tuple(getattr(published, "gestures", ())) if published is not None else ()
-        if gestures:
-            published_labels = "|".join(
-                f"{getattr(gesture, 'arm', '')}:{getattr(gesture, 'label', '')}"
-                for gesture in gestures
-            )
-        else:
-            published_labels = ""
-
-        if str(getattr(published, "mode", "single")) == "single" and gestures:
-            self._latest_pred_label = str(getattr(gestures[0], "label", self._latest_pred_label))
-            self._latest_pred_conf = float(getattr(gestures[0], "confidence", self._latest_pred_conf))
-        elif str(getattr(published, "mode", "single")) == "split":
-            self._latest_pred_label = "split"
-            self._latest_pred_conf = max(self._latest_left_conf, self._latest_right_conf)
-
         apply_ts = time.time()
         scenario = world.get_scenario_snapshot()
         row = {
-            'runtime_preset': RUNTIME_TUNING_NAME,
-            'control_policy': CONTROL_POLICY_NAME,
             'timestamp': datetime.datetime.now().isoformat(),
-            'wall_time_s': apply_ts,
             'control_apply_ts': apply_ts,
             'simulation_time': float(getattr(world.hud, 'simulation_time', 0.0)),
-            'frame': int(getattr(world.hud, 'frame', 0)),
             'prediction_seq': int(getattr(published, 'prediction_seq', 0)) if published is not None else 0,
-            'window_end_ts': float(getattr(published, 'window_end_ts', 0.0)) if published is not None else 0.0,
-            'prediction_ts': float(getattr(published, 'prediction_ts', 0.0)) if published is not None else 0.0,
-            'publish_ts': float(getattr(published, 'publish_ts', 0.0)) if published is not None else 0.0,
-            'gesture_age_s': float(self._latest_gesture_age),
-            'gesture_fresh': bool(self._latest_gesture_fresh),
-            'published_mode': str(getattr(published, 'mode', 'single')) if published is not None else '',
-            'pred_label': str(self._latest_pred_label),
-            'pred_conf': float(self._latest_pred_conf),
-            'right_label': str(self._latest_right_label),
-            'right_conf': float(self._latest_right_conf),
-            'left_label': str(self._latest_left_label),
-            'left_conf': float(self._latest_left_conf),
             'steer_key': str(self._latest_steer_key),
             'applied_steer_key': str(self._latest_applied_steer_key),
-            'steer_dwell_pending_key': str(self._latest_steer_dwell_pending_key),
-            'steer_dwell_pending_count': int(self._latest_steer_dwell_pending_count),
-            'steer_dwell_required': int(self._latest_steer_dwell_required),
-            'signal_state': str(self._latest_signal_state),
-            'horn_on': bool(self._latest_horn_on),
             'steer': float(getattr(self._control, 'steer', 0.0)),
             'throttle': float(getattr(self._control, 'throttle', 0.0)),
             'brake': float(getattr(self._control, 'brake', 0.0)),
             'reverse': bool(getattr(self._control, 'reverse', False)),
             'hand_brake': bool(getattr(self._control, 'hand_brake', False)),
-            'vehicle_x': float(transform.location.x),
-            'vehicle_y': float(transform.location.y),
-            'vehicle_z': float(transform.location.z),
-            'speed_mps': float(speed_mps),
             'lane_error_m': self._estimate_lane_error_m(world),
             'lane_invasion_event': bool(lane_invasion_event),
-            'lane_invasion_count_total': lane_invasion_count,
             'scenario_name': str(scenario.get('scenario_name', '')),
             'scenario_kind': str(scenario.get('scenario_kind', '')),
             'scenario_status': str(scenario.get('scenario_status', '')),
-            'scenario_started': scenario.get('scenario_started', ''),
             'scenario_finished': scenario.get('scenario_finished', ''),
             'scenario_success': scenario.get('scenario_success', ''),
             'scenario_failure_reason': str(scenario.get('scenario_failure_reason', '')),
             'scenario_elapsed_s': scenario.get('scenario_elapsed_s', ''),
             'scenario_completion_time_s': scenario.get('scenario_completion_time_s', ''),
-            'scenario_checkpoint_index': scenario.get('scenario_checkpoint_index', ''),
-            'scenario_checkpoint_count': scenario.get('scenario_checkpoint_count', ''),
-            'scenario_progress_m': scenario.get('scenario_progress_m', ''),
-            'scenario_objective_met': scenario.get('scenario_objective_met', ''),
-            'scenario_next_checkpoint_distance_m': scenario.get('scenario_next_checkpoint_distance_m', ''),
-            'scenario_lead_distance_m': scenario.get('scenario_lead_distance_m', ''),
-            'scenario_lead_gap_m': scenario.get('scenario_lead_gap_m', ''),
-            'scenario_lead_response_active': scenario.get('scenario_lead_response_active', ''),
-            'scenario_lead_speed_reduction_pct': scenario.get('scenario_lead_speed_reduction_pct', ''),
-            'scenario_current_lane_id': scenario.get('scenario_current_lane_id', ''),
-            'scenario_target_lane_id': scenario.get('scenario_target_lane_id', ''),
-            'published_labels': published_labels,
         }
         self._drive_logger.write_row(row)
 
@@ -2449,15 +2019,6 @@ class DualControl(object):
             return
         self._signal_state = side
     
-    def _honk(self):
-        # CARLA doesn't have a built-in horn actuator for standard vehicles,
-        # so we simulate it with a HUD notification (and optional sound if you add one).
-        if hasattr(self, "_hud") and self._hud is not None:
-            self._hud.notification("HORN!", seconds=0.2)
-        else:
-            print("HORN!")
-
-
 # ==============================================================================
 # -- HUD -----------------------------------------------------------------------
 # ==============================================================================
@@ -2474,7 +2035,6 @@ class HUD(object):
         mono = pygame.font.match_font(mono)
         self._font_mono = pygame.font.Font(mono, 12 if os.name == 'nt' else 14)
         self._notifications = FadingText(font, (width, 40), (0, height - 40))
-        self.help = HelpText(pygame.font.Font(mono, 24), width, height)
         self.server_fps = 0
         self.frame = 0
         self.simulation_time = 0
@@ -2492,13 +2052,8 @@ class HUD(object):
         self._notifications.tick(world, clock)
         if not self._show_info:
             return
-        t = world.player.get_transform()
         v = world.player.get_velocity()
         c = world.player.get_control()
-        heading = 'N' if abs(t.rotation.yaw) < 89.5 else ''
-        heading += 'S' if abs(t.rotation.yaw) > 90.5 else ''
-        heading += 'E' if 179.5 > t.rotation.yaw > 0.5 else ''
-        heading += 'W' if -0.5 > t.rotation.yaw > -179.5 else ''
         colhist = world.collision_sensor.get_collision_history()
         collision = [colhist[x + self.frame - 200] for x in range(0, 200)]
         max_col = max(1.0, max(collision))
@@ -2513,24 +2068,15 @@ class HUD(object):
             'Simulation time: % 12s' % datetime.timedelta(seconds=int(self.simulation_time)),
             '',
             'Speed:   % 15.0f km/h' % (3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)),
-            u'Heading:% 16.0f\N{DEGREE SIGN} % 2s' % (t.rotation.yaw, heading),
-            'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (t.location.x, t.location.y)),
-            'GNSS:% 24s' % ('(% 2.6f, % 3.6f)' % (world.gnss_sensor.lat, world.gnss_sensor.lon)),
-            'Height:  % 18.0f m' % t.location.z,
             '']
-        if isinstance(c, carla.VehicleControl):
-            self._info_text += [
-                ('Throttle:', c.throttle, 0.0, 1.0),
-                ('Steer:', c.steer, -1.0, 1.0),
-                ('Brake:', c.brake, 0.0, 1.0),
-                ('Reverse:', c.reverse),
-                ('Hand brake:', c.hand_brake),
-                ('Manual:', c.manual_gear_shift),
-                'Gear:        %s' % {-1: 'R', 0: 'N'}.get(c.gear, c.gear)]
-        elif isinstance(c, carla.WalkerControl):
-            self._info_text += [
-                ('Speed:', c.speed, 0.0, 5.556),
-                ('Jump:', c.jump)]
+        self._info_text += [
+            ('Throttle:', c.throttle, 0.0, 1.0),
+            ('Steer:', c.steer, -1.0, 1.0),
+            ('Brake:', c.brake, 0.0, 1.0),
+            ('Reverse:', c.reverse),
+            ('Hand brake:', c.hand_brake),
+            ('Manual:', c.manual_gear_shift),
+            'Gear:        %s' % {-1: 'R', 0: 'N'}.get(c.gear, c.gear)]
         self._info_text += [
             '',
             'Collision:',
@@ -2596,7 +2142,6 @@ class HUD(object):
                     display.blit(surface, (8, v_offset))
                 v_offset += 18
         self._notifications.render(display)
-        self.help.render(display)
 
 
 # ==============================================================================
@@ -2626,35 +2171,6 @@ class FadingText(object):
 
     def render(self, display):
         display.blit(self.surface, self.pos)
-
-
-# ==============================================================================
-# -- HelpText ------------------------------------------------------------------
-# ==============================================================================
-
-
-class HelpText(object):
-    def __init__(self, font, width, height):
-        lines = __doc__.split('\n')
-        self.font = font
-        self.dim = (680, len(lines) * 22 + 12)
-        self.pos = (0.5 * width - 0.5 * self.dim[0], 0.5 * height - 0.5 * self.dim[1])
-        self.seconds_left = 0
-        self.surface = pygame.Surface(self.dim)
-        self.surface.fill((0, 0, 0, 0))
-        for n, line in enumerate(lines):
-            text_texture = self.font.render(line, True, (255, 255, 255))
-            self.surface.blit(text_texture, (22, n * 22))
-            self._render = False
-        self.surface.set_alpha(220)
-
-    def toggle(self):
-        self._render = not self._render
-
-    def render(self, display):
-        if self._render:
-            display.blit(self.surface, self.pos)
-
 
 # ==============================================================================
 # -- CollisionSensor -----------------------------------------------------------
@@ -2768,34 +2284,6 @@ class LaneInvasionSensor(object):
             self.hud.notification('Crossed line')
 
 # ==============================================================================
-# -- GnssSensor --------------------------------------------------------
-# ==============================================================================
-
-
-class GnssSensor(object):
-    def __init__(self, parent_actor):
-        self.sensor = None
-        self._parent = parent_actor
-        self.lat = 0.0
-        self.lon = 0.0
-        world = self._parent.get_world()
-        bp = world.get_blueprint_library().find('sensor.other.gnss')
-        self.sensor = world.spawn_actor(bp, carla.Transform(carla.Location(x=1.0, z=2.8)), attach_to=self._parent)
-        # We need to pass the lambda a weak reference to self to avoid circular
-        # reference.
-        weak_self = weakref.ref(self)
-        self.sensor.listen(lambda event: GnssSensor._on_gnss_event(weak_self, event))
-
-    @staticmethod
-    def _on_gnss_event(weak_self, event):
-        self = weak_self()
-        if not self:
-            return
-        self.lat = event.latitude
-        self.lon = event.longitude
-
-
-# ==============================================================================
 # -- CameraManager -------------------------------------------------------------
 # ==============================================================================
 
@@ -2806,70 +2294,26 @@ class CameraManager(object):
         self.surface = None
         self._parent = parent_actor
         self.hud = hud
-        self.recording = False
-        self._camera_transforms = [
-            carla.Transform(carla.Location(x=-5.5, z=2.8), carla.Rotation(pitch=-15)),
-            carla.Transform(carla.Location(x=1.6, z=1.7))]
-        self.transform_index = 1
-        self.sensors = [
-            ['sensor.camera.rgb', cc.Raw, 'Camera RGB'],
-            ['sensor.camera.depth', cc.Raw, 'Camera Depth (Raw)'],
-            ['sensor.camera.depth', cc.Depth, 'Camera Depth (Gray Scale)'],
-            ['sensor.camera.depth', cc.LogarithmicDepth, 'Camera Depth (Logarithmic Gray Scale)'],
-            ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)'],
-            ['sensor.camera.semantic_segmentation', cc.CityScapesPalette,
-                'Camera Semantic Segmentation (CityScapes Palette)'],
-            ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)']]
+        self._camera_transform = carla.Transform(carla.Location(x=1.6, z=1.7))
         world = self._parent.get_world()
         bp_library = world.get_blueprint_library()
-        for item in self.sensors:
-            bp = bp_library.find(item[0])
-            if item[0].startswith('sensor.camera'):
-                if LOW_GRAPHICS_MODE:
-                    bp.set_attribute('image_size_x', str(CAMERA_IMAGE_WIDTH))
-                    bp.set_attribute('image_size_y', str(CAMERA_IMAGE_HEIGHT))
-                    if bp.has_attribute('sensor_tick'):
-                        bp.set_attribute('sensor_tick', str(CAMERA_SENSOR_TICK_S))
-                    if bp.has_attribute('enable_postprocess_effects'):
-                        bp.set_attribute('enable_postprocess_effects', 'False')
-                else:
-                    bp.set_attribute('image_size_x', str(hud.dim[0]))
-                    bp.set_attribute('image_size_y', str(hud.dim[1]))
-            elif item[0].startswith('sensor.lidar'):
-                bp.set_attribute('range', '15' if LOW_GRAPHICS_MODE else '50')
-            item.append(bp)
-        self.index = None
-
-    def toggle_camera(self):
-        self.transform_index = (self.transform_index + 1) % len(self._camera_transforms)
-        self.sensor.set_transform(self._camera_transforms[self.transform_index])
-
-    def set_sensor(self, index, notify=True):
-        index = index % len(self.sensors)
-        needs_respawn = True if self.index is None \
-            else self.sensors[index][0] != self.sensors[self.index][0]
-        if needs_respawn:
-            if self.sensor is not None:
-                self.sensor.destroy()
-                self.surface = None
-            self.sensor = self._parent.get_world().spawn_actor(
-                self.sensors[index][-1],
-                self._camera_transforms[self.transform_index],
-                attach_to=self._parent)
-            # We need to pass the lambda a weak reference to self to avoid
-            # circular reference.
-            weak_self = weakref.ref(self)
-            self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
-        if notify:
-            self.hud.notification(self.sensors[index][2])
-        self.index = index
-
-    def next_sensor(self):
-        self.set_sensor(self.index + 1)
-
-    def toggle_recording(self):
-        self.recording = not self.recording
-        self.hud.notification('Recording %s' % ('On' if self.recording else 'Off'))
+        bp = bp_library.find('sensor.camera.rgb')
+        if LOW_GRAPHICS_MODE:
+            bp.set_attribute('image_size_x', str(CAMERA_IMAGE_WIDTH))
+            bp.set_attribute('image_size_y', str(CAMERA_IMAGE_HEIGHT))
+            if bp.has_attribute('sensor_tick'):
+                bp.set_attribute('sensor_tick', str(CAMERA_SENSOR_TICK_S))
+            if bp.has_attribute('enable_postprocess_effects'):
+                bp.set_attribute('enable_postprocess_effects', 'False')
+        else:
+            bp.set_attribute('image_size_x', str(hud.dim[0]))
+            bp.set_attribute('image_size_y', str(hud.dim[1]))
+        self.sensor = self._parent.get_world().spawn_actor(
+            bp,
+            self._camera_transform,
+            attach_to=self._parent)
+        weak_self = weakref.ref(self)
+        self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
 
     def render(self, display):
         if self.surface is not None:
@@ -2880,28 +2324,12 @@ class CameraManager(object):
         self = weak_self()
         if not self:
             return
-        if self.sensors[self.index][0].startswith('sensor.lidar'):
-            points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
-            points = np.reshape(points, (int(points.shape[0] / 4), 4))
-            lidar_data = np.array(points[:, :2])
-            lidar_data *= min(self.hud.dim) / 100.0
-            lidar_data += (0.5 * self.hud.dim[0], 0.5 * self.hud.dim[1])
-            lidar_data = np.fabs(lidar_data) # pylint: disable=E1111
-            lidar_data = lidar_data.astype(np.int32)
-            lidar_data = np.reshape(lidar_data, (-1, 2))
-            lidar_img_size = (self.hud.dim[0], self.hud.dim[1], 3)
-            lidar_img = np.zeros(lidar_img_size)
-            lidar_img[tuple(lidar_data.T)] = (255, 255, 255)
-            self.surface = pygame.surfarray.make_surface(lidar_img)
-        else:
-            image.convert(self.sensors[self.index][1])
-            array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-            array = np.reshape(array, (image.height, image.width, 4))
-            array = array[:, :, :3]
-            array = array[:, :, ::-1]
-            self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-        if self.recording:
-            image.save_to_disk('_out/%08d' % image.frame)
+        image.convert(cc.Raw)
+        array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+        array = np.reshape(array, (image.height, image.width, 4))
+        array = array[:, :, :3]
+        array = array[:, :, ::-1]
+        self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
 
 
 # ==============================================================================

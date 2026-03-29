@@ -16,6 +16,7 @@ from DataCollector.CollectDataController import *
 import tkinter as tk
 from tkinter import filedialog
 import numpy as np
+from emg.strict_layout import resolve_strict_channel_indices
 from project_paths import STRICT_DATA_ROOT, strict_raw_dir
 
 from DataCollector.CollectionMetricsManagement import CollectionMetricsManagement
@@ -55,6 +56,23 @@ def resolve_rest_label_trim(
     if label_trim_s <= 0.0 or rest_duration_s <= 0.0:
         return 0.0
     return min(label_trim_s, rest_duration_s * 0.25)
+
+
+def _slice_channel_matrix(values, channel_indices: np.ndarray) -> np.ndarray:
+    indices = np.asarray(channel_indices, dtype=int).reshape(-1)
+    matrix = np.asarray(values, dtype=float)
+    if matrix.size == 0:
+        return np.empty((0, indices.size), dtype=float)
+    if matrix.ndim != 2:
+        raise ValueError(f"Expected 2D channel matrix, got shape {matrix.shape}.")
+    if indices.size == 0:
+        return np.empty((matrix.shape[0], 0), dtype=float)
+    max_idx = int(np.max(indices))
+    if max_idx >= matrix.shape[1]:
+        raise ValueError(
+            f"Channel slice index {max_idx} is out of bounds for matrix with {matrix.shape[1]} channel(s)."
+        )
+    return matrix[:, indices]
 
 
 class CollectDataWindow(QWidget):
@@ -981,6 +999,16 @@ class CollectDataWindow(QWidget):
             raise RuntimeError("Failed to configure pipeline.")
 
         channel_count = base.channelcount
+        channel_labels = list(getattr(base, "emgChannelNames", []))
+        if len(channel_labels) != channel_count:
+            raise RuntimeError(
+                "Strict collection requires Delsys EMG channel labels for every live stream channel. "
+                f"Received {len(channel_labels)} labels for {channel_count} channels."
+            )
+        strict_layout = resolve_strict_channel_indices(channel_labels, arm=config.arm)
+        selected_channel_indices = np.asarray(strict_layout.ordered_indices, dtype=int)
+        selected_channel_labels = [str(channel_labels[idx]) for idx in selected_channel_indices]
+        selected_channel_count = int(selected_channel_indices.size)
         plotter = self.plotCanvas if self.plot_enabled else None
         emg_idx = getattr(base, "emgChannelsIdx", [])
         self.protocol_abort = False
@@ -1068,24 +1096,12 @@ class CollectDataWindow(QWidget):
                 if calib_neutral_x and calib_mvc_x:
                     neutral_arr = np.asarray(calib_neutral_x, dtype=float)
                     mvc_arr = np.asarray(calib_mvc_x, dtype=float)
-                    quality_neutral = neutral_arr
-                    quality_mvc = mvc_arr
-                    quality_scope = f"all {neutral_arr.shape[1]} channels"
-
-                    # If both arms are connected in one stream, score only the selected arm.
-                    # Sensor pairing contract is right arm channels first, then left arm channels.
-                    if neutral_arr.shape[1] >= 30 and neutral_arr.shape[1] == mvc_arr.shape[1]:
-                        split_idx = (neutral_arr.shape[1] + 1) // 2
-                        if config.arm == "right":
-                            quality_neutral = neutral_arr[:, :split_idx]
-                            quality_mvc = mvc_arr[:, :split_idx]
-                        else:
-                            quality_neutral = neutral_arr[:, split_idx:]
-                            quality_mvc = mvc_arr[:, split_idx:]
-                        quality_scope = (
-                            f"{config.arm} arm channels "
-                            f"({quality_neutral.shape[1]}/{neutral_arr.shape[1]})"
-                        )
+                    quality_neutral = _slice_channel_matrix(neutral_arr, selected_channel_indices)
+                    quality_mvc = _slice_channel_matrix(mvc_arr, selected_channel_indices)
+                    quality_scope = (
+                        f"{config.arm} arm channels "
+                        f"({quality_neutral.shape[1]}/{neutral_arr.shape[1]})"
+                    )
 
                     neutral_rms = np.sqrt(np.mean(quality_neutral ** 2, axis=0))
                     mvc_rms = np.sqrt(np.mean(quality_mvc ** 2, axis=0))
@@ -1320,9 +1336,13 @@ class CollectDataWindow(QWidget):
             status_text = "Protocol complete." if not self.protocol_abort else "Protocol stopped early."
             self.update_instruction(status_text, None, 0, 0)
 
-        X = np.asarray(all_x, dtype=float)
-        timestamps = np.asarray(all_ts, dtype=float)
+        X = _slice_channel_matrix(all_x, selected_channel_indices)
+        timestamps = _slice_channel_matrix(all_ts, selected_channel_indices)
         y = np.asarray(all_labels, dtype=object)
+        calib_neutral_X = _slice_channel_matrix(calib_neutral_x, selected_channel_indices)
+        calib_neutral_timestamps = _slice_channel_matrix(calib_neutral_ts, selected_channel_indices)
+        calib_mvc_X = _slice_channel_matrix(calib_mvc_x, selected_channel_indices)
+        calib_mvc_timestamps = _slice_channel_matrix(calib_mvc_ts, selected_channel_indices)
 
         metadata = {
             "subject": config.subject,
@@ -1335,14 +1355,17 @@ class CollectDataWindow(QWidget):
             "gesture_duration_s": config.gesture_duration,
             "neutral_duration_s": config.neutral_duration,
             "repetitions": config.repetitions,
-            "channel_count": channel_count,
+            "channel_count": selected_channel_count,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "prep_duration_s": config.prep_duration,
             "inter_gesture_rest_s": config.inter_gesture_rest_s,
             "label_trim_s": config.label_trim_s,
             "rest_label_trim_s": rest_trim_s,
             "ramp_style": "ramp contractions (longer window for non-neutral gestures)",
-            "emg_channel_labels": list(getattr(self.CallbackConnector.base, "emgChannelNames", [])),
+            "emg_channel_labels": selected_channel_labels,
+            "source_channel_count": channel_count,
+            "source_emg_channel_labels": channel_labels,
+            "saved_channel_indices": selected_channel_indices.tolist(),
         }
         if config.protocol_name == "neutral_recovery":
             metadata["neutral_recovery"] = {
@@ -1376,10 +1399,10 @@ class CollectDataWindow(QWidget):
         if config.calibrate:
             save_kwargs.update(
                 {
-                    "calib_neutral_X": np.asarray(calib_neutral_x, dtype=float),
-                    "calib_neutral_timestamps": np.asarray(calib_neutral_ts, dtype=float),
-                    "calib_mvc_X": np.asarray(calib_mvc_x, dtype=float),
-                    "calib_mvc_timestamps": np.asarray(calib_mvc_ts, dtype=float),
+                    "calib_neutral_X": calib_neutral_X,
+                    "calib_neutral_timestamps": calib_neutral_timestamps,
+                    "calib_mvc_X": calib_mvc_X,
+                    "calib_mvc_timestamps": calib_mvc_timestamps,
                 }
             )
         np.savez_compressed(output_path, **save_kwargs)

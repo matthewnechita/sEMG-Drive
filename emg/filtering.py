@@ -83,8 +83,7 @@ def define_filters(fs):
     IMPORTANT: after changing any parameter here you must:
       1. Delete all data_resampled_strict/**/*_filtered.npz files
       2. python emg/filtering.py          (re-filter raw data + calibration)
-      3. python tools/recalibrate.py --apply
-      4. Retrain both models
+      3. Retrain the affected models
     """
     fi = libemg_filter.Filter(fs)
     fi.install_filters({"name": "notch",    "cutoff": 60,        "bandwidth": 3})

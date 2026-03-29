@@ -1,72 +1,44 @@
-"""Cross-subject EMG gesture classifier training.
-
-Supports the existing `cnn_v2` path and the metric-learning `metric_tcn`
-variant. Zero-shot LOSO remains the baseline cross-subject metric, while the
-metric-TCN path can also run a prototype-based calibrated LOSO pass.
-
-Usage:
-    python train_cross_subject.py
-
-To run realtime inference with the cross-subject model:
-    python realtime_gesture_cnn.py --model models/strict/cross_subject/right/gesture_cnn_v3_3_gestures.pt
-
-DQ note: subject05 is excluded by default (EXCLUDED_SUBJECTS below).
-All 4 sessions show MVC/neutral ratio <= 1.8x — the MVC calibration failed,
-meaning mvc-normalised signal is near noise level for this subject.
-Recollect calibration for subject05 before re-including them.
-"""
 import datetime as dt
 import copy
 import time
 from pathlib import Path
-from typing import Any, Protocol, cast
 
 import numpy as np
 import torch
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    classification_report,
-    confusion_matrix,
-)
+from sklearn.metrics import accuracy_score
 from sklearn.model_selection import GroupShuffleSplit
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from libemg.utils import get_windows
-from emg.model_family import (
-    ModelFamilyConfig,
+from emg.cnn_training import (
     build_architecture_metadata,
-    build_family_metadata,
+    build_model_metadata,
     build_model,
-    build_training_objectives,
+    build_training_objective,
     compute_training_step,
     prepare_train_eval_inputs,
     standardize_windows,
-    supports_prototype_calibration,
-    validate_model_family,
 )
-from emg.prototype_classifier import PrototypeClassifier
-from emg.strict_layout import (
-    resolve_strict_indices_from_metadata,
-    strict_channel_count_for_arm,
-    strict_layout_bundle_metadata,
+from emg.eval_utils import (
+    compute_eval_artifacts,
+    print_eval_summary,
+    serialize_eval_metrics,
+)
+from emg.strict_layout import strict_channel_count_for_arm, strict_layout_bundle_metadata
+from emg.training_data import (
+    DEFAULT_MVC_MIN_RATIO,
+    load_strict_windows_from_file,
+    print_missing_calibration_warning,
+    subject_from_path,
+    validate_calibration_data,
 )
 from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_root
-
-
-class SupportsExtractEmbedding(Protocol):
-    def extract_embedding(
-        self,
-        x: torch.Tensor,
-        l2_normalize: bool = False,
-    ) -> torch.Tensor: ...
 
 
 # ======== Config ========
 ARM        = "left"            # ← set to "right" or "left" before running, lowercase l
 DATA_ROOT  = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
-MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "metrics_test.pt"
+MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "v6_4_gestures.pt"
 PATTERN    = "*_filtered.npz"
 
 WINDOW_SIZE = 200
@@ -82,8 +54,6 @@ RANDOM_STATE = 42
 BATCH_SIZE   = 512
 
 # Cross-subject hyperparameters.
-# Keep these shared across model families unless a specific experiment needs
-# a model-family-specific override.
 EPOCHS  = 50
 LR      = 1e-4
 DROPOUT = 0.25
@@ -96,7 +66,6 @@ LABEL_SMOOTHING = 0.05
 USE_AUGMENTATION = True
 AMP_RANGE = (0.5, 2.0)   # wide inter-subject amplitude variance range
 AUG_PROB  = 0.5
-CHANNEL_LAYOUT_MODE = "strict"  # "strict" or "none"
 
 # Subjects with failed MVC calibration or other DQ issues.
 # subject05: all 4 sessions have mvc_ratio <= 1.8x (MVC barely > neutral).
@@ -113,329 +82,23 @@ INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "hor
 # This measures true cross-subject accuracy (model vs subjects it never trained on).
 # Minimum recommended LOSO accuracy before deployment: 65%.
 LOSO_EVAL = True
-CALIBRATED_LOSO_EVAL = False
 TRAIN_FINAL_MODEL = True
-MODEL_FAMILY = "cnn_v2"  # "cnn_v2" or "metric_tcn"
-METRIC_TCN_CHANNELS = (64, 64, 128, 128)
-METRIC_TCN_KERNEL_SIZE = 5
-METRIC_TCN_EMBEDDING_DIM = 128
-SUPCON_WEIGHT = 0.20
-SUPCON_TEMPERATURE = 0.10
-PROTOTYPE_TEMPERATURE = 0.20
-PROTOTYPE_L2_NORMALIZE = True
 
 # ========================
-
-MODEL_FAMILY = validate_model_family(MODEL_FAMILY)
-FAMILY_CFG = ModelFamilyConfig(
-    model_family=MODEL_FAMILY,
-    metric_tcn_channels=METRIC_TCN_CHANNELS,
-    metric_tcn_kernel_size=METRIC_TCN_KERNEL_SIZE,
-    metric_tcn_embedding_dim=METRIC_TCN_EMBEDDING_DIM,
-    supcon_weight=SUPCON_WEIGHT,
-    supcon_temperature=SUPCON_TEMPERATURE,
-)
 
 
 # ── Label utilities ──────────────────────────────────────────────────────────
 
-def majority_label_with_confidence(segment):
-    if segment.size == 0:
-        return None, 0.0
-    flat = segment.reshape(-1)
-    if flat.dtype == object:
-        cleaned = []
-        for x in flat:
-            if x is None:
-                continue
-            if isinstance(x, bytes):
-                try:
-                    x = x.decode("utf-8")
-                except Exception:
-                    continue
-            if isinstance(x, np.str_):
-                x = str(x)
-            cleaned.append(x)
-        flat = np.array(cleaned, dtype=object)
-        if flat.size == 0:
-            return None, 0.0
-    if flat.dtype.kind in "fc":
-        flat = flat[~np.isnan(flat)]
-    if flat.size == 0:
-        return None, 0.0
-    values, counts = np.unique(flat, return_counts=True)
-    if counts.size == 0:
-        return None, 0.0
-    idx = counts.argmax()
-    total = counts.sum()
-    confidence = float(counts[idx] / total) if total > 0 else 0.0
-    return values[idx], confidence
-
-
-def _normalize_rows(cm: np.ndarray) -> np.ndarray:
-    row_sums = cm.sum(axis=1, keepdims=True).astype(float)
-    out = np.zeros_like(cm, dtype=float)
-    np.divide(cm, row_sums, out=out, where=row_sums != 0)
-    return out
-
-
-def _normalize_cols(cm: np.ndarray) -> np.ndarray:
-    col_sums = cm.sum(axis=0, keepdims=True).astype(float)
-    out = np.zeros_like(cm, dtype=float)
-    np.divide(cm, col_sums, out=out, where=col_sums != 0)
-    return out
-
-
-def _print_confusion_matrix(title: str, matrix: np.ndarray, label_names: list[str], as_percent: bool):
-    row_w = max(8, max(len(name) for name in label_names))
-    cell_w = max(8, max(len(name) for name in label_names))
-    header = " " * (row_w + 3) + " ".join(f"{name:>{cell_w}}" for name in label_names)
-    print(f"\n{title}")
-    print(header)
-    for i, name in enumerate(label_names):
-        if as_percent:
-            row = " ".join(f"{(100.0 * float(v)):>{cell_w}.1f}" for v in matrix[i])
-        else:
-            row = " ".join(f"{int(v):>{cell_w}d}" for v in matrix[i])
-        print(f"{name:>{row_w}} | {row}")
-
-
-def _compute_eval_artifacts(y_true, y_pred, index_to_label):
-    label_indices = list(range(len(index_to_label)))
-    label_names = [index_to_label[i] for i in label_indices]
-
-    report_text = classification_report(
-        y_true,
-        y_pred,
-        labels=label_indices,
-        target_names=label_names,
-        zero_division=0,
-    )
-    report_dict_raw = classification_report(
-        y_true,
-        y_pred,
-        labels=label_indices,
-        target_names=label_names,
-        output_dict=True,
-        zero_division=0,
-    )
-    if not isinstance(report_dict_raw, dict):
-        raise TypeError("classification_report(output_dict=True) did not return a dict.")
-    report_dict: dict[str, Any] = {str(k): v for k, v in report_dict_raw.items()}
-
-    cm_counts = confusion_matrix(y_true, y_pred, labels=label_indices)
-    cm_row_norm = _normalize_rows(cm_counts)
-    cm_col_norm = _normalize_cols(cm_counts)
-
-    per_class = []
-    for name in label_names:
-        stats_obj = report_dict.get(name, {})
-        stats = stats_obj if isinstance(stats_obj, dict) else {}
-        precision = float(stats.get("precision", 0.0))
-        recall = float(stats.get("recall", 0.0))
-        f1 = float(stats.get("f1-score", 0.0))
-        per_class.append(
-            {
-                "label": name,
-                "precision": precision,
-                "recall": recall,
-                "f1": f1,
-                "pr_gap": abs(precision - recall),
-            }
-        )
-
-    worst_recall = min(per_class, key=lambda item: item["recall"]) if per_class else None
-
-    confusion_to_neutral_rate = {}
-    neutral_prediction_fp_rate = None
-    if "neutral" in label_names:
-        neutral_idx = label_names.index("neutral")
-        for i, name in enumerate(label_names):
-            if i == neutral_idx:
-                continue
-            row_total = int(cm_counts[i].sum())
-            rate = float(cm_counts[i, neutral_idx] / row_total) if row_total > 0 else 0.0
-            confusion_to_neutral_rate[name] = rate
-
-        pred_neutral_total = int(cm_counts[:, neutral_idx].sum())
-        neutral_tp = int(cm_counts[neutral_idx, neutral_idx])
-        neutral_fp = pred_neutral_total - neutral_tp
-        neutral_prediction_fp_rate = (
-            float(neutral_fp / pred_neutral_total) if pred_neutral_total > 0 else 0.0
-        )
-
-    macro_avg_obj = report_dict.get("macro avg", {})
-    macro_avg = macro_avg_obj if isinstance(macro_avg_obj, dict) else {}
-    weighted_avg_obj = report_dict.get("weighted avg", {})
-    weighted_avg = weighted_avg_obj if isinstance(weighted_avg_obj, dict) else {}
-
-    return {
-        "classification_report_text": report_text,
-        "classification_report_dict": report_dict,
-        "confusion_matrix_counts": cm_counts,
-        "confusion_matrix_row_norm": cm_row_norm,
-        "confusion_matrix_col_norm": cm_col_norm,
-        "per_class": per_class,
-        "test_accuracy": float(accuracy_score(y_true, y_pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "macro_precision": float(macro_avg.get("precision", 0.0)),
-        "macro_recall": float(macro_avg.get("recall", 0.0)),
-        "macro_f1": float(macro_avg.get("f1-score", 0.0)),
-        "weighted_precision": float(weighted_avg.get("precision", 0.0)),
-        "weighted_recall": float(weighted_avg.get("recall", 0.0)),
-        "weighted_f1": float(weighted_avg.get("f1-score", 0.0)),
-        "worst_class_recall_label": worst_recall["label"] if worst_recall else None,
-        "worst_class_recall": worst_recall["recall"] if worst_recall else None,
-        "max_pr_gap_label": max(per_class, key=lambda item: item["pr_gap"])["label"] if per_class else None,
-        "max_pr_gap": max((item["pr_gap"] for item in per_class), default=None),
-        "confusion_to_neutral_rate": confusion_to_neutral_rate,
-        "neutral_prediction_fp_rate": neutral_prediction_fp_rate,
-    }
-
-
-def _serialize_eval_metrics(eval_artifacts: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "test_accuracy": float(eval_artifacts["test_accuracy"]),
-        "balanced_accuracy": float(eval_artifacts["balanced_accuracy"]),
-        "macro_precision": float(eval_artifacts["macro_precision"]),
-        "macro_recall": float(eval_artifacts["macro_recall"]),
-        "macro_f1": float(eval_artifacts["macro_f1"]),
-        "weighted_precision": float(eval_artifacts["weighted_precision"]),
-        "weighted_recall": float(eval_artifacts["weighted_recall"]),
-        "weighted_f1": float(eval_artifacts["weighted_f1"]),
-        "worst_class_recall_label": eval_artifacts["worst_class_recall_label"],
-        "worst_class_recall": eval_artifacts["worst_class_recall"],
-        "max_precision_recall_gap_label": eval_artifacts["max_pr_gap_label"],
-        "max_precision_recall_gap": eval_artifacts["max_pr_gap"],
-        "confusion_to_neutral_rate": eval_artifacts["confusion_to_neutral_rate"],
-        "neutral_prediction_fp_rate": eval_artifacts["neutral_prediction_fp_rate"],
-        "confusion_matrix_counts": eval_artifacts["confusion_matrix_counts"].tolist(),
-        "confusion_matrix_row_norm": eval_artifacts["confusion_matrix_row_norm"].tolist(),
-        "confusion_matrix_col_norm": eval_artifacts["confusion_matrix_col_norm"].tolist(),
-    }
+MVC_QUALITY_MIN_RATIO = DEFAULT_MVC_MIN_RATIO
 
 
 # ── Calibration ──────────────────────────────────────────────────────────────
 
-MVC_QUALITY_MIN_RATIO = 1.5  # skip MVC normalization if median ratio falls below this
 
-def compute_calibration(neutral_emg, mvc_emg, percentile):
-    neutral = np.asarray(neutral_emg, dtype=float)
-    mvc     = np.asarray(mvc_emg, dtype=float)
-    if neutral.size == 0 or mvc.size == 0:
-        return None, None
-
-    neutral_rms = np.sqrt(np.mean(neutral ** 2, axis=0))
-    mvc_rms     = np.sqrt(np.mean(mvc ** 2, axis=0))
-    ratio       = np.where(neutral_rms < 1e-9, 1.0, mvc_rms / neutral_rms)
-    median_ratio = float(np.median(ratio))
-
-    if median_ratio < MVC_QUALITY_MIN_RATIO:
-        print(
-            f"  [calib] SKIP: median MVC/neutral ratio={median_ratio:.2f}x "
-            f"(< {MVC_QUALITY_MIN_RATIO}x threshold). "
-            "MVC calibration failed — normalization not applied for this session."
-        )
-        return None, None
-
-    neutral_mean = np.mean(neutral, axis=0)
-    mvc_scale    = np.percentile(mvc, percentile, axis=0)
-    mvc_scale    = np.where(mvc_scale < 1e-6, 1.0, mvc_scale)
-    return neutral_mean, mvc_scale
-
-
-def validate_calibration_data(files):
-    missing = []
-    for fp in files:
-        try:
-            data = np.load(fp, allow_pickle=True)
-            if data.get("calib_neutral_emg") is None or data.get("calib_mvc_emg") is None:
-                missing.append(fp)
-        except Exception:
-            missing.append(fp)
-    if missing:
-        print(
-            f"WARNING: {len(missing)} file(s) lack calibration data. "
-            "Calibration normalisation will be skipped for these sessions."
-        )
-        for fp in missing[:5]:
-            print(f"  {fp}")
-        if len(missing) > 5:
-            print(f"  ... and {len(missing) - 5} more.")
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
 
-def subject_from_path(path: Path) -> str:
-    return path.parent.parent.name
-
-
-def _keep_gesture_label(label) -> bool:
-    if label is None:
-        return False
-    label = str(label)
-    if INCLUDED_GESTURES is not None and label not in INCLUDED_GESTURES:
-        return False
-    return True
-
-
-def load_windows_from_file(path):
-    data = np.load(path, allow_pickle=True)
-    if "emg" not in data.files or "y" not in data.files:
-        return None
-    emg = np.asarray(data["emg"], dtype=float)
-    metadata = data.get("metadata")
-    strict_layout = None
-    if CHANNEL_LAYOUT_MODE == "strict":
-        strict_layout = resolve_strict_indices_from_metadata(metadata, arm=ARM)
-        if emg.shape[1] != strict_layout.ordered_indices.size:
-            raise ValueError(
-                f"{path.name}: strict layout resolved {strict_layout.ordered_indices.size} channels "
-                f"for {ARM}, but file has {emg.shape[1]}."
-            )
-        emg = emg[:, strict_layout.ordered_indices]
-
-    if USE_CALIBRATION:
-        calib_neutral = data.get("calib_neutral_emg")
-        calib_mvc     = data.get("calib_mvc_emg")
-        if calib_neutral is not None and calib_mvc is not None:
-            calib_neutral = np.asarray(calib_neutral, dtype=float)
-            calib_mvc = np.asarray(calib_mvc, dtype=float)
-            if strict_layout is not None:
-                calib_neutral = calib_neutral[:, strict_layout.ordered_indices]
-                calib_mvc = calib_mvc[:, strict_layout.ordered_indices]
-            neutral_mean, mvc_scale = compute_calibration(
-                calib_neutral, calib_mvc, MVC_PERCENTILE
-            )
-            if neutral_mean is not None and mvc_scale is not None:
-                emg = (emg - neutral_mean) / mvc_scale
-
-    windows = get_windows(emg, WINDOW_SIZE, WINDOW_STEP)
-    labels  = np.asarray(data["y"], dtype=object)
-
-    n_windows = windows.shape[0]
-    starts    = np.arange(n_windows) * WINDOW_STEP
-    ends      = starts + WINDOW_SIZE
-
-    window_labels = []
-    for s, e in zip(starts, ends):
-        lbl, confidence = majority_label_with_confidence(labels[s:e])
-        if lbl == "neutral_buffer":
-            lbl = None
-        if USE_MIN_LABEL_CONFIDENCE and lbl is not None and confidence < MIN_LABEL_CONFIDENCE:
-            lbl = None
-        if lbl is not None and not _keep_gesture_label(lbl):
-            lbl = None
-        window_labels.append(lbl)
-
-    window_labels = np.asarray(window_labels, dtype=object)
-    keep          = window_labels != None  # noqa: E711
-    windows       = windows[keep]
-    window_labels = window_labels[keep]
-
-    if windows.size == 0:
-        return None
-    return windows.astype(np.float32), window_labels, strict_layout
 
 
 def load_dataset():
@@ -451,7 +114,7 @@ def load_dataset():
         print(f"Excluded subjects (DQ policy): {EXCLUDED_SUBJECTS}")
 
     if USE_CALIBRATION:
-        validate_calibration_data(files)
+        print_missing_calibration_warning(validate_calibration_data(files))
 
     X_list, y_list, groups_list, subjects_list, channel_counts = [], [], [], [], []
     layout_sources: dict[str, int] = {}
@@ -459,32 +122,43 @@ def load_dataset():
     strict_slot_order = None
     strict_channel_counts = None
     for fp in files:
-        result = load_windows_from_file(fp)
-        if result is None:
+        windowed = load_strict_windows_from_file(
+            fp,
+            arm=ARM,
+            window_size=WINDOW_SIZE,
+            window_step=WINDOW_STEP,
+            use_calibration=USE_CALIBRATION,
+            mvc_percentile=MVC_PERCENTILE,
+            mvc_min_ratio=MVC_QUALITY_MIN_RATIO,
+            use_min_label_confidence=USE_MIN_LABEL_CONFIDENCE,
+            min_label_confidence=MIN_LABEL_CONFIDENCE,
+            included_gestures=INCLUDED_GESTURES,
+            verbose_calibration_skip=True,
+        )
+        if windowed is None:
             continue
-        windows, labels, strict_layout = result
+        windows = windowed.windows
+        labels = windowed.labels
+        strict_layout = windowed.strict_layout
         X_list.append(windows)
         y_list.append(labels)
         groups_list.append(np.array([str(fp)] * len(labels), dtype=object))
         subjects_list.append(np.array([subject_from_path(fp)] * len(labels), dtype=object))
         channel_counts.append(int(windows.shape[1]))
-        if CHANNEL_LAYOUT_MODE == "strict":
-            if strict_layout is None:
-                raise ValueError(f"{fp.name}: strict layout resolution failed unexpectedly.")
-            layout_sources["emg_channel_labels"] = layout_sources.get("emg_channel_labels", 0) + 1
-            if strict_pair_order is None:
-                strict_pair_order = tuple(strict_layout.pair_numbers)
-                strict_slot_order = tuple(strict_layout.slot_names)
-                strict_channel_counts = tuple(strict_layout.channel_counts)
-            elif (
-                tuple(strict_layout.pair_numbers) != strict_pair_order
-                or tuple(strict_layout.slot_names) != strict_slot_order
-                or tuple(strict_layout.channel_counts) != strict_channel_counts
-            ):
-                raise ValueError(
-                    f"Inconsistent strict slot mapping while loading {fp.name}: "
-                    f"pairs={tuple(strict_layout.pair_numbers)}"
-                )
+        layout_sources["emg_channel_labels"] = layout_sources.get("emg_channel_labels", 0) + 1
+        if strict_pair_order is None:
+            strict_pair_order = tuple(strict_layout.pair_numbers)
+            strict_slot_order = tuple(strict_layout.slot_names)
+            strict_channel_counts = tuple(strict_layout.channel_counts)
+        elif (
+            tuple(strict_layout.pair_numbers) != strict_pair_order
+            or tuple(strict_layout.slot_names) != strict_slot_order
+            or tuple(strict_layout.channel_counts) != strict_channel_counts
+        ):
+            raise ValueError(
+                f"Inconsistent strict slot mapping while loading {fp.name}: "
+                f"pairs={tuple(strict_layout.pair_numbers)}"
+            )
 
     if not X_list:
         raise ValueError("No labeled windows found in filtered files.")
@@ -505,7 +179,7 @@ def load_dataset():
 
 # ── Normalisation ─────────────────────────────────────────────────────────────
 def _prepare_test_data(X, _mean, _std):
-    return standardize_windows(X, _mean, _std, model_family=MODEL_FAMILY)
+    return standardize_windows(X, _mean, _std)
 
 
 # ── Augmentation (GPU-native) ─────────────────────────────────────────────────
@@ -581,37 +255,11 @@ def make_subject_sample_weights(subjects: np.ndarray) -> np.ndarray:
 
 def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
     return build_model(
-        MODEL_FAMILY,
         in_channels=in_channels,
         num_classes=num_classes,
         dropout=DROPOUT,
         device=device,
-        family_cfg=FAMILY_CFG,
     )
-
-
-def _embed_windows(model: nn.Module, X: np.ndarray, device, *, l2_normalize: bool) -> np.ndarray:
-    model.eval()
-    loader = DataLoader(TensorDataset(torch.from_numpy(X.astype(np.float32))), batch_size=BATCH_SIZE, shuffle=False)
-    chunks = []
-    with torch.no_grad():
-        for (xb,) in loader:
-            xb = xb.to(device)
-            extract_embedding = getattr(model, "extract_embedding", None)
-            if callable(extract_embedding):
-                emb_tensor = cast(SupportsExtractEmbedding, model).extract_embedding(
-                    xb,
-                    l2_normalize=l2_normalize,
-                )
-            else:
-                logits = model(xb)
-                emb_tensor = logits
-                if l2_normalize:
-                    emb_tensor = torch.nn.functional.normalize(emb_tensor, p=2, dim=1, eps=1e-8)
-            chunks.append(emb_tensor.detach().cpu().numpy())
-    if not chunks:
-        return np.empty((0, 0), dtype=np.float32)
-    return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -630,9 +278,7 @@ def train_eval_split(
     use_eval_for_model_selection=True,
     use_eval_for_scheduler=True,
 ):
-    X_train_t, X_eval_t, mean, std = prepare_train_eval_inputs(
-        MODEL_FAMILY, X_train, X_eval
-    )
+    X_train_t, X_eval_t, mean, std = prepare_train_eval_inputs(X_train, X_eval)
 
     train_ds = TensorDataset(torch.from_numpy(X_train_t), torch.from_numpy(y_train))
     eval_ds  = TensorDataset(torch.from_numpy(X_eval_t),  torch.from_numpy(y_eval))
@@ -653,11 +299,7 @@ def train_eval_split(
 
     model = _build_model(int(channels[0]), num_classes, device)
 
-    objectives = build_training_objectives(
-        MODEL_FAMILY,
-        label_smoothing=LABEL_SMOOTHING,
-        family_cfg=FAMILY_CFG,
-    )
+    objective = build_training_objective(label_smoothing=LABEL_SMOOTHING)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     # patience=5: cross-subject dataset is large; loss moves slowly
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -678,12 +320,10 @@ def train_eval_split(
                 xb = augment_emg_gpu(xb, p=AUG_PROB)
             optimizer.zero_grad()
             logits, loss = compute_training_step(
-                MODEL_FAMILY,
                 model,
                 xb,
                 yb,
-                objectives=objectives,
-                family_cfg=FAMILY_CFG,
+                objective=objective,
             )
             loss.backward()
             optimizer.step()
@@ -698,12 +338,10 @@ def train_eval_split(
             for xb, yb in eval_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 logits, l = compute_training_step(
-                    MODEL_FAMILY,
                     model,
                     xb,
                     yb,
-                    objectives=objectives,
-                    family_cfg=FAMILY_CFG,
+                    objective=objective,
                 )
                 eval_loss_sum  += l.item() * xb.size(0)
                 eval_correct   += (torch.argmax(logits, 1) == yb).sum().item()
@@ -783,23 +421,18 @@ def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_
             for xb, _ in test_loader:
                 all_preds.append(torch.argmax(model(xb.to(device)), dim=1).cpu().numpy())
         y_pred = np.concatenate(all_preds)
-        eval_artifacts = _compute_eval_artifacts(y_idx[test_mask], y_pred, index_to_label)
+        eval_artifacts = compute_eval_artifacts(y_idx[test_mask], y_pred, index_to_label)
         acc = float(eval_artifacts["test_accuracy"])
         loso_accs.append(acc)
         fold_results.append(
             {
                 "held_out_subject": str(held_out),
                 "test_windows": int(test_mask.sum()),
-                "metrics": _serialize_eval_metrics(eval_artifacts),
+                "metrics": serialize_eval_metrics(eval_artifacts),
             }
         )
         print(f"    Accuracy: {acc:.3f}")
-        print(classification_report(
-            y_idx[test_mask], y_pred,
-            labels=list(range(len(index_to_label))),
-            target_names=[index_to_label[i] for i in range(len(index_to_label))],
-            zero_division=0,
-        ))
+        print(eval_artifacts["classification_report_text"])
 
     loso_accs = np.asarray(loso_accs, dtype=float)
     print(
@@ -815,7 +448,6 @@ def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_
         )
     return {
         "enabled": True,
-        "model_family": MODEL_FAMILY,
         "folds": fold_results,
         "summary": {
             "mean_accuracy": float(loso_accs.mean()),
@@ -823,191 +455,6 @@ def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_
             "min_accuracy": float(loso_accs.min()),
             "max_accuracy": float(loso_accs.max()),
         },
-    }
-
-
-def _predict_prototype_labels(
-    model: nn.Module,
-    X_support: np.ndarray,
-    y_support: np.ndarray,
-    X_query: np.ndarray,
-    *,
-    mean: np.ndarray,
-    std: np.ndarray,
-    device,
-    num_classes: int,
-) -> np.ndarray:
-    X_support_t = _prepare_test_data(X_support, mean, std)
-    X_query_t = _prepare_test_data(X_query, mean, std)
-    support_embeddings = _embed_windows(
-        model,
-        X_support_t,
-        device,
-        l2_normalize=PROTOTYPE_L2_NORMALIZE,
-    )
-    classifier = PrototypeClassifier.fit(
-        support_embeddings,
-        y_support,
-        temperature=PROTOTYPE_TEMPERATURE,
-        l2_normalize=PROTOTYPE_L2_NORMALIZE,
-    )
-    query_embeddings = _embed_windows(
-        model,
-        X_query_t,
-        device,
-        l2_normalize=PROTOTYPE_L2_NORMALIZE,
-    )
-    if query_embeddings.shape[0] == 0:
-        return np.empty((0,), dtype=np.int64)
-    probs = np.stack(
-        [
-            classifier.predict_proba(emb, num_classes=int(num_classes))
-            for emb in query_embeddings
-        ],
-        axis=0,
-    )
-    return np.argmax(probs, axis=1).astype(np.int64, copy=False)
-
-
-def calibrated_loso_evaluate(
-    X,
-    y_idx,
-    groups,
-    subjects,
-    channel_count,
-    num_classes,
-    device,
-    index_to_label,
-):
-    if not supports_prototype_calibration(MODEL_FAMILY):
-        print("\nCalibrated LOSO skipped: current model family does not prefer prototype calibration.")
-        return {"enabled": False, "reason": "prototype_calibration_not_supported"}
-
-    unique_subjects = sorted(np.unique(subjects))
-    if len(unique_subjects) < 2:
-        print("\nCalibrated LOSO skipped: requires at least 2 subjects.")
-        return {"enabled": False, "reason": "requires_at_least_two_subjects"}
-
-    print(f"\nCalibrated LOSO evaluation over {len(unique_subjects)} subjects:")
-    print("(Held-out session file = support set; remaining held-out sessions = query set)")
-
-    channels = [int(channel_count), 32, 64, 128]
-    required_labels = set(range(int(num_classes)))
-    all_true = []
-    all_pred = []
-    subject_results = []
-    fold_results = []
-
-    for held_out in unique_subjects:
-        train_mask = subjects != held_out
-        subject_mask = subjects == held_out
-        subject_groups = sorted({str(g) for g in groups[subject_mask]})
-        if len(subject_groups) < 2:
-            print(f"\n  Held-out: {held_out} skipped (needs at least 2 session files for support/query split).")
-            continue
-
-        print(f"\n  Held-out: {held_out}  (train {train_mask.sum()}, subject windows {subject_mask.sum()})")
-        model, mean, std, _ = train_eval_split(
-            X[train_mask], y_idx[train_mask],
-            X[subject_mask], y_idx[subject_mask],
-            channels, num_classes, EPOCHS, device,
-            subjects_train=subjects[train_mask],
-            use_eval_for_model_selection=False,
-            use_eval_for_scheduler=False,
-        )
-
-        subject_true = []
-        subject_pred = []
-        subject_fold_results = []
-        for support_group in subject_groups:
-            support_mask = subject_mask & (groups == support_group)
-            query_mask = subject_mask & (groups != support_group)
-            if not np.any(query_mask):
-                continue
-
-            support_labels = set(int(v) for v in np.unique(y_idx[support_mask]).tolist())
-            missing_labels = sorted(required_labels - support_labels)
-            if missing_labels:
-                missing_names = [index_to_label[idx] for idx in missing_labels]
-                print(
-                    f"    Support {Path(str(support_group)).name} skipped: "
-                    f"missing labels {missing_names}"
-                )
-                continue
-
-            y_pred = _predict_prototype_labels(
-                model,
-                X[support_mask],
-                y_idx[support_mask],
-                X[query_mask],
-                mean=mean,
-                std=std,
-                device=device,
-                num_classes=num_classes,
-            )
-            if y_pred.size == 0:
-                continue
-
-            y_true = y_idx[query_mask]
-            eval_artifacts = _compute_eval_artifacts(y_true, y_pred, index_to_label)
-            fold_payload = {
-                "held_out_subject": str(held_out),
-                "support_file": Path(str(support_group)).name,
-                "support_windows": int(support_mask.sum()),
-                "query_windows": int(query_mask.sum()),
-                "metrics": _serialize_eval_metrics(eval_artifacts),
-            }
-            fold_results.append(fold_payload)
-            subject_fold_results.append(fold_payload)
-            subject_true.append(y_true)
-            subject_pred.append(y_pred)
-            all_true.append(y_true)
-            all_pred.append(y_pred)
-            print(
-                f"    Support {Path(str(support_group)).name}: "
-                f"accuracy={eval_artifacts['test_accuracy']:.3f} "
-                f"macro_f1={eval_artifacts['macro_f1']:.3f}"
-            )
-
-        if subject_true:
-            y_true_subject = np.concatenate(subject_true)
-            y_pred_subject = np.concatenate(subject_pred)
-            subject_eval = _compute_eval_artifacts(y_true_subject, y_pred_subject, index_to_label)
-            subject_results.append(
-                {
-                    "held_out_subject": str(held_out),
-                    "support_unit": "session_file",
-                    "fold_count": int(len(subject_fold_results)),
-                    "metrics": _serialize_eval_metrics(subject_eval),
-                    "folds": subject_fold_results,
-                }
-            )
-            print(
-                f"    Subject summary: accuracy={subject_eval['test_accuracy']:.3f} "
-                f"macro_f1={subject_eval['macro_f1']:.3f}"
-            )
-        else:
-            print(f"    No valid support/query splits for {held_out}.")
-
-    if not all_true:
-        print("\nCalibrated LOSO produced no valid support/query folds.")
-        return {"enabled": False, "reason": "no_valid_support_query_splits"}
-
-    overall_true = np.concatenate(all_true)
-    overall_pred = np.concatenate(all_pred)
-    overall_eval = _compute_eval_artifacts(overall_true, overall_pred, index_to_label)
-    print(
-        f"\nCalibrated LOSO summary: accuracy={overall_eval['test_accuracy']:.3f} "
-        f"balanced_accuracy={overall_eval['balanced_accuracy']:.3f} "
-        f"macro_f1={overall_eval['macro_f1']:.3f}"
-    )
-    return {
-        "enabled": True,
-        "model_family": MODEL_FAMILY,
-        "support_unit": "session_file",
-        "subjects": subject_results,
-        "folds": fold_results,
-        "summary": _serialize_eval_metrics(overall_eval),
     }
 
 
@@ -1043,7 +490,7 @@ def _build_bundle(
         "test_size": float(TEST_SIZE),
         "calibration_used": bool(USE_CALIBRATION),
         "calibration_mvc_percentile": float(MVC_PERCENTILE),
-        **build_family_metadata(MODEL_FAMILY, family_cfg=FAMILY_CFG),
+        **build_model_metadata(),
         "label_confidence_filter": {
             "enabled": bool(USE_MIN_LABEL_CONFIDENCE),
             "min_label_confidence": float(MIN_LABEL_CONFIDENCE),
@@ -1089,10 +536,8 @@ def _build_bundle(
         "label_to_index": label_to_index,
         "index_to_label": index_to_label,
         "architecture": build_architecture_metadata(
-            MODEL_FAMILY,
             int(channel_count),
             dropout=DROPOUT,
-            family_cfg=FAMILY_CFG,
         ),
         "metadata": metadata,
     }
@@ -1124,7 +569,7 @@ def _train_and_save(
     test_files  = sorted({str(g) for g in groups[test_idx]})
     print(f"Train ({len(train_files)} files): {[Path(f).name for f in train_files]}")
     print(f"Test  ({len(test_files)} files):  {[Path(f).name for f in test_files]}")
-    print(f"\nTraining {MODEL_FAMILY} for {EPOCHS} epochs on {len(train_idx)} windows.")
+    print(f"\nTraining GestureCNNv2 for {EPOCHS} epochs on {len(train_idx)} windows.")
 
     model, mean, std, _ = train_eval_split(
         X[train_idx], y_idx[train_idx],
@@ -1146,66 +591,14 @@ def _train_and_save(
     y_pred = np.concatenate(all_preds)
     y_test = y_idx[test_idx]
 
-    eval_artifacts = _compute_eval_artifacts(y_test, y_pred, index_to_label)
-    test_accuracy = float(eval_artifacts["test_accuracy"])
-    print(f"\nIn-distribution test accuracy: {test_accuracy:.3f}")
+    eval_artifacts = compute_eval_artifacts(y_test, y_pred, index_to_label)
     print("(Note: this is NOT the cross-subject accuracy. See LOSO results above.)")
-    print("\nReport:\n", eval_artifacts["classification_report_text"])
-    _print_confusion_matrix(
-        "Confusion matrix (counts, rows=true, cols=pred):",
-        eval_artifacts["confusion_matrix_counts"],
+    print_eval_summary(
+        "In-distribution test summary",
+        "accuracy",
+        eval_artifacts,
         [index_to_label[i] for i in range(len(labels))],
-        as_percent=False,
     )
-    _print_confusion_matrix(
-        "Confusion matrix (row-normalized %, rows=true, cols=pred):",
-        eval_artifacts["confusion_matrix_row_norm"],
-        [index_to_label[i] for i in range(len(labels))],
-        as_percent=True,
-    )
-    _print_confusion_matrix(
-        "Confusion matrix (col-normalized %, rows=true, cols=pred):",
-        eval_artifacts["confusion_matrix_col_norm"],
-        [index_to_label[i] for i in range(len(labels))],
-        as_percent=True,
-    )
-
-    print("\nCore metrics:")
-    print(f"  balanced_accuracy: {eval_artifacts['balanced_accuracy']:.3f}")
-    print(
-        f"  macro P/R/F1: "
-        f"{eval_artifacts['macro_precision']:.3f} / "
-        f"{eval_artifacts['macro_recall']:.3f} / "
-        f"{eval_artifacts['macro_f1']:.3f}"
-    )
-    print(
-        f"  weighted P/R/F1: "
-        f"{eval_artifacts['weighted_precision']:.3f} / "
-        f"{eval_artifacts['weighted_recall']:.3f} / "
-        f"{eval_artifacts['weighted_f1']:.3f}"
-    )
-    if eval_artifacts["worst_class_recall_label"] is not None:
-        print(
-            f"  worst_class_recall: "
-            f"{eval_artifacts['worst_class_recall_label']} = "
-            f"{eval_artifacts['worst_class_recall']:.3f}"
-        )
-    if eval_artifacts["max_pr_gap_label"] is not None:
-        print(
-            f"  max_precision_recall_gap: "
-            f"{eval_artifacts['max_pr_gap_label']} = "
-            f"{eval_artifacts['max_pr_gap']:.3f}"
-        )
-
-    if eval_artifacts["confusion_to_neutral_rate"]:
-        print("  confusion_to_neutral_rate:")
-        for label, rate in sorted(eval_artifacts["confusion_to_neutral_rate"].items()):
-            print(f"    {label} -> neutral: {rate:.3f}")
-    if eval_artifacts["neutral_prediction_fp_rate"] is not None:
-        print(
-            f"  neutral_prediction_fp_rate: "
-            f"{eval_artifacts['neutral_prediction_fp_rate']:.3f}"
-        )
 
     test_subjects = subjects[test_idx]
     unique_test   = np.unique(test_subjects)
@@ -1215,22 +608,13 @@ def _train_and_save(
             mask = test_subjects == subj
             print(f"  {subj}: {accuracy_score(y_test[mask], y_pred[mask]):.3f}  ({mask.sum()} windows)")
 
-    extra_metadata = None
-    if CHANNEL_LAYOUT_MODE == "strict":
-        extra_metadata = {
-            "channel_layout": {
-                **strict_layout_bundle_metadata(ARM),
-                "type_canonicalization_enabled": False,
-                "canonical_block_order": [],
-                "permutation_groups": [],
-                "permutation_augmentation_enabled": False,
-                "layout_inference_sources": dict(layout_sources),
-                "kind_counts": {},
-            }
+    extra_metadata = {
+        "channel_layout": {
+            **strict_layout_bundle_metadata(ARM),
+            "layout_inference_sources": dict(layout_sources),
         }
+    }
     if evaluation_metadata:
-        if extra_metadata is None:
-            extra_metadata = {}
         extra_metadata["evaluation"] = evaluation_metadata
 
     bundle = _build_bundle(
@@ -1258,13 +642,6 @@ def _train_and_save(
 def main():
     if ARM not in ("right", "left"):
         raise ValueError(f"ARM must be 'right' or 'left', got {ARM!r}")
-    if CHANNEL_LAYOUT_MODE not in ("strict", "none"):
-        raise ValueError(
-            f"CHANNEL_LAYOUT_MODE must be 'strict' or 'none', got {CHANNEL_LAYOUT_MODE!r}"
-        )
-    validate_model_family(MODEL_FAMILY)
-    if CALIBRATED_LOSO_EVAL and not LOSO_EVAL:
-        raise ValueError("CALIBRATED_LOSO_EVAL requires LOSO_EVAL = True.")
     confirm = input(f"Training {ARM} arm cross-subject model — continue? [y/N] ").strip().lower()
     if confirm != "y":
         print("Aborted.")
@@ -1280,16 +657,15 @@ def main():
         f"{len(np.unique(y))} classes, {len(unique_subjects)} subject(s): "
         f"{unique_subjects}"
     )
-    print(f"Model family: {MODEL_FAMILY}")
-    if CHANNEL_LAYOUT_MODE == "strict":
-        expected_channels = strict_channel_count_for_arm(ARM)
-        if channel_count != expected_channels:
-            raise ValueError(
-                f"Strict layout for {ARM} expects {expected_channels} channels, got {channel_count}."
-            )
-        print(
-            f"Channel layout mode: STRICT ({ARM}) | pairs={strict_layout_bundle_metadata(ARM)['pair_order']}"
+    expected_channels = strict_channel_count_for_arm(ARM)
+    if channel_count != expected_channels:
+        raise ValueError(
+            f"Strict layout for {ARM} expects {expected_channels} channels, got {channel_count}."
         )
+    print("Model architecture: GestureCNNv2")
+    print(
+        f"Channel layout mode: STRICT ({ARM}) | pairs={strict_layout_bundle_metadata(ARM)['pair_order']}"
+    )
 
     labels         = sorted({str(lbl) for lbl in np.unique(y)})
     if INCLUDED_GESTURES is not None:
@@ -1311,17 +687,6 @@ def main():
         evaluation_metadata["zero_shot_loso"] = loso_evaluate(
             X, y_idx, subjects, channel_count, num_classes, device, index_to_label
         )
-        if CALIBRATED_LOSO_EVAL:
-            evaluation_metadata["calibrated_loso"] = calibrated_loso_evaluate(
-                X,
-                y_idx,
-                groups,
-                subjects,
-                channel_count,
-                num_classes,
-                device,
-                index_to_label,
-            )
 
     if not TRAIN_FINAL_MODEL:
         print("\nTRAIN_FINAL_MODEL = False; skipping pooled final fit.")

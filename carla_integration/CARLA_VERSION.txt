@@ -1,3 +1,0 @@
-CARLA_VERSION=0.9.15
-CARLA_ROOT=C:\Users\matth\Desktop\CARLA_0.9.15
-SOURCE_EXAMPLES=C:\Users\matth\Desktop\CARLA_0.9.15\PythonAPI\examples

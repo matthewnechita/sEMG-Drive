@@ -1,85 +1,90 @@
-# Evaluation Metrics Scripts
+# Evaluation Metrics
 
-This folder holds evaluation and reporting utilities that are separate from the
-top-level training and realtime entrypoints.
+This folder holds the maintained evaluation pipeline for offline model metrics, end-to-end latency, and CARLA driving metrics.
 
-## Scripts
+## Core scripts
 
 - `harvest_model_metrics.py`
-  - Scan saved model bundles and export their stored offline metrics.
-  - Useful for building the 3-gesture / 5-gesture and per-subject / cross-subject tables.
-
+  - Read saved CNN bundles and export the final offline metric set.
+- `gather_current_metrics.py`
+  - Stage a current snapshot from tracked model bundles and CARLA run artifacts.
 - `plot_model_accuracy_bars.py`
-  - Plot harvested offline accuracy bars from `model_metrics.csv`.
-  - Useful for replotting per-subject vs cross-subject model comparisons after filtering to one model family.
-
-- `plot_filter_effect.py`
-  - Compare one raw `.npz` file against its filtered `.npz` counterpart.
-  - Saves a figure with a time-domain overlay and PSD comparison.
-
-- `compare_realtime_runs.py`
-  - Compare two prompted realtime CSV runs and summarize accuracy, balanced accuracy,
-    confidence shifts, and top confusions.
-
-- `realtime_behavior_metrics.py`
-  - Compute segment-based realtime behavior metrics from prompted CSV runs.
-  - Includes time to first correct prediction, time to stable prediction, label-flip
-    rate, carryover stale rate, and confidence summaries.
-
-- `diagnose_session_recall.py`
-  - Break down model performance by filtered session file.
-  - Useful for identifying weak sessions, label issues, or outlier recordings.
-
+  - Plot the final offline model metrics as one aggregate figure.
+- `plot_carla_summary_bars.py`
+  - Plot the final aggregate CARLA metrics as one summary figure.
 - `analyze_latency.py`
-  - Join realtime and CARLA timing logs and compute latency summaries.
-  - Expects timestamp columns to be present in the logs.
-
+  - Join realtime and CARLA timing logs and summarize end-to-end latency.
 - `analyze_drive_metrics.py`
-  - Summarize CARLA run logs into lane-keeping, timing, and steering metrics.
-  - Consumes the per-tick CARLA CSV emitted by `carla wheel z.py`.
-
-- `plot_drive_lane_error.py`
-  - Plot `lane_error_m` over time from a CARLA run CSV.
-  - Adds a rolling mean overlay, lane-invasion markers, and summary stats.
-
+  - Summarize CARLA drive logs into the final driving metric set.
 - `build_eval_tables.py`
-  - Merge offline model metrics with optional realtime/latency/drive summaries into copyable tables.
-  - Writes separate `capstone_report_*` and `research_paper_*` tables plus a master table.
-  - Uses `table_manifest_template.csv` as the starter input format.
+  - Build participant-level and aggregate report tables from a manifest.
 
-Runtime log collection
+## Log collection
 
-- Realtime prediction log only:
-  - `python realtime_gesture_cnn.py --model <bundle_path> --prediction-log eval_metrics/out/realtime_predictions.csv`
-- CARLA drive log plus realtime prediction log:
-  - `python "carla wheel z.py" --eval-log-dir eval_metrics/out/run_01`
-- CARLA with explicit log paths:
-  - `python "carla wheel z.py" --carla-log eval_metrics/out/carla_drive.csv --realtime-log eval_metrics/out/realtime_predictions.csv`
+Prediction log only:
 
-The CARLA entrypoint now forwards `--realtime-log` into `realtime_gesture_cnn.py` and writes
-its own per-tick vehicle/control log to `--carla-log`.
+```powershell
+python realtime_gesture_cnn.py --model-right models/strict/per_subject/right/Matthewv6_4_gestures.pt --model-left models/strict/per_subject/left/Matthewv6_4_gestures.pt --prediction-log eval_metrics/out/realtime_predictions.csv
+```
 
-Table assembly
+CARLA drive log plus forwarded realtime prediction log:
 
-- Write a fresh manifest from the template:
-  - `python eval_metrics/build_eval_tables.py --write-template-manifest eval_metrics/table_manifest.csv`
-- Fill `eval_metrics/table_manifest.csv` with the exact model rows and optional JSON summaries.
-- Build the tables:
-  - `python eval_metrics/build_eval_tables.py --manifest eval_metrics/table_manifest.csv`
+```powershell
+python carla_integration/manual_control_emg.py --scenario lane_keep_5min --eval-log-dir eval_metrics/out/lane_keep_eval
+```
 
-## Expected workflow
+## Final metric set
 
-1. Use top-level training scripts to generate or load model bundles.
-2. Use `harvest_model_metrics.py` to export offline metrics into CSV/JSON.
-3. Use `realtime_confidence_analysis.py` for prompted realtime runs.
-4. Use `compare_realtime_runs.py`, `realtime_behavior_metrics.py`, and
-   `diagnose_session_recall.py` to summarize and inspect those runs.
-5. Add or collect realtime/CARLA logs.
-6. Use `analyze_latency.py` and `analyze_drive_metrics.py` on those logs.
-7. Use `plot_drive_lane_error.py` to render the lane error trace for a CARLA run.
-8. Use `plot_filter_effect.py` to generate signal-processing figures.
+- Offline:
+  - balanced accuracy
+  - macro precision
+  - macro recall
+  - macro F1
+  - worst-class recall
+- Latency:
+  - end-to-end latency mean
+  - end-to-end latency p95
+- CARLA:
+  - scenario success
+  - completion time
+  - lane error RMSE
+  - lane invasions
+- Scenario-specific:
+  - `highway_overtake` command success rate, only when explicitly logged
+
+## Offline metric harvest
+
+```powershell
+python eval_metrics/harvest_model_metrics.py --models-root models/strict --output-csv eval_metrics/out/model_metrics.csv --output-json eval_metrics/out/model_metrics.json
+```
+
+## Table assembly
+
+```powershell
+python eval_metrics/build_eval_tables.py --write-template-manifest eval_metrics/table_manifest.csv
+python eval_metrics/build_eval_tables.py --manifest eval_metrics/table_manifest.csv
+```
+
+The checked-in [table_manifest_template.csv](/C:/Users/matth/Desktop/capstone/capstone-emg/eval_metrics/table_manifest_template.csv) is a maintained example of the expected manifest columns.
+
+## Final plots
+
+Offline figure:
+
+```powershell
+python eval_metrics/plot_model_accuracy_bars.py --input-csv eval_metrics/out/model_metrics.csv --gesture-bucket 4_gesture --latest-only
+```
+
+CARLA figure:
+
+```powershell
+python eval_metrics/plot_carla_summary_bars.py --input-csv eval_metrics/out/tables/evaluation_aggregate_table.csv --deliverable-bucket capstone_report
+```
 
 ## Notes
 
-- These scripts are intended for evaluation support, not model training.
-- They are designed to be usable independently from the top-level scripts.
+- `eval_metrics/out/` and `eval_metrics/logs/` are generated outputs, not source data.
+- The maintained evaluation flow is participant-first: summarize each participant/run first, then aggregate across participants for report tables.
+- Standalone prompted realtime behavior metrics are no longer part of the maintained evaluation path.
+- The final visualization plan is one offline figure, one CARLA figure, and latency kept as a table rather than a standalone plot.
+- The evaluation scripts assume the cleaned CNN-only repo state with the fixed 4-gesture set: `left_turn`, `right_turn`, `neutral`, `horn`.

@@ -11,20 +11,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EVAL_ROOT = REPO_ROOT / "eval_metrics"
 OUT_ROOT = EVAL_ROOT / "out" / "current_metrics"
 MODELS_ROOT = REPO_ROOT / "models" / "strict"
-PROMPT_LOG_ROOT = EVAL_ROOT / "logs"
 CARLA_RUN_ROOT = EVAL_ROOT / "out"
 
 
 def _run(cmd: list[str]) -> None:
     print(">", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=str(REPO_ROOT))
-
-
-def _csv_header(path: Path) -> list[str]:
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.reader(f)
-        row = next(reader, [])
-    return [str(value).strip() for value in row]
 
 
 def _extract_stamp(path: Path, prefix: str) -> str | None:
@@ -65,21 +57,6 @@ def _discover_carla_pairs() -> list[dict[str, str]]:
                 }
             )
     return pairs
-
-
-def _discover_prompt_logs() -> tuple[list[Path], list[Path]]:
-    behavior_ready: list[Path] = []
-    skipped: list[Path] = []
-    if not PROMPT_LOG_ROOT.exists():
-        return behavior_ready, skipped
-
-    for path in sorted(PROMPT_LOG_ROOT.rglob("*.csv")):
-        header = _csv_header(path)
-        if "prompt_label" in header:
-            behavior_ready.append(path)
-        else:
-            skipped.append(path)
-    return behavior_ready, skipped
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -131,35 +108,7 @@ def main() -> None:
         ]
     )
 
-    # 3. Prompted realtime behavior metrics, only when prompt labels exist.
-    prompt_logs, prompt_logs_skipped = _discover_prompt_logs()
-    behavior_rows: list[dict[str, object]] = []
-    behavior_root = OUT_ROOT / "realtime_behavior"
-    for path in prompt_logs:
-        rel_slug = "_".join(path.relative_to(PROMPT_LOG_ROOT).with_suffix("").parts)
-        out_json = behavior_root / f"{rel_slug}.json"
-        out_segments = behavior_root / f"{rel_slug}_segments.csv"
-        _run(
-            [
-                sys.executable,
-                str(EVAL_ROOT / "realtime_behavior_metrics.py"),
-                "--input",
-                str(path),
-                "--output-json",
-                str(out_json),
-                "--output-segments-csv",
-                str(out_segments),
-            ]
-        )
-        behavior_rows.append(
-            {
-                "input_csv": str(path),
-                "summary_json": str(out_json),
-                "segments_csv": str(out_segments),
-            }
-        )
-
-    # 4. CARLA drive/latency summaries for every paired run.
+    # 3. CARLA drive/latency summaries for every paired run.
     pairs = _discover_carla_pairs()
     run_rows: list[dict[str, object]] = []
     for pair in pairs:
@@ -207,25 +156,19 @@ def main() -> None:
             }
         )
 
-    inventory["realtime_behavior_ready_logs"] = [str(path) for path in prompt_logs]
-    inventory["realtime_behavior_skipped_logs"] = [str(path) for path in prompt_logs_skipped]
     inventory["carla_run_pairs"] = run_rows
     inventory["outputs"] = {
         "model_metrics_csv": str(model_metrics_csv),
         "model_metrics_json": str(model_metrics_json),
         "manifest_template": str(manifest_template),
-        "realtime_behavior_index_csv": str(OUT_ROOT / "realtime_behavior_index.csv"),
         "carla_run_index_csv": str(OUT_ROOT / "carla_run_index.csv"),
     }
 
-    _write_csv(OUT_ROOT / "realtime_behavior_index.csv", behavior_rows or [{"note": "No prompted realtime logs with prompt_label found."}])
     _write_csv(OUT_ROOT / "carla_run_index.csv", run_rows or [{"note": "No paired CARLA run logs found."}])
     _write_json(OUT_ROOT / "artifact_inventory.json", inventory)
 
     print("\nCurrent metric gathering complete.")
     print(f"Staged outputs under: {OUT_ROOT}")
-    if not prompt_logs:
-        print("No prompted realtime logs with prompt labels were found, so behavior metrics were skipped.")
 
 
 if __name__ == "__main__":

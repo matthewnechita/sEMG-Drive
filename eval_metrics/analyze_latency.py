@@ -44,19 +44,13 @@ def _summary(values):
         return {
             "count": 0,
             "mean_ms": None,
-            "median_ms": None,
-            "p90_ms": None,
             "p95_ms": None,
-            "max_ms": None,
         }
     arr = np.asarray(vals, dtype=float)
     return {
         "count": int(arr.size),
         "mean_ms": float(arr.mean()),
-        "median_ms": float(np.median(arr)),
-        "p90_ms": float(np.percentile(arr, 90)),
         "p95_ms": float(np.percentile(arr, 95)),
-        "max_ms": float(arr.max()),
     }
 
 
@@ -104,47 +98,23 @@ def main(argv=None):
         )
 
     joined = []
-    classifier_latency = []
-    publish_latency = []
-    control_latency = []
     end_to_end_latency = []
-    per_label = {}
 
     for key in shared_keys:
         rt_row = realtime_index[key]
         carla_row = carla_index[key]
         window_end_ts = _to_float(rt_row.get("window_end_ts"))
-        prediction_ts = _to_float(rt_row.get("prediction_ts"))
-        publish_ts = _to_float(rt_row.get("publish_ts"))
         control_apply_ts = _to_float(carla_row.get("control_apply_ts"))
         label = str(rt_row.get(args.label_column, "")).strip()
-
-        cls_ms = None if window_end_ts is None or prediction_ts is None else (prediction_ts - window_end_ts) * 1000.0
-        pub_ms = None if prediction_ts is None or publish_ts is None else (publish_ts - prediction_ts) * 1000.0
-        ctl_ms = None if publish_ts is None or control_apply_ts is None else (control_apply_ts - publish_ts) * 1000.0
         e2e_ms = None if window_end_ts is None or control_apply_ts is None else (control_apply_ts - window_end_ts) * 1000.0
 
-        if cls_ms is not None:
-            classifier_latency.append(cls_ms)
-        if pub_ms is not None:
-            publish_latency.append(pub_ms)
-        if ctl_ms is not None:
-            control_latency.append(ctl_ms)
         if e2e_ms is not None:
             end_to_end_latency.append(e2e_ms)
-
-        if label:
-            bucket = per_label.setdefault(label, [])
-            if e2e_ms is not None:
-                bucket.append(e2e_ms)
 
         joined.append(
             {
                 args.join_key: key,
                 "pred_label": label,
-                "classifier_latency_ms": cls_ms,
-                "publish_latency_ms": pub_ms,
-                "control_latency_ms": ctl_ms,
                 "end_to_end_latency_ms": e2e_ms,
             }
         )
@@ -152,13 +122,7 @@ def main(argv=None):
     payload = {
         "join_key": args.join_key,
         "rows_joined": len(joined),
-        "classifier_latency_ms": _summary(classifier_latency),
-        "publish_latency_ms": _summary(publish_latency),
-        "control_latency_ms": _summary(control_latency),
         "end_to_end_latency_ms": _summary(end_to_end_latency),
-        "per_label_end_to_end_ms": {
-            label: _summary(values) for label, values in sorted(per_label.items())
-        },
     }
 
     args.output_json.parent.mkdir(parents=True, exist_ok=True)

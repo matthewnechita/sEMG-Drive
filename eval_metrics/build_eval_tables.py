@@ -1,7 +1,9 @@
 import argparse
 import csv
 import json
+import math
 import re
+from collections import defaultdict
 from pathlib import Path
 
 
@@ -17,7 +19,6 @@ TEMPLATE_COLUMNS = [
     "comparison_group",
     "model_path",
     "model_filename",
-    "realtime_behavior_json",
     "latency_json",
     "drive_metrics_json",
     "notes",
@@ -37,7 +38,6 @@ TEMPLATE_ROWS = [
         "comparison_group": "",
         "model_path": "",
         "model_filename": "",
-        "realtime_behavior_json": "",
         "latency_json": "",
         "drive_metrics_json": "",
         "notes": "",
@@ -54,7 +54,6 @@ TEMPLATE_ROWS = [
         "comparison_group": "",
         "model_path": "",
         "model_filename": "",
-        "realtime_behavior_json": "",
         "latency_json": "",
         "drive_metrics_json": "",
         "notes": "",
@@ -71,7 +70,6 @@ TEMPLATE_ROWS = [
         "comparison_group": "",
         "model_path": "",
         "model_filename": "",
-        "realtime_behavior_json": "",
         "latency_json": "",
         "drive_metrics_json": "",
         "notes": "",
@@ -88,7 +86,6 @@ TEMPLATE_ROWS = [
         "comparison_group": "",
         "model_path": "",
         "model_filename": "",
-        "realtime_behavior_json": "",
         "latency_json": "",
         "drive_metrics_json": "",
         "notes": "",
@@ -105,7 +102,6 @@ TEMPLATE_ROWS = [
         "comparison_group": "Prior-paper comparison, no eye-tracker metrics",
         "model_path": "",
         "model_filename": "",
-        "realtime_behavior_json": "",
         "latency_json": "",
         "drive_metrics_json": "",
         "notes": "No eye-tracker metrics",
@@ -122,7 +118,6 @@ TEMPLATE_ROWS = [
         "comparison_group": "Prior-paper comparison, no eye-tracker metrics",
         "model_path": "",
         "model_filename": "",
-        "realtime_behavior_json": "",
         "latency_json": "",
         "drive_metrics_json": "",
         "notes": "No eye-tracker metrics",
@@ -139,7 +134,6 @@ TEMPLATE_ROWS = [
         "comparison_group": "Prior-paper comparison, no eye-tracker metrics",
         "model_path": "",
         "model_filename": "",
-        "realtime_behavior_json": "",
         "latency_json": "",
         "drive_metrics_json": "",
         "notes": "No eye-tracker metrics",
@@ -156,7 +150,6 @@ TEMPLATE_ROWS = [
         "comparison_group": "Prior-paper comparison, no eye-tracker metrics",
         "model_path": "",
         "model_filename": "",
-        "realtime_behavior_json": "",
         "latency_json": "",
         "drive_metrics_json": "",
         "notes": "No eye-tracker metrics",
@@ -164,7 +157,7 @@ TEMPLATE_ROWS = [
 ]
 
 
-BASE_COLUMNS = [
+PARTICIPANT_COLUMNS = [
     "table_row_id",
     "row_id",
     "deliverable",
@@ -177,67 +170,84 @@ BASE_COLUMNS = [
     "status",
     "comparison_group",
     "notes",
-]
-
-
-OFFLINE_COLUMNS = [
     "source_model_filename",
     "source_model_path",
     "offline_bundle_scope",
     "offline_gesture_bucket",
     "offline_labels",
-    "offline_test_accuracy",
     "offline_balanced_accuracy",
-    "offline_macro_f1",
     "offline_macro_precision",
     "offline_macro_recall",
-    "offline_weighted_f1",
-    "offline_weighted_precision",
-    "offline_weighted_recall",
+    "offline_macro_f1",
     "offline_worst_class_recall",
-    "offline_worst_class_recall_label",
-    "offline_max_precision_recall_gap",
-    "offline_max_precision_recall_gap_label",
     "offline_channel_count",
     "offline_window_size_samples",
     "offline_window_step_samples",
     "offline_created_at",
+    "latency_json",
+    "lat_rows_joined",
+    "lat_e2e_mean_ms",
+    "lat_e2e_p95_ms",
+    "drive_metrics_json",
+    "drive_rows",
+    "drive_scenario_success",
+    "drive_completion_time_s",
+    "drive_lane_error_rmse_m",
+    "drive_lane_invasions",
+    "drive_command_success_rate",
 ]
 
 
-SYSTEM_COLUMNS = [
-    "realtime_behavior_json",
-    "latency_json",
-    "drive_metrics_json",
-    "rt_rows_prompted",
-    "rt_segments_prompted",
-    "rt_overall_accuracy",
-    "rt_balanced_accuracy",
-    "rt_ttfc_mean_s",
-    "rt_ttfc_median_s",
-    "rt_ttfc_p90_s",
-    "rt_tts_mean_s",
-    "rt_tts_median_s",
-    "rt_tts_p90_s",
-    "rt_flip_rate_mean_per_s",
-    "rt_flip_fraction_mean",
-    "rt_stale_rate_mean",
-    "lat_rows_joined",
-    "lat_classifier_mean_ms",
-    "lat_classifier_p95_ms",
-    "lat_publish_mean_ms",
-    "lat_control_mean_ms",
-    "lat_control_p95_ms",
+AGGREGATE_COLUMNS = [
+    "aggregate_row_id",
+    "row_id",
+    "deliverable",
+    "deliverable_bucket",
+    "task",
+    "model_scope",
+    "condition",
+    "arm",
+    "status",
+    "comparison_group",
+    "notes",
+    "participant_count",
+    "offline_balanced_accuracy_mean",
+    "offline_balanced_accuracy_sd",
+    "offline_macro_precision_mean",
+    "offline_macro_precision_sd",
+    "offline_macro_recall_mean",
+    "offline_macro_recall_sd",
+    "offline_macro_f1_mean",
+    "offline_macro_f1_sd",
+    "offline_worst_class_recall_mean",
+    "offline_worst_class_recall_sd",
+    "lat_e2e_mean_ms_mean",
+    "lat_e2e_mean_ms_sd",
+    "lat_e2e_p95_ms_mean",
+    "lat_e2e_p95_ms_sd",
+    "drive_scenario_success_rate",
+    "drive_completion_time_s_mean",
+    "drive_completion_time_s_sd",
+    "drive_lane_error_rmse_m_mean",
+    "drive_lane_error_rmse_m_sd",
+    "drive_lane_invasions_mean",
+    "drive_lane_invasions_sd",
+    "drive_command_success_rate_mean",
+    "drive_command_success_rate_sd",
+]
+
+
+NUMERIC_PARTICIPANT_METRICS = [
+    "offline_balanced_accuracy",
+    "offline_macro_precision",
+    "offline_macro_recall",
+    "offline_macro_f1",
+    "offline_worst_class_recall",
     "lat_e2e_mean_ms",
-    "lat_e2e_median_ms",
     "lat_e2e_p95_ms",
-    "lat_e2e_max_ms",
-    "drive_rows",
-    "drive_lane_error_mean_m",
+    "drive_completion_time_s",
     "drive_lane_error_rmse_m",
     "drive_lane_invasions",
-    "drive_completion_time_s",
-    "drive_steering_smoothness",
     "drive_command_success_rate",
 ]
 
@@ -328,49 +338,54 @@ def _read_json(path_str):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _nested_get(obj, *keys):
-    cur = obj
-    for key in keys:
-        if not isinstance(cur, dict):
+def _normalize_path_text(path_text):
+    return str(path_text or "").replace("/", "\\").strip().lower()
+
+
+def _to_float(value):
+    try:
+        if value is None or value == "":
             return None
-        cur = cur.get(key)
-    return cur
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _flatten_realtime(summary):
-    if not isinstance(summary, dict) or not summary:
-        return {}
-    return {
-        "rt_rows_prompted": summary.get("rows_prompted"),
-        "rt_segments_prompted": summary.get("segments_prompted"),
-        "rt_overall_accuracy": summary.get("overall_accuracy"),
-        "rt_balanced_accuracy": summary.get("balanced_accuracy"),
-        "rt_ttfc_mean_s": _nested_get(summary, "time_to_first_correct_s", "mean"),
-        "rt_ttfc_median_s": _nested_get(summary, "time_to_first_correct_s", "median"),
-        "rt_ttfc_p90_s": _nested_get(summary, "time_to_first_correct_s", "p90"),
-        "rt_tts_mean_s": _nested_get(summary, "time_to_stable_prediction_s", "mean"),
-        "rt_tts_median_s": _nested_get(summary, "time_to_stable_prediction_s", "median"),
-        "rt_tts_p90_s": _nested_get(summary, "time_to_stable_prediction_s", "p90"),
-        "rt_flip_rate_mean_per_s": _nested_get(summary, "label_flip_rate_per_s", "mean"),
-        "rt_flip_fraction_mean": _nested_get(summary, "label_flip_fraction", "mean"),
-        "rt_stale_rate_mean": _nested_get(summary, "carryover_stale_rate", "mean"),
-    }
+def _to_bool(value):
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    return None
+
+
+def _mean(values):
+    vals = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    if not vals:
+        return None
+    return float(sum(vals) / len(vals))
+
+
+def _mean_sd(values):
+    vals = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    if not vals:
+        return None, None
+    if len(vals) == 1:
+        return float(vals[0]), 0.0
+    mean = float(sum(vals) / len(vals))
+    variance = float(sum((v - mean) ** 2 for v in vals) / (len(vals) - 1))
+    return mean, math.sqrt(variance)
 
 
 def _flatten_latency(summary):
     if not isinstance(summary, dict) or not summary:
         return {}
+    e2e = summary.get("end_to_end_latency_ms", {})
     return {
         "lat_rows_joined": summary.get("rows_joined"),
-        "lat_classifier_mean_ms": _nested_get(summary, "classifier_latency_ms", "mean_ms"),
-        "lat_classifier_p95_ms": _nested_get(summary, "classifier_latency_ms", "p95_ms"),
-        "lat_publish_mean_ms": _nested_get(summary, "publish_latency_ms", "mean_ms"),
-        "lat_control_mean_ms": _nested_get(summary, "control_latency_ms", "mean_ms"),
-        "lat_control_p95_ms": _nested_get(summary, "control_latency_ms", "p95_ms"),
-        "lat_e2e_mean_ms": _nested_get(summary, "end_to_end_latency_ms", "mean_ms"),
-        "lat_e2e_median_ms": _nested_get(summary, "end_to_end_latency_ms", "median_ms"),
-        "lat_e2e_p95_ms": _nested_get(summary, "end_to_end_latency_ms", "p95_ms"),
-        "lat_e2e_max_ms": _nested_get(summary, "end_to_end_latency_ms", "max_ms"),
+        "lat_e2e_mean_ms": e2e.get("mean_ms") if isinstance(e2e, dict) else None,
+        "lat_e2e_p95_ms": e2e.get("p95_ms") if isinstance(e2e, dict) else None,
     }
 
 
@@ -378,23 +393,17 @@ def _flatten_drive(summary):
     if not isinstance(summary, dict) or not summary:
         return {}
     full = summary.get("full_route", {})
+    if not isinstance(full, dict):
+        full = {}
     out = {
         "drive_rows": full.get("rows"),
-        "drive_lane_error_mean_m": full.get("lane_error_mean_m"),
+        "drive_scenario_success": full.get("scenario_success"),
+        "drive_completion_time_s": full.get("completion_time_s"),
         "drive_lane_error_rmse_m": full.get("lane_error_rmse_m"),
         "drive_lane_invasions": full.get("lane_invasions"),
-        "drive_completion_time_s": full.get("completion_time_s"),
-        "drive_steering_smoothness": full.get("steering_smoothness"),
-        "drive_command_success_rate": full.get("command_success_rate"),
     }
-    segments = summary.get("segments", {})
-    if isinstance(segments, dict):
-        for segment_name, segment_metrics in sorted(segments.items()):
-            segment_slug = _slugify(segment_name)
-            if not isinstance(segment_metrics, dict) or not segment_slug:
-                continue
-            for key, value in sorted(segment_metrics.items()):
-                out[f"drive_{segment_slug}_{_slugify(key)}"] = value
+    if "command_success_rate" in full:
+        out["drive_command_success_rate"] = full.get("command_success_rate")
     return out
 
 
@@ -407,27 +416,16 @@ def _offline_from_model_row(row):
         "offline_bundle_scope": row.get("bundle_scope", ""),
         "offline_gesture_bucket": row.get("gesture_bucket", ""),
         "offline_labels": row.get("labels", ""),
-        "offline_test_accuracy": row.get("test_accuracy", ""),
         "offline_balanced_accuracy": row.get("balanced_accuracy", ""),
-        "offline_macro_f1": row.get("macro_f1", ""),
         "offline_macro_precision": row.get("macro_precision", ""),
         "offline_macro_recall": row.get("macro_recall", ""),
-        "offline_weighted_f1": row.get("weighted_f1", ""),
-        "offline_weighted_precision": row.get("weighted_precision", ""),
-        "offline_weighted_recall": row.get("weighted_recall", ""),
+        "offline_macro_f1": row.get("macro_f1", ""),
         "offline_worst_class_recall": row.get("worst_class_recall", ""),
-        "offline_worst_class_recall_label": row.get("worst_class_recall_label", ""),
-        "offline_max_precision_recall_gap": row.get("max_precision_recall_gap", ""),
-        "offline_max_precision_recall_gap_label": row.get("max_precision_recall_gap_label", ""),
         "offline_channel_count": row.get("channel_count", ""),
         "offline_window_size_samples": row.get("window_size_samples", ""),
         "offline_window_step_samples": row.get("window_step_samples", ""),
         "offline_created_at": row.get("created_at", ""),
     }
-
-
-def _normalize_path_text(path_text):
-    return str(path_text or "").replace("/", "\\").strip().lower()
 
 
 def _match_model_rows(manifest_row, model_rows):
@@ -443,7 +441,7 @@ def _match_model_rows(manifest_row, model_rows):
         return [row for row in model_rows if _normalize_path_text(row.get("path", "")) == target]
 
     if model_filename:
-        target = model_filename.strip().lower()
+        target = model_filename.lower()
         return [row for row in model_rows if str(row.get("filename", "")).strip().lower() == target]
 
     matches = []
@@ -462,17 +460,14 @@ def _match_model_rows(manifest_row, model_rows):
     return matches
 
 
-def _build_output_rows(manifest_rows, model_rows):
+def _build_participant_rows(manifest_rows, model_rows):
     out = []
     for manifest_index, manifest_row in enumerate(manifest_rows, start=1):
         matches = _match_model_rows(manifest_row, model_rows)
         if not matches:
             matches = [None]
         for match_index, model_row in enumerate(matches, start=1):
-            row = {
-                key: manifest_row.get(key, "")
-                for key in TEMPLATE_COLUMNS
-            }
+            row = {key: manifest_row.get(key, "") for key in TEMPLATE_COLUMNS}
             if model_row is not None:
                 if not row.get("subject"):
                     row["subject"] = model_row.get("subject", "") or model_row.get("target_subject", "")
@@ -482,6 +477,7 @@ def _build_output_rows(manifest_rows, model_rows):
                     row["task"] = model_row.get("gesture_bucket", "")
                 if not row.get("model_scope"):
                     row["model_scope"] = model_row.get("bundle_scope", "")
+
             row["deliverable_bucket"] = _deliverable_bucket(row.get("deliverable", ""))
             suffix_parts = []
             if row.get("subject"):
@@ -493,47 +489,137 @@ def _build_output_rows(manifest_rows, model_rows):
             row["table_row_id"] = str(row.get("row_id", f"ROW_{manifest_index}"))
             if suffix_parts:
                 row["table_row_id"] += "__" + "__".join(_slugify(part) for part in suffix_parts if str(part).strip())
+
             row.update(_offline_from_model_row(model_row))
-            row.update(_flatten_realtime(_read_json(row.get("realtime_behavior_json", ""))))
             row.update(_flatten_latency(_read_json(row.get("latency_json", ""))))
             row.update(_flatten_drive(_read_json(row.get("drive_metrics_json", ""))))
             out.append(row)
     return out
 
 
-def _dynamic_system_columns(rows):
-    dynamic = []
-    for key in sorted({key for row in rows for key in row.keys()}):
-        if key.startswith("drive_") and key not in SYSTEM_COLUMNS:
-            dynamic.append(key)
-    return dynamic
+def _aggregate_group_key(row):
+    return (
+        str(row.get("row_id", "")),
+        str(row.get("deliverable", "")),
+        str(row.get("deliverable_bucket", "")),
+        str(row.get("task", "")),
+        str(row.get("model_scope", "")),
+        str(row.get("condition", "")),
+        str(row.get("arm", "")),
+        str(row.get("status", "")),
+        str(row.get("comparison_group", "")),
+        str(row.get("notes", "")),
+    )
 
 
-def _selected_columns(rows, kind):
-    base = list(BASE_COLUMNS)
-    if kind == "offline":
-        return base + OFFLINE_COLUMNS
-    if kind == "system":
-        return base + SYSTEM_COLUMNS + _dynamic_system_columns(rows)
-    if kind == "full":
-        columns = base + OFFLINE_COLUMNS + SYSTEM_COLUMNS + _dynamic_system_columns(rows)
-        remaining = [key for key in sorted({key for row in rows for key in row.keys()}) if key not in columns]
-        return columns + remaining
-    raise ValueError(f"Unknown table kind: {kind}")
+def _participant_key(row):
+    subject = str(row.get("subject", "")).strip()
+    if subject:
+        return subject.lower()
+    return str(row.get("table_row_id", "")).strip().lower()
+
+
+def _aggregate_participant_bucket(rows):
+    out = {}
+    for metric in NUMERIC_PARTICIPANT_METRICS:
+        out[metric] = _mean(_to_float(row.get(metric)) for row in rows)
+    success_values = [_to_bool(row.get("drive_scenario_success")) for row in rows]
+    success_values = [1.0 if value else 0.0 for value in success_values if value is not None]
+    out["drive_scenario_success_rate"] = _mean(success_values)
+    return out
+
+
+def _build_aggregate_rows(participant_rows):
+    grouped = defaultdict(list)
+    for row in participant_rows:
+        grouped[_aggregate_group_key(row)].append(row)
+
+    aggregate_rows = []
+    for key, rows in sorted(grouped.items()):
+        participant_groups = defaultdict(list)
+        for row in rows:
+            participant_groups[_participant_key(row)].append(row)
+
+        participant_summaries = [
+            _aggregate_participant_bucket(group_rows)
+            for _, group_rows in sorted(participant_groups.items())
+        ]
+
+        template_row = rows[0]
+        aggregate_row = {
+            "aggregate_row_id": "__".join(
+                part for part in [
+                    str(template_row.get("row_id", "")).strip(),
+                    _slugify(template_row.get("arm", "")),
+                    _slugify(template_row.get("condition", "")),
+                ]
+                if part
+            ) or str(template_row.get("row_id", "")).strip(),
+            "row_id": template_row.get("row_id", ""),
+            "deliverable": template_row.get("deliverable", ""),
+            "deliverable_bucket": template_row.get("deliverable_bucket", ""),
+            "task": template_row.get("task", ""),
+            "model_scope": template_row.get("model_scope", ""),
+            "condition": template_row.get("condition", ""),
+            "arm": template_row.get("arm", ""),
+            "status": template_row.get("status", ""),
+            "comparison_group": template_row.get("comparison_group", ""),
+            "notes": template_row.get("notes", ""),
+            "participant_count": len(participant_summaries),
+        }
+
+        for metric in [
+            "offline_balanced_accuracy",
+            "offline_macro_precision",
+            "offline_macro_recall",
+            "offline_macro_f1",
+            "offline_worst_class_recall",
+            "lat_e2e_mean_ms",
+            "lat_e2e_p95_ms",
+            "drive_completion_time_s",
+            "drive_lane_error_rmse_m",
+            "drive_lane_invasions",
+            "drive_command_success_rate",
+        ]:
+            mean, sd = _mean_sd(summary.get(metric) for summary in participant_summaries)
+            aggregate_row[f"{metric}_mean"] = mean
+            aggregate_row[f"{metric}_sd"] = sd
+
+        aggregate_row["drive_scenario_success_rate"] = _mean(
+            summary.get("drive_scenario_success_rate") for summary in participant_summaries
+        )
+        aggregate_rows.append(aggregate_row)
+
+    return aggregate_rows
 
 
 def _filter_deliverable(rows, deliverable_bucket):
     return [row for row in rows if row.get("deliverable_bucket") == deliverable_bucket]
 
 
-def _write_deliverable_tables(output_dir: Path, deliverable_bucket: str, rows):
-    if not rows:
-        return
-    for kind in ("offline", "system", "full"):
-        columns = _selected_columns(rows, kind)
-        stem = f"{deliverable_bucket}_{kind}_table"
-        _write_csv(output_dir / f"{stem}.csv", rows, columns)
-        _write_markdown(output_dir / f"{stem}.md", rows, columns)
+def _write_deliverable_tables(output_dir: Path, deliverable_bucket: str, participant_rows, aggregate_rows):
+    if participant_rows:
+        _write_csv(
+            output_dir / f"{deliverable_bucket}_participant_table.csv",
+            participant_rows,
+            PARTICIPANT_COLUMNS,
+        )
+        _write_markdown(
+            output_dir / f"{deliverable_bucket}_participant_table.md",
+            participant_rows,
+            PARTICIPANT_COLUMNS,
+        )
+    if aggregate_rows:
+        _write_csv(
+            output_dir / f"{deliverable_bucket}_aggregate_table.csv",
+            aggregate_rows,
+            AGGREGATE_COLUMNS,
+        )
+        _write_markdown(
+            output_dir / f"{deliverable_bucket}_aggregate_table.md",
+            aggregate_rows,
+            AGGREGATE_COLUMNS,
+        )
 
 
 def _write_template_manifest(path: Path):
@@ -542,7 +628,7 @@ def _write_template_manifest(path: Path):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Assemble capstone/report tables from model, realtime, latency, and drive summaries."
+        description="Assemble participant and aggregate tables from offline, latency, and CARLA summaries."
     )
     parser.add_argument(
         "--manifest",
@@ -587,20 +673,33 @@ def main(argv=None):
 
     manifest_rows = _load_csv_rows(manifest_path)
     model_rows = _load_csv_rows(Path(args.model_metrics))
-    assembled_rows = _build_output_rows(manifest_rows, model_rows)
+    participant_rows = _build_participant_rows(manifest_rows, model_rows)
+    aggregate_rows = _build_aggregate_rows(participant_rows)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    master_columns = _selected_columns(assembled_rows, "full")
-    _write_csv(output_dir / "evaluation_master_table.csv", assembled_rows, master_columns)
-    _write_json(output_dir / "evaluation_master_table.json", assembled_rows)
+    _write_csv(output_dir / "evaluation_participant_table.csv", participant_rows, PARTICIPANT_COLUMNS)
+    _write_json(output_dir / "evaluation_participant_table.json", participant_rows)
+    _write_csv(output_dir / "evaluation_aggregate_table.csv", aggregate_rows, AGGREGATE_COLUMNS)
+    _write_json(output_dir / "evaluation_aggregate_table.json", aggregate_rows)
 
-    _write_deliverable_tables(output_dir, "capstone_report", _filter_deliverable(assembled_rows, "capstone_report"))
-    _write_deliverable_tables(output_dir, "research_paper", _filter_deliverable(assembled_rows, "research_paper"))
+    _write_deliverable_tables(
+        output_dir,
+        "capstone_report",
+        _filter_deliverable(participant_rows, "capstone_report"),
+        _filter_deliverable(aggregate_rows, "capstone_report"),
+    )
+    _write_deliverable_tables(
+        output_dir,
+        "research_paper",
+        _filter_deliverable(participant_rows, "research_paper"),
+        _filter_deliverable(aggregate_rows, "research_paper"),
+    )
 
     print(f"Loaded {len(manifest_rows)} manifest row(s)")
-    print(f"Built {len(assembled_rows)} assembled table row(s)")
+    print(f"Built {len(participant_rows)} participant row(s)")
+    print(f"Built {len(aggregate_rows)} aggregate row(s)")
     print(f"Saved tables under {output_dir}")
 
 

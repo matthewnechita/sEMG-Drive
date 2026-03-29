@@ -13,5 +13,15 @@ models/cross_subject/right/*_stage_b_active_gestures.pt
 __pycache__/
 *.pyc
 
+# Generated evaluation artifacts
+eval_metrics/out/
+eval_metrics/logs/
+
+# Editor-local files
+.vscode/
+
+# Temporary Office lock files
+report_drafts/~$*.docx
+
 # Claude Code
 .claude/

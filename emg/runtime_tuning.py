@@ -20,8 +20,6 @@ class RealtimeTuning:
     softmax_reject_enabled: bool
     softmax_reject_min_confidence: float
     softmax_reject_min_margin: float
-    prototype_reject_min_confidence: float
-    prototype_reject_min_margin: float
 
     @property
     def resolved_dual_arm_single_threshold(self) -> float:
@@ -63,8 +61,6 @@ REALTIME_TUNING = RealtimeTuning(
     softmax_reject_enabled=False,
     softmax_reject_min_confidence=0.55,
     softmax_reject_min_margin=0.08,
-    prototype_reject_min_confidence=0.55,
-    prototype_reject_min_margin=0.08,
 )
 
 # Edit these values directly when tuning CARLA control behavior.

@@ -16,16 +16,13 @@ Output:
 
 Usage:
 - Edit config constants below.
-- Run: python tools/resample_raw_dataset.py
+- Run: python emg/resample_raw_dataset.py
 
   Order should be:
 
-  1. python tools/resample_raw_dataset.py
+  1. python emg/resample_raw_dataset.py
   2. python emg/filtering.py
-  3. python tools/recalibrate.py --data-root <your_resampledbtw _root> (dry run)
-  4. If you see failed sessions, run:
-     python tools/recalibrate.py --data-root <your_resampled_root> --apply
-  5. Retrain.
+  3. Retrain.
 """
 from __future__ import annotations
 
