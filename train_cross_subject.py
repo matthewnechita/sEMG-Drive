@@ -98,9 +98,6 @@ MVC_QUALITY_MIN_RATIO = DEFAULT_MVC_MIN_RATIO
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
-
-
-
 def load_dataset():
     files = sorted(DATA_ROOT.rglob(PATTERN))
     if not files:

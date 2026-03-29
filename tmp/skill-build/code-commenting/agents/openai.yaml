@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Commenting"
+  short_description: "Add sparse, high-signal comments in a comments-only pass."
+  default_prompt: "Add sparse, high-signal code comments in a comments-only pass: no logic changes, no refactors, remove stale comments and excess spacing, and report any place where a code fix seems necessary instead of making it. Do not touch Delsys/vendor-origin code or comments; comment only project-authored additions. Run the lightest available verification afterward."
