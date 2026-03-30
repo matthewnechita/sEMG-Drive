@@ -27,7 +27,7 @@ from emg.strict_layout import (
     strict_channel_count_for_arm,
 )
 
-# ======== Config (edit as needed) ========
+# -- Config -------------------------------------------------------------------
 WINDOW_SIZE = 200
 WINDOW_STEP = 100
 # Keep this aligned with your training data preprocessing.
@@ -106,6 +106,8 @@ class PredictionCSVLogger:
         out_path = Path(self.path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         self._file = out_path.open("w", newline="", encoding="utf-8")
+        # One row per published prediction keeps the latency join keyed to what
+        # CARLA actually consumed rather than every intermediate buffer update.
         self._fieldnames = [
             "runtime_preset",
             "prediction_seq",
@@ -160,11 +162,10 @@ MVC_PERCENTILE = 95.0
 # Keep this aligned with train_cross_subject.py (MVC_QUALITY_MIN_RATIO).
 MVC_MIN_RATIO = 1.5        # allow normalization unless calibration is clearly weak
 
-# ======== Dual-arm config ========
+# -- Dual-arm config ----------------------------------------------------------
 # Strict layout uses fixed pair identities; pairing/scan order may vary.
 RIGHT_ARM_CHANNELS = strict_channel_count_for_arm("right")
-# Left arm uses 5 sensors → 16 channels (one fewer sensor than right arm)
-# =================================
+# Left arm uses 5 sensors -> 16 channels (one fewer sensor than right arm)
 
 # Optional runtime gesture filtering (code-only; no CLI flags).
 # Example (3-class mode):
@@ -181,9 +182,7 @@ GESTURE_INSTRUCTIONS = {
     "signal_right": "perform SIGNAL RIGHT gesture",
     "horn":         "perform HORN gesture",
 }
-# ==========================================
-
-# ======== Inference bundles ========
+# -- Inference bundles --------------------------------------------------------
 # Dual-arm strict realtime uses both checked-in per-subject bundles by default.
 MODEL_RIGHT = os.path.join(
     BASE_DIR,
@@ -202,8 +201,6 @@ MODEL_LEFT = os.path.join(
     "left",
     "Matthewv6_4_gestures.pt",
 )
-# =================================
-
 class _StreamingHandler:
     def __init__(self):
         self.streamYTData = True
@@ -218,8 +215,8 @@ class _StreamingHandler:
 def define_filters(fs):
     """
     libEMG filtering stack (must match emg/filtering.py exactly):
-    - Notch @ 60 Hz  (bandwidth 3) — power line fundamental
-    - Notch @ 120 Hz (bandwidth 3) — 2nd power line harmonic
+    - Notch @ 60 Hz  (bandwidth 3) - power line fundamental
+    - Notch @ 120 Hz (bandwidth 3) - 2nd power line harmonic
     - Bandpass 20-450 Hz (order 6)
     """
     fi = libemg_filter.Filter(fs)
@@ -433,6 +430,7 @@ class _RealtimeTimestampResampler:
         if any(len(tb) < 2 for tb in self._time_buf):
             return np.empty((0, self.channel_count), dtype=float), np.empty((0,), dtype=float)
 
+        # Only interpolate over the time span that every channel can currently support.
         overlap_start = max(tb[0] for tb in self._time_buf)
         overlap_end = min(tb[-1] for tb in self._time_buf)
         if self._next_t is None:
@@ -545,6 +543,8 @@ def resolve_published_gesture_output(
     left: ArmGestureState,
     combined: ArmGestureState,
 ) -> PublishedGestureOutput:
+    # Publish one fused label when both arms agree; otherwise expose the split
+    # arm view so downstream logging can still see the disagreement.
     if right.label == left.label:
         return PublishedGestureOutput(
             mode="single",
@@ -590,7 +590,7 @@ def fuse_predictions(label_r, conf_r, label_l, conf_l):
     neutral = str(LOW_CONFIDENCE_LABEL)
 
     if label_r == label_l:
-        # Both arms agree — strengthen the prediction
+        # Both arms agree - strengthen the prediction.
         combined_conf = max(conf_r, conf_l)
         if combined_conf >= DUAL_ARM_AGREE_THRESHOLD:
             return label_r, combined_conf
@@ -846,6 +846,8 @@ def _slice_channels_by_indices(batch_arr, indices, target_channels):
     idx = np.asarray(indices, dtype=int).reshape(-1)
     idx = idx[(idx >= 0) & (idx < arr.shape[1])]
     out = arr[:, idx] if idx.size else np.empty((arr.shape[0], 0), dtype=float)
+    # Padding keeps the per-arm tensor width stable even if the live stream is
+    # temporarily missing channels, which lets the strict model fail closed downstream.
     if out.shape[1] < target_channels:
         out = np.pad(
             out,

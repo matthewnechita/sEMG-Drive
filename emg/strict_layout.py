@@ -31,6 +31,7 @@ class StrictLayoutResolution:
 
 
 STRICT_ARM_LAYOUTS: dict[str, tuple[StrictSlot, ...]] = {
+    # This is the maintained fixed-placement contract for training and realtime.
     "right": (
         StrictSlot("R_Avanti_1", 1, "avanti", 1),
         StrictSlot("R_Avanti_2", 2, "avanti", 1),
@@ -129,6 +130,8 @@ def resolve_strict_channel_indices(
     channel_labels: list[str] | tuple[str, ...],
     arm: str,
 ) -> StrictLayoutResolution:
+    # Resolve by pair number and sensor kind so scan order does not have to
+    # match the training-time channel order.
     labels = [str(value) for value in channel_labels]
     arm_name = _normalize_arm(arm)
     slots = strict_slots_for_arm(arm_name)

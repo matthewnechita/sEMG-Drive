@@ -94,6 +94,8 @@ def compute_eval_artifacts(y_true, y_pred, index_to_label) -> dict[str, Any]:
     neutral_prediction_fp_rate = None
     if "neutral" in label_names:
         neutral_idx = label_names.index("neutral")
+        # Neutral-specific diagnostics matter for the maintained driving setup
+        # because false returns to neutral are more disruptive than generic confusion.
         for index, name in enumerate(label_names):
             if index == neutral_idx:
                 continue

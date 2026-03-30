@@ -38,7 +38,7 @@ from emg.training_data import (
 from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_root
 
 
-# ======== Config ========
+# -- Config --------------------------------------------------------------------
 ARM = "right"  # set to "right" or "left" before running
 TARGET_SUBJECT = "Matthew"
 
@@ -70,11 +70,10 @@ AUG_PROB = 0.4
 
 EXCLUDED_SUBJECTS: list[str] = []  # Keep empty for Matthew-only runs unless you need to blacklist a subject.
 INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "horn"}  # Example subset: {"neutral", "left_turn", "right_turn"}.
-# ========================
 
 MVC_QUALITY_MIN_RATIO = DEFAULT_MVC_MIN_RATIO
 
-
+# -- Data loading ------------------------------------------------------------
 def load_dataset(target_subject: str):
     files = sorted(DATA_ROOT.rglob(PATTERN))
     if not files:
@@ -127,6 +126,7 @@ def load_dataset(target_subject: str):
         subjects_list.append(np.array([subject_from_path(fp)] * len(labels), dtype=object))
         channel_counts.append(int(windows.shape[1]))
         layout_sources["emg_channel_labels"] = layout_sources.get("emg_channel_labels", 0) + 1
+        # Grouped CV only makes sense if every file resolves to the same strict arm layout.
         if strict_pair_order is None:
             strict_pair_order = tuple(strict_layout.pair_numbers)
             strict_slot_order = tuple(strict_layout.slot_names)
@@ -165,11 +165,12 @@ def _prepare_test_data(X, _mean, _std):
 
 
 # -- Augmentation --------------------------------------------------------------
-
 def augment_emg_gpu(
     xb: torch.Tensor,
     p: float,
 ) -> torch.Tensor:
+    # Keep the per-subject augmentation family aligned with cross-subject training,
+    # but use a narrower amplitude range because sessions come from one participant.
     """In-place-safe GPU augmentation. xb: (B, C, T) float32 on device."""
     bsz, channels, t_len = xb.shape
     dev = xb.device
@@ -467,6 +468,8 @@ def _run_grouped_cross_validation(
         shuffle=True,
         random_state=RANDOM_STATE,
     )
+    # Fill predictions back into original window order so final metrics use one
+    # out-of-fold label per window across the whole subject dataset.
     oof_pred = np.full(y_idx.shape, -1, dtype=np.int64)
     fold_results = []
 
@@ -528,6 +531,7 @@ def _run_grouped_cross_validation(
     balanced_values = [fold["metrics"]["balanced_accuracy"] for fold in fold_results]
     macro_f1_values = [fold["metrics"]["macro_f1"] for fold in fold_results]
     best_epoch_values = [fold["best_epoch"] for fold in fold_results]
+    # Reuse the median best epoch from grouped CV for the final full-data fit.
     selected_final_fit_epochs = max(1, int(np.rint(np.median(best_epoch_values))))
 
     print("\nFold metric summary:")

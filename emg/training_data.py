@@ -140,6 +140,8 @@ def load_strict_windows_from_file(
     emg = np.asarray(data["emg"], dtype=float)
     metadata = data.get("metadata")
     strict_layout = resolve_strict_indices_from_metadata(metadata, arm=arm)
+    # Filtered training files are expected to already match the selected arm;
+    # metadata is used to verify ordering, not to carve a mixed-arm matrix.
     if emg.shape[1] != strict_layout.ordered_indices.size:
         raise ValueError(
             f"{Path(path).name}: strict layout resolved {strict_layout.ordered_indices.size} "
@@ -173,6 +175,8 @@ def load_strict_windows_from_file(
     window_labels: list[str | None] = []
     for start, end in zip(starts, ends):
         label, confidence = majority_label_with_confidence(labels[start:end])
+        # Drop neutral buffers and mixed-label windows so training sees only
+        # stable gesture targets.
         if label == "neutral_buffer":
             label = None
         if (

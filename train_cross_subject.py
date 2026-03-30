@@ -35,8 +35,8 @@ from emg.training_data import (
 from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_root
 
 
-# ======== Config ========
-ARM        = "left"            # ← set to "right" or "left" before running, lowercase l
+# -- Config --------------------------------------------------------------------
+ARM = "left"  # Set to "right" or "left" before running.
 DATA_ROOT  = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
 MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "v6_4_gestures.pt"
 PATTERN    = "*_filtered.npz"
@@ -59,45 +59,31 @@ LR      = 1e-4
 DROPOUT = 0.25
 LABEL_SMOOTHING = 0.05
 
-# Subject-balanced sampling is always on for cross-subject training.
-
-# Augmentation — wide amplitude range matches inter-subject EMG amplitude
-# variance (~5-10x between people due to electrode placement, muscle mass).
+# Augmentation uses a wider amplitude range because cross-subject EMG varies
+# more across participants than within one participant.
 USE_AUGMENTATION = True
 AMP_RANGE = (0.5, 2.0)   # wide inter-subject amplitude variance range
 AUG_PROB  = 0.5
 
-# Subjects with failed MVC calibration or other DQ issues.
-# subject05: all 4 sessions have mvc_ratio <= 1.8x (MVC barely > neutral).
-# This corrupts the MVC normalisation; recollect before re-including.
+# Keep empty unless a participant should be excluded for known data-quality issues.
 EXCLUDED_SUBJECTS: list[str] = []
 
 # Optional gesture filtering (code-only; no CLI flags).
 # Set INCLUDED_GESTURES to a subset to train only those labels.
 # Example:
-# INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"} example
-INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "horn"} # set to = None to include all gestures
+# INCLUDED_GESTURES = {"neutral", "left_turn", "right_turn"}
+INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "horn"}  # Set to None to include all gestures.
 
 # LOSO evaluation must be run before deploying the cross-subject model.
-# This measures true cross-subject accuracy (model vs subjects it never trained on).
+# This measures true cross-subject accuracy on held-out participants.
 # Minimum recommended LOSO accuracy before deployment: 65%.
 LOSO_EVAL = True
 TRAIN_FINAL_MODEL = True
 
-# ========================
-
-
-# ── Label utilities ──────────────────────────────────────────────────────────
-
+# -- Label utilities ---------------------------------------------------------
 MVC_QUALITY_MIN_RATIO = DEFAULT_MVC_MIN_RATIO
 
-
-# ── Calibration ──────────────────────────────────────────────────────────────
-
-
-
-
-# ── Data loading ─────────────────────────────────────────────────────────────
+# -- Data loading ------------------------------------------------------------
 def load_dataset():
     files = sorted(DATA_ROOT.rglob(PATTERN))
     if not files:
@@ -143,6 +129,7 @@ def load_dataset():
         subjects_list.append(np.array([subject_from_path(fp)] * len(labels), dtype=object))
         channel_counts.append(int(windows.shape[1]))
         layout_sources["emg_channel_labels"] = layout_sources.get("emg_channel_labels", 0) + 1
+        # Every file in a cross-subject training run must resolve to the same strict slot order.
         if strict_pair_order is None:
             strict_pair_order = tuple(strict_layout.pair_numbers)
             strict_slot_order = tuple(strict_layout.slot_names)
@@ -174,15 +161,15 @@ def load_dataset():
     )
 
 
-# ── Normalisation ─────────────────────────────────────────────────────────────
+# -- Normalisation -----------------------------------------------------------
 def _prepare_test_data(X, _mean, _std):
     return standardize_windows(X, _mean, _std)
 
 
-# ── Augmentation (GPU-native) ─────────────────────────────────────────────────
-# All ops run on the GPU tensor after .to(device), eliminating CPU↔GPU round-trips.
+# -- Augmentation (GPU-native) -----------------------------------------------
+# All ops run on the GPU tensor after .to(device), eliminating CPU-GPU round-trips.
 # Temporal stretch uses a single F.interpolate over the whole batch (one factor per
-# batch) instead of per-sample loops, which is ~100× faster on GPU.
+# batch) instead of per-sample loops, which is ~100x faster on GPU.
 
 import torch.nn.functional as _F
 
@@ -192,14 +179,14 @@ def augment_emg_gpu(xb: torch.Tensor, p: float) -> torch.Tensor:
     dev = xb.device
     xb = xb.clone()
 
-    # 1. Amplitude scaling — per-sample random scale
+    # 1. Amplitude scaling - per-sample random scale
     mask = torch.rand(B, device=dev) < p
     if mask.any():
         n = int(mask.sum())
         factors = torch.empty(n, 1, 1, device=dev).uniform_(AMP_RANGE[0], AMP_RANGE[1])
         xb[mask] = xb[mask] * factors
 
-    # 2. Additive Gaussian noise — SNR-calibrated per sample
+    # 2. Additive Gaussian noise - SNR-calibrated per sample
     mask = torch.rand(B, device=dev) < p
     if mask.any():
         n = int(mask.sum())
@@ -209,7 +196,7 @@ def augment_emg_gpu(xb: torch.Tensor, p: float) -> torch.Tensor:
         noise_std  = (sig_power / snr_linear).sqrt().view(n, 1, 1)   # (n,1,1)
         xb[mask]   = xb[mask] + torch.randn(n, C, T, device=dev) * noise_std
 
-    # 3. Temporal shift — vectorised gather (no Python loop)
+    # 3. Temporal shift - vectorised gather (no Python loop)
     mask = torch.rand(B, device=dev) < p
     if mask.any():
         n      = int(mask.sum())
@@ -218,7 +205,7 @@ def augment_emg_gpu(xb: torch.Tensor, p: float) -> torch.Tensor:
         idx    = idx.unsqueeze(1).expand(-1, C, -1)                  # (n, C, T)
         xb[mask] = torch.gather(xb[mask], 2, idx)
 
-    # 4. Channel dropout — vectorised scatter
+    # 4. Channel dropout - vectorised scatter
     mask = torch.rand(B, device=dev) < p
     if mask.any():
         n       = int(mask.sum())
@@ -227,7 +214,7 @@ def augment_emg_gpu(xb: torch.Tensor, p: float) -> torch.Tensor:
         ch_mask.scatter_(1, drop_ch.unsqueeze(1), True)
         xb[mask] = xb[mask].masked_fill(ch_mask.unsqueeze(2), 0.0)
 
-    # 5. Temporal stretch — single batched interpolation (one shared factor per batch)
+    # 5. Temporal stretch - single batched interpolation (one shared factor per batch)
     if torch.rand(1, device=dev).item() < p:
         factor  = torch.empty(1, device=dev).uniform_(0.85, 1.15).item()
         new_len = max(1, int(T * factor))
@@ -240,16 +227,14 @@ def augment_emg_gpu(xb: torch.Tensor, p: float) -> torch.Tensor:
     return xb
 
 
-# ── Subject-balanced sampling ─────────────────────────────────────────────────
-
+# -- Subject-balanced sampling -----------------------------------------------
 def make_subject_sample_weights(subjects: np.ndarray) -> np.ndarray:
     unique, counts = np.unique(subjects, return_counts=True)
     weight_map = {s: 1.0 / c for s, c in zip(unique, counts)}
     return np.array([weight_map[s] for s in subjects], dtype=np.float32)
 
 
-# ── Model ─────────────────────────────────────────────────────────────────────
-
+# -- Model -------------------------------------------------------------------
 def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
     return build_model(
         in_channels=in_channels,
@@ -259,8 +244,7 @@ def _build_model(in_channels: int, num_classes: int, device) -> nn.Module:
     )
 
 
-# ── Training ──────────────────────────────────────────────────────────────────
-
+# -- Training ----------------------------------------------------------------
 def train_eval_split(
     X_train,
     y_train,
@@ -376,8 +360,7 @@ def train_eval_split(
     return model, mean, std, best_metric
 
 
-# ── LOSO evaluation ───────────────────────────────────────────────────────────
-
+# -- LOSO evaluation ---------------------------------------------------------
 def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_to_label):
     """Leave-one-subject-out: true measure of cross-subject generalisation.
 
@@ -387,7 +370,7 @@ def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_
     """
     unique_subjects = sorted(np.unique(subjects))
     if len(unique_subjects) < 2:
-        print("LOSO requires at least 2 subjects — skipping.")
+        print("LOSO requires at least 2 subjects - skipping.")
         return {"enabled": False, "reason": "requires_at_least_two_subjects"}
 
     print(f"\nLOSO evaluation over {len(unique_subjects)} subjects:")
@@ -455,8 +438,7 @@ def loso_evaluate(X, y_idx, subjects, channel_count, num_classes, device, index_
     }
 
 
-# ── Save bundle ───────────────────────────────────────────────────────────────
-
+# -- Save bundle -------------------------------------------------------------
 def _build_bundle(
     *,
     model: nn.Module,
@@ -634,12 +616,11 @@ def _train_and_save(
     print(f"Saved to {model_out}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
+# -- Main --------------------------------------------------------------------
 def main():
     if ARM not in ("right", "left"):
         raise ValueError(f"ARM must be 'right' or 'left', got {ARM!r}")
-    confirm = input(f"Training {ARM} arm cross-subject model — continue? [y/N] ").strip().lower()
+    confirm = input(f"Training {ARM} arm cross-subject model - continue? [y/N] ").strip().lower()
     if confirm != "y":
         print("Aborted.")
         return
@@ -677,8 +658,7 @@ def main():
     channels    = [int(channel_count), 32, 64, 128]
     num_classes = len(labels)
 
-    # LOSO runs first so you can assess cross-subject accuracy before committing
-    # to the final model weights.
+    # LOSO runs before the pooled final fit so deployment decisions can use zero-shot accuracy.
     evaluation_metadata = {}
     if LOSO_EVAL:
         evaluation_metadata["zero_shot_loso"] = loso_evaluate(

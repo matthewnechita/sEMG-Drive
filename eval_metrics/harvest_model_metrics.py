@@ -43,6 +43,7 @@ def _gesture_labels(index_to_label, metadata):
     labels = [label for _, label in sorted(index_to_label.items())]
     if labels:
         return labels
+    # Older bundles may only persist the label list in metadata.
     meta_labels = metadata.get("labels")
     if isinstance(meta_labels, (list, tuple)):
         return [str(label) for label in meta_labels]
@@ -108,6 +109,8 @@ def summarize_bundle(path: Path):
         metrics = {}
     stream = metadata.get("stream")
 
+    # Keep the harvested row close to the report table schema so later scripts
+    # can merge offline bundle metadata with latency and CARLA summaries.
     row = {
         "path": str(path),
         "filename": path.name,

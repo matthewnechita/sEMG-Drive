@@ -29,7 +29,7 @@ def _coerce_scalar_fs(value):
     return fs
 
 
-# LOAD IN THE RAW EMG DATA
+# -- Loading -----------------------------------------------------------------
 def load_emg_data(file_path):
     """
     Load the raw EMG data from the .npz file
@@ -41,7 +41,7 @@ def load_emg_data(file_path):
     if "emg" in data:
         emg = data["emg"]
         fs = _coerce_scalar_fs(data.get("fs"))
-        # carry any additional keys through to the filtered file
+        # Carry metadata and auxiliary arrays through untouched.
         extras = {k: data[k] for k in data.files if k not in ["emg", "fs"]}
     else:
         emg = data["X"]
@@ -58,7 +58,7 @@ def load_emg_data(file_path):
         for key in data.files:
             if key.startswith("calib_"):
                 extras[key] = data.get(key)
-        # derive sampling rate from timestamp spacing if not present
+        # Resampled raw files may not carry a scalar fs field yet.
         if "fs" in data:
             fs = _coerce_scalar_fs(data.get("fs"))
         elif isinstance(metadata, dict) and "fs" in metadata:
@@ -72,7 +72,7 @@ def load_emg_data(file_path):
     return emg, _coerce_scalar_fs(fs), extras
 
 
-# DEFINE THE FILTERS USING libEMG
+# -- Filter definition -------------------------------------------------------
 def define_filters(fs):
     """
     Create the filter object and install:
@@ -92,7 +92,7 @@ def define_filters(fs):
     return fi
 
 
-# APPLY THE FILTERS TO THE EMG DATA
+# -- Filtering ---------------------------------------------------------------
 def apply_filters(fi, emg):
     """
     This method applies the defined filters onto the raw EMG data
@@ -101,7 +101,7 @@ def apply_filters(fi, emg):
     return np.array(filtered_data, dtype=float)
 
 
-# SAVE THE FILTERED DATA INTO A .npz FILE
+# -- Saving ------------------------------------------------------------------
 def save_filtered_data(output_path, filtered, fs, extras):
     """
     This method saves the filtered data into a .npz file for later use
@@ -140,6 +140,8 @@ if __name__ == "__main__":
         if calib_neutral is not None:
             calib_neutral = np.asarray(calib_neutral, dtype=float)
             if calib_neutral.size:
+                # Filter calibration segments with the same chain as the training
+                # stream so MVC normalization uses comparable signal statistics.
                 extras["calib_neutral_emg"] = apply_filters(fi, calib_neutral)
             extras.pop("calib_neutral_X", None)
 

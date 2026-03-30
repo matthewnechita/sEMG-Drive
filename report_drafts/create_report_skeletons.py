@@ -192,6 +192,8 @@ def _core_xml(title: str) -> str:
 
 
 def _run(text: str, bold: bool = False, italic: bool = False) -> str:
+    # Build WordprocessingML runs directly so this script can emit a minimal
+    # .docx package without depending on python-docx in the repo.
     safe = escape(text)
     rpr = []
     if bold:
@@ -306,6 +308,8 @@ def _document_xml(paragraphs: list[tuple[str, str]]) -> str:
 
 
 def _docx_write(path: Path, title: str, paragraphs: list[tuple[str, str]]) -> None:
+    # Write the small OOXML package directly because these skeleton files only
+    # need stable headings, tables, and metadata placeholders.
     document_xml = _document_xml(paragraphs)
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", CONTENT_TYPES_XML)

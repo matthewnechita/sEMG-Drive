@@ -90,6 +90,8 @@ def main(argv=None):
     realtime_index = _index_rows(realtime_rows, args.join_key)
     carla_index = _index_rows(carla_rows, args.join_key)
 
+    # The join key is a per-prediction identifier emitted by both processes, so
+    # we do not depend on wall-clock synchronization between the two logs.
     shared_keys = sorted(set(realtime_index) & set(carla_index))
     if not shared_keys:
         raise ValueError(
@@ -106,6 +108,8 @@ def main(argv=None):
         window_end_ts = _to_float(rt_row.get("window_end_ts"))
         control_apply_ts = _to_float(carla_row.get("control_apply_ts"))
         label = str(rt_row.get(args.label_column, "")).strip()
+        # Window end to control apply is the maintained end-to-end latency path
+        # used in the current CARLA reporting workflow.
         e2e_ms = None if window_end_ts is None or control_apply_ts is None else (control_apply_ts - window_end_ts) * 1000.0
 
         if e2e_ms is not None:

@@ -23,6 +23,8 @@ class RealtimeTuning:
 
     @property
     def resolved_dual_arm_single_threshold(self) -> float:
+        # Mirror the minimum-confidence gate unless a stricter per-arm fallback
+        # was tuned explicitly for disagreement handling.
         if self.dual_arm_single_threshold is None:
             return float(self.min_confidence)
         return float(self.dual_arm_single_threshold)

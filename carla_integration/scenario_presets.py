@@ -7,6 +7,8 @@ CheckpointXYZ = Tuple[float, float, float]
 
 
 def _progress_markers(start_m: float, end_m: float, spacing_m: float) -> Tuple[float, ...]:
+    # Scenario wrappers store checkpoint progress in route meters so the client
+    # can draw markers and evaluate completion without hard-coding map points.
     markers = []
     current = float(start_m)
     end = float(end_m)
@@ -52,6 +54,7 @@ class ScenarioPreset:
 
 
 SCENARIO_PRESETS: Dict[str, ScenarioPreset] = {
+    # These are the maintained named scenarios used by the wrapper .cmd launchers.
     "lane_keep_5min": ScenarioPreset(
         name="lane_keep_5min",
         kind="lane_keep",

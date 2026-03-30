@@ -69,6 +69,8 @@ def main(argv=None):
     for row in rows:
         if deliverable_bucket and str(row.get("deliverable_bucket") or "").strip().lower() != deliverable_bucket:
             continue
+        # Skip rows that never populated CARLA metrics so the plot stays aligned
+        # with simulator-backed evaluation entries only.
         if _to_float(row.get("drive_lane_error_rmse_m_mean")) is None and _to_float(row.get("drive_completion_time_s_mean")) is None:
             continue
         filtered.append(row)

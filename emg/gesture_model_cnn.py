@@ -87,6 +87,8 @@ class GestureCNNv2(nn.Module):
         return self.head(combined)
 
     def extract_embedding(self, x, l2_normalize=False):
+        # Concatenate a single global energy feature so the head can use coarse
+        # activation magnitude alongside the learned temporal embedding.
         energy = x.pow(2).mean(dim=(1, 2)).unsqueeze(1)
         x = self.input_norm(x)
         x = self.stem(x)
@@ -113,6 +115,8 @@ class GestureModelBundle:
         return int(self.mean.shape[0])
 
     def standardize(self, X: np.ndarray) -> np.ndarray:
+        # Runtime bundles keep mean/std fields for compatibility, but the active
+        # CNN path applies InstanceNorm inside the model instead.
         return np.asarray(X, dtype=np.float32)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -135,6 +139,7 @@ def _resolve_architecture(bundle: dict, in_channels: int, num_classes: int):
     metadata = bundle.get("metadata") or {}
     arch_type = str(arch.get("type") or "").strip()
     if not arch_type:
+        # Older bundles infer the active architecture from metadata only.
         if metadata.get("use_instance_norm_input", False):
             arch_type = "GestureCNNv2"
     if arch_type != "GestureCNNv2":

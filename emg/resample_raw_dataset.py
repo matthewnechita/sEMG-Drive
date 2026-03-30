@@ -39,14 +39,13 @@ if str(REPO_ROOT) not in sys.path:
 from project_paths import STRICT_DATA_ROOT, STRICT_RESAMPLED_ROOT
 
 
-# ======== Config (edit in code) ========
+# -- Config -------------------------------------------------------------------
 DATA_ROOT = STRICT_DATA_ROOT
 OUTPUT_ROOT = STRICT_RESAMPLED_ROOT
 RAW_PATTERN = "*_raw.npz"
 TARGET_FS_HZ = 2000.0
 OVERWRITE = False
 MAX_FILES = None  # set to int for a quick smoke run, e.g. 2
-# =======================================
 
 
 def _estimate_fs_per_channel(timestamps: np.ndarray) -> list[float]:
@@ -92,6 +91,8 @@ def _monotonic_unique_time_series(t: np.ndarray, x: np.ndarray):
 
 
 def _build_common_grid(timestamps: np.ndarray, target_fs_hz: float):
+    # Clamp to the overlap interval so every channel is interpolated onto a
+    # shared grid without extrapolating past missing data.
     starts = []
     ends = []
     for ch in range(timestamps.shape[1]):
@@ -191,6 +192,8 @@ def _resample_optional_segment(data_dict: dict, x_key: str, ts_key: str, target_
         return
     if x_seg.ndim != 2 or ts_seg.ndim != 2 or x_seg.shape != ts_seg.shape:
         return
+    # Recalibration terms must live on the same time base as the main session
+    # so offline normalization matches the resampled training signal.
     t_grid, _, _ = _build_common_grid(ts_seg, target_fs_hz)
     x_out, ts_out = _resample_matrix(x_seg, ts_seg, t_grid)
     data_dict[x_key] = x_out
@@ -234,6 +237,8 @@ def _resample_file(src: Path, dst: Path, target_fs_hz: float) -> tuple[int, int]
     if not isinstance(metadata, dict):
         metadata = {"original_metadata": metadata}
 
+    # Preserve the original per-channel timing summary so downstream checks can
+    # tell whether the file came from a heterogeneous raw capture.
     fs_per_ch = _estimate_fs_per_channel(ts_in)
     metadata["resampling"] = {
         "enabled": True,

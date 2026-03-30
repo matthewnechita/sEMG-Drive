@@ -18,6 +18,8 @@ def _page_break() -> tuple[str, str]:
 
 
 def _final_report_draft() -> list[tuple[str, str]]:
+    # Keep the draft content in the same tuple format as create_report_skeletons
+    # so both scripts share one OOXML writer.
     p = _paragraph
     br = _page_break
     return [
@@ -292,6 +294,8 @@ def _final_report_draft() -> list[tuple[str, str]]:
 
 
 def _research_paper_tex() -> str:
+    # The paper draft is emitted as TeX so later edits stay diff-friendly and
+    # can be moved into a venue template with minimal manual cleanup.
     return r"""\documentclass[11pt]{article}
 \usepackage[margin=1in]{geometry}
 \usepackage[T1]{fontenc}

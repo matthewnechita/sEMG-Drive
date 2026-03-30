@@ -50,6 +50,8 @@ def _summary_lane_error(rows):
 
 
 def _completion_time_s(rows):
+    # Prefer scenario time if it exists, then control timestamps, then generic
+    # wall time so older logs still produce one comparable duration field.
     sim_vals = [_to_float(row.get("simulation_time")) for row in rows]
     sim_vals = [v for v in sim_vals if v is not None]
     if sim_vals:
@@ -120,6 +122,7 @@ def summarize_rows(rows):
         "completion_time_s": scenario_completion_s if scenario_completion_s is not None else _completion_time_s(rows),
     }
     if str(scenario_name or "").strip().lower() == "highway_overtake":
+        # Only the overtake scenario emits a command-level success flag today.
         command_success_rate = _command_success_rate(rows)
         if command_success_rate is not None:
             summary["command_success_rate"] = command_success_rate

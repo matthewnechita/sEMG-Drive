@@ -25,6 +25,8 @@ TEMPLATE_COLUMNS = [
 ]
 
 
+# The template is intentionally small and hand-editable so the report workflow
+# can be curated row-by-row instead of inferred entirely from filenames.
 TEMPLATE_ROWS = [
     {
         "row_id": "CR_3_PER",
@@ -444,6 +446,8 @@ def _match_model_rows(manifest_row, model_rows):
         target = model_filename.lower()
         return [row for row in model_rows if str(row.get("filename", "")).strip().lower() == target]
 
+    # Fall back to semantic matching so a manifest can stay stable even when the
+    # exact bundle filename changes after a retrain.
     matches = []
     for row in model_rows:
         if task and _normalize_task(row.get("gesture_bucket", "")) != task:
@@ -488,6 +492,8 @@ def _build_participant_rows(manifest_rows, model_rows):
                 suffix_parts.append(str(model_row.get("filename", f"model_{match_index}")))
             row["table_row_id"] = str(row.get("row_id", f"ROW_{manifest_index}"))
             if suffix_parts:
+                # Keep participant row ids deterministic so CSV, JSON, and Markdown
+                # exports all refer to the same logical row.
                 row["table_row_id"] += "__" + "__".join(_slugify(part) for part in suffix_parts if str(part).strip())
 
             row.update(_offline_from_model_row(model_row))
@@ -521,6 +527,8 @@ def _participant_key(row):
 
 def _aggregate_participant_bucket(rows):
     out = {}
+    # Average repeated runs per participant first so one subject with extra logs
+    # does not dominate the final aggregate table.
     for metric in NUMERIC_PARTICIPANT_METRICS:
         out[metric] = _mean(_to_float(row.get(metric)) for row in rows)
     success_values = [_to_bool(row.get("drive_scenario_success")) for row in rows]
@@ -581,6 +589,7 @@ def _build_aggregate_rows(participant_rows):
             "drive_lane_invasions",
             "drive_command_success_rate",
         ]:
+            # Aggregate rows summarize participant-level means, not raw trial rows.
             mean, sd = _mean_sd(summary.get(metric) for summary in participant_summaries)
             aggregate_row[f"{metric}_mean"] = mean
             aggregate_row[f"{metric}_sd"] = sd

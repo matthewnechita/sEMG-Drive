@@ -47,6 +47,8 @@ def _discover_carla_pairs() -> list[dict[str, str]]:
             if stamp:
                 rt_by_stamp[stamp] = path
 
+        # Pair runs by the shared filename stamp so latency analysis can join
+        # realtime and CARLA rows from the same simulator session.
         for stamp in sorted(set(carla_by_stamp) & set(rt_by_stamp)):
             pairs.append(
                 {
@@ -76,6 +78,8 @@ def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 def main() -> None:
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
+    # Keep one machine-readable index of every artifact generated in this pass
+    # so the report scripts can find staged outputs without re-discovering them.
     inventory: dict[str, object] = {
         "models_root": str(MODELS_ROOT),
         "output_root": str(OUT_ROOT),

@@ -54,6 +54,8 @@ def _arm_order(value):
 def _latest_rows(rows):
     latest = {}
     for row in rows:
+        # Collapse reruns down to the newest bundle for each logical slot so the
+        # plot reflects the current maintained models, not every historical export.
         key = (
             str(row.get("bundle_scope") or "").strip().lower(),
             str(row.get("arm") or "").strip().lower(),

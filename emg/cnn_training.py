@@ -19,6 +19,8 @@ def standardize_windows(
     mean: np.ndarray,
     std: np.ndarray,
 ) -> np.ndarray:
+    # The current CNN path stores normalization stats for bundle compatibility,
+    # but training and inference both consume raw float32 windows.
     del mean, std
     return np.asarray(X, dtype=np.float32)
 
@@ -86,5 +88,6 @@ def build_architecture_metadata(
 
 def build_model_metadata() -> dict:
     return {
+        # Bundles keep this flag so older loaders can still detect the active input path.
         "use_instance_norm_input": True,
     }
