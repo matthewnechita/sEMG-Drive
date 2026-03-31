@@ -38,15 +38,88 @@ def _last_nonempty(rows, column):
     return None
 
 
-def _summary_lane_error(rows):
-    vals = [_to_float(row.get("lane_error_m")) for row in rows]
+def _numeric_series(rows, column):
+    vals = [_to_float(row.get(column)) for row in rows]
     vals = [v for v in vals if v is not None]
+    return vals
+
+
+def _mean_or_none(values):
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def _summary_lane_offset(rows):
+    vals = _numeric_series(rows, "lane_error_m")
     if not vals:
-        return {"rmse_m": None}
+        return {"mean_m": None, "rmse_m": None}
     arr = np.asarray(vals, dtype=float)
     return {
+        "mean_m": float(np.mean(arr)),
         "rmse_m": float(np.sqrt(np.mean(np.square(arr)))),
     }
+
+
+def _mean_velocity_mps(rows):
+    return _mean_or_none(_numeric_series(rows, "speed_mps"))
+
+
+def _mean_velocity_deviation_mps(rows):
+    vals = _numeric_series(rows, "velocity_deviation_mps")
+    if vals:
+        return _mean_or_none(vals)
+
+    paired = []
+    for row in rows:
+        speed = _to_float(row.get("speed_mps"))
+        speed_limit = _to_float(row.get("speed_limit_mps"))
+        if speed is None or speed_limit is None:
+            continue
+        paired.append(abs(speed - speed_limit))
+    return _mean_or_none(paired)
+
+
+def _mean_abs_steering_angle_rad(rows):
+    vals = _numeric_series(rows, "steering_angle_rad")
+    if not vals:
+        return None
+    return float(np.mean(np.abs(np.asarray(vals, dtype=float))))
+
+
+def _steering_entropy(rows, bins=9):
+    vals = _numeric_series(rows, "steering_angle_rad")
+    if len(vals) < 3:
+        return None
+
+    arr = np.asarray(vals, dtype=float)
+    predicted = (2.0 * arr[1:-1]) - arr[:-2]
+    errors = arr[2:] - predicted
+    if errors.size == 0:
+        return None
+    if np.allclose(errors, errors[0]):
+        return 0.0
+
+    lo = float(np.min(errors))
+    hi = float(np.max(errors))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return 0.0
+
+    hist, _ = np.histogram(errors, bins=max(2, int(bins)), range=(lo, hi))
+    total = int(np.sum(hist))
+    if total <= 0:
+        return None
+
+    probs = hist.astype(float) / float(total)
+    probs = probs[probs > 0.0]
+    if probs.size == 0:
+        return None
+
+    entropy = float(-np.sum(probs * np.log2(probs)))
+    max_entropy = float(np.log2(max(2, int(bins))))
+    if max_entropy <= 0.0:
+        return None
+    return float(entropy / max_entropy)
 
 
 def _completion_time_s(rows):
@@ -108,7 +181,7 @@ def _command_success_rate(rows):
 
 
 def summarize_rows(rows):
-    lane = _summary_lane_error(rows)
+    lane = _summary_lane_offset(rows)
     scenario_name = _last_nonempty(rows, "scenario_name")
     scenario_completion_s = _scenario_completion_time_s(rows) if scenario_name else None
     summary = {
@@ -117,6 +190,11 @@ def summarize_rows(rows):
         "scenario_kind": _last_nonempty(rows, "scenario_kind"),
         "scenario_status": _last_nonempty(rows, "scenario_status"),
         "scenario_success": _scenario_success(rows),
+        "mean_velocity_mps": _mean_velocity_mps(rows),
+        "lane_offset_mean_m": lane["mean_m"],
+        "steering_angle_mean_rad": _mean_abs_steering_angle_rad(rows),
+        "mean_velocity_deviation_mps": _mean_velocity_deviation_mps(rows),
+        "steering_entropy": _steering_entropy(rows),
         "lane_error_rmse_m": lane["rmse_m"],
         "lane_invasions": _event_count(rows, "lane_invasion_event", "lane_invasion"),
         "completion_time_s": scenario_completion_s if scenario_completion_s is not None else _completion_time_s(rows),

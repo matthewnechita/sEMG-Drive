@@ -54,6 +54,7 @@ import math
 import random
 import re
 import weakref
+from configparser import ConfigParser
 from pathlib import Path
 
 from carla_integration.scenario_presets import get_scenario_preset, scenario_choices
@@ -70,6 +71,7 @@ try:
     from pygame.locals import K_F1
     from pygame.locals import K_PERIOD
     from pygame.locals import K_SPACE
+    from pygame.locals import K_TAB
     from pygame.locals import K_UP
     from pygame.locals import K_c
     from pygame.locals import K_m
@@ -183,6 +185,10 @@ class DriveCSVLogger(object):
             'brake',
             'reverse',
             'hand_brake',
+            'speed_mps',
+            'speed_limit_mps',
+            'velocity_deviation_mps',
+            'steering_angle_rad',
             'lane_error_m',
             'lane_invasion_event',
             'scenario_name',
@@ -219,6 +225,30 @@ def _velocity_speed_mps(velocity):
         + float(velocity.y) ** 2
         + float(velocity.z) ** 2
     )
+
+
+def _speed_limit_mps(actor):
+    try:
+        speed_limit_kph = float(actor.get_speed_limit())
+    except RuntimeError:
+        return None
+    if speed_limit_kph <= 0.0:
+        return None
+    return speed_limit_kph / 3.6
+
+
+def _vehicle_max_steer_angle_rad(actor):
+    try:
+        physics = actor.get_physics_control()
+    except RuntimeError:
+        return None
+    wheels = tuple(getattr(physics, "wheels", ()) or ())
+    if not wheels:
+        return None
+    max_deg = max(float(getattr(wheel, "max_steer_angle", 0.0) or 0.0) for wheel in wheels)
+    if max_deg <= 0.0:
+        return None
+    return math.radians(max_deg)
 
 
 def _shift_location(location, z=0.0):
@@ -1534,6 +1564,7 @@ class World(object):
             self.world.apply_settings(settings)
 
     def restart(self):
+        cam_transform_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
         self._scenario_exit_requested = False
         if self.player is not None:
             self.destroy()
@@ -1556,7 +1587,7 @@ class World(object):
         # Set up the sensors.
         self.collision_sensor = CollisionSensor(self.player, self.hud)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
-        self.camera_manager = CameraManager(self.player, self.hud)
+        self.camera_manager = CameraManager(self.player, self.hud, transform_index=cam_transform_index)
         actor_type = get_actor_display_name(self.player)
         self.hud.notification(actor_type)
         if self._scenario_runtime is not None:
@@ -1632,6 +1663,12 @@ class DualControl(object):
         # Store references so gesture actions can affect vehicle + HUD
         self._player = world.player
         self._hud = world.hud
+        self._joystick = None
+        self._throttle_idx = None
+        self._brake_idx = None
+        self._handbrake_idx = None
+        self._vehicle_max_steer_angle_rad = _vehicle_max_steer_angle_rad(world.player)
+        self._init_wheel_controls()
         
         # Gesture freshness (optional safety: ignore stale labels)
         self._gesture_max_age = float(CARLA_TUNING.gesture_max_age_s)
@@ -1680,6 +1717,28 @@ class DualControl(object):
             self._drive_logger.close()
             self._drive_logger = None
 
+    def _init_wheel_controls(self):
+        pygame.joystick.init()
+        joystick_count = pygame.joystick.get_count()
+        if joystick_count <= 0:
+            print("[wheel] no steering wheel detected; using keyboard throttle/brake")
+            return
+        if joystick_count > 1:
+            raise ValueError("Please connect just one joystick")
+
+        self._joystick = pygame.joystick.Joystick(0)
+        self._joystick.init()
+
+        parser = ConfigParser()
+        wheel_config_path = os.path.join(SCRIPT_DIR, 'wheel_config.ini')
+        if not parser.read(wheel_config_path):
+            raise FileNotFoundError("wheel config not found: %s" % wheel_config_path)
+
+        self._throttle_idx = int(parser.get('G29 Racing Wheel', 'throttle'))
+        self._brake_idx = int(parser.get('G29 Racing Wheel', 'brake'))
+        self._handbrake_idx = int(parser.get('G29 Racing Wheel', 'handbrake'))
+        print("[wheel] joystick controls enabled from %s" % wheel_config_path)
+
     def _get_live_player(self):
         player = self._player
         if player is None:
@@ -1711,6 +1770,7 @@ class DualControl(object):
             self._control = player.get_control()
         except RuntimeError:
             self._control = carla.VehicleControl()
+        self._vehicle_max_steer_angle_rad = _vehicle_max_steer_angle_rad(player)
         player.set_autopilot(self._autopilot_enabled)
 
         if reset_state_on_change:
@@ -1729,6 +1789,8 @@ class DualControl(object):
                     world.restart()
                 elif event.key == K_F1:
                     world.hud.toggle_info()
+                elif event.key == K_TAB and world.camera_manager is not None:
+                    world.camera_manager.toggle_camera()
                 elif event.key == K_c and pygame.key.get_mods() & KMOD_SHIFT:
                     world.next_weather(reverse=True)
                 elif event.key == K_c:
@@ -1752,6 +1814,7 @@ class DualControl(object):
         self._sync_world_refs(world, reset_state_on_change=True)
         if not self._autopilot_enabled:
             self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
+            self._parse_vehicle_wheel()
             self._apply_gesture_override()
             self._control.reverse = self._control.gear < 0
             world.player.apply_control(self._control)
@@ -1761,6 +1824,35 @@ class DualControl(object):
         self._control.throttle = 1.0 if keys[K_UP] or keys[K_w] else 0.0
         self._control.brake = 1.0 if keys[K_DOWN] or keys[K_s] else 0.0
         self._control.hand_brake = keys[K_SPACE]
+
+    def _parse_vehicle_wheel(self):
+        if self._joystick is None:
+            return
+
+        num_axes = self._joystick.get_numaxes()
+        js_inputs = [float(self._joystick.get_axis(i)) for i in range(num_axes)]
+        if max(self._throttle_idx, self._brake_idx) >= len(js_inputs):
+            return
+
+        js_buttons = [
+            float(self._joystick.get_button(i))
+            for i in range(self._joystick.get_numbuttons())
+        ]
+
+        k2 = 1.6
+        throttle_cmd = k2 + (2.05 * math.log10(-0.7 * js_inputs[self._throttle_idx] + 1.4) - 1.2) / 0.92
+        throttle_cmd = max(0.0, min(1.0, throttle_cmd))
+
+        brake_cmd = k2 + (2.05 * math.log10(-0.7 * js_inputs[self._brake_idx] + 1.4) - 1.2) / 0.92
+        brake_cmd = max(0.0, min(1.0, brake_cmd))
+
+        hand_brake_pressed = False
+        if self._handbrake_idx < len(js_buttons):
+            hand_brake_pressed = bool(js_buttons[self._handbrake_idx])
+
+        self._control.throttle = max(float(self._control.throttle), throttle_cmd)
+        self._control.brake = max(float(self._control.brake), brake_cmd)
+        self._control.hand_brake = bool(self._control.hand_brake) or hand_brake_pressed
 
     def _start_gesture_thread(self):
         if realtime_gesture is None:
@@ -1947,6 +2039,9 @@ class DualControl(object):
     def _log_drive_step(self, world):
         if self._drive_logger is None:
             return
+        player = self._get_live_player()
+        if player is None:
+            return
         published = self._latest_published
         if published is None:
             published = getattr(realtime_gesture, "PublishedGestureOutput", None)
@@ -1957,6 +2052,23 @@ class DualControl(object):
 
         apply_ts = time.time()
         scenario = world.get_scenario_snapshot()
+        try:
+            speed_mps = _velocity_speed_mps(player.get_velocity())
+        except RuntimeError:
+            speed_mps = None
+        speed_limit_mps = _speed_limit_mps(player)
+        velocity_deviation_mps = (
+            abs(float(speed_mps) - float(speed_limit_mps))
+            if speed_mps is not None and speed_limit_mps is not None
+            else None
+        )
+        if self._vehicle_max_steer_angle_rad is None:
+            self._vehicle_max_steer_angle_rad = _vehicle_max_steer_angle_rad(player)
+        steering_angle_rad = (
+            float(getattr(self._control, 'steer', 0.0)) * float(self._vehicle_max_steer_angle_rad)
+            if self._vehicle_max_steer_angle_rad is not None
+            else None
+        )
         row = {
             'timestamp': datetime.datetime.now().isoformat(),
             'control_apply_ts': apply_ts,
@@ -1969,6 +2081,10 @@ class DualControl(object):
             'brake': float(getattr(self._control, 'brake', 0.0)),
             'reverse': bool(getattr(self._control, 'reverse', False)),
             'hand_brake': bool(getattr(self._control, 'hand_brake', False)),
+            'speed_mps': speed_mps,
+            'speed_limit_mps': speed_limit_mps,
+            'velocity_deviation_mps': velocity_deviation_mps,
+            'steering_angle_rad': steering_angle_rad,
             'lane_error_m': self._estimate_lane_error_m(world),
             'lane_invasion_event': bool(lane_invasion_event),
             'scenario_name': str(scenario.get('scenario_name', '')),
@@ -2289,12 +2405,16 @@ class LaneInvasionSensor(object):
 
 
 class CameraManager(object):
-    def __init__(self, parent_actor, hud):
+    def __init__(self, parent_actor, hud, transform_index=0):
         self.sensor = None
         self.surface = None
         self._parent = parent_actor
         self.hud = hud
-        self._camera_transform = carla.Transform(carla.Location(x=1.6, z=1.7))
+        self._camera_transforms = [
+            carla.Transform(carla.Location(x=-5.5, z=2.8), carla.Rotation(pitch=-15)),
+            carla.Transform(carla.Location(x=1.6, z=1.7)),
+        ]
+        self.transform_index = int(transform_index) % len(self._camera_transforms)
         world = self._parent.get_world()
         bp_library = world.get_blueprint_library()
         bp = bp_library.find('sensor.camera.rgb')
@@ -2310,10 +2430,18 @@ class CameraManager(object):
             bp.set_attribute('image_size_y', str(hud.dim[1]))
         self.sensor = self._parent.get_world().spawn_actor(
             bp,
-            self._camera_transform,
+            self._camera_transforms[self.transform_index],
             attach_to=self._parent)
         weak_self = weakref.ref(self)
         self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
+
+    def toggle_camera(self):
+        self.transform_index = (self.transform_index + 1) % len(self._camera_transforms)
+        if self.sensor is not None:
+            self.sensor.set_transform(self._camera_transforms[self.transform_index])
+        if self.hud is not None:
+            label = 'Third-person' if self.transform_index == 0 else 'Dash'
+            self.hud.notification('Camera: %s' % label)
 
     def render(self, display):
         if self.surface is not None:

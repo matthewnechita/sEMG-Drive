@@ -56,10 +56,17 @@ It also records bundle scope, subject, arm, label set, channel count, window set
 
 - scenario success
 - completion time
+- mean velocity
+- mean velocity deviation
+- lane offset mean
+- steering angle mean
+- steering entropy
 - lane error RMSE
 - lane invasions
 
 For `highway_overtake`, it also reports `command_success_rate` if and only if the input log explicitly contains `command_correct`.
+
+The paper-aligned driving metrics are kept as raw performance measures. The maintained path does not convert them into paper-style binary safety scores.
 
 `build_eval_tables.py` is the report-assembly layer. It reads a manifest, flattens offline, latency, and drive summaries into participant rows, and then builds aggregate rows from those participant rows.
 
@@ -94,6 +101,10 @@ Latency validation is explicit. `analyze_latency.py` fails if the two logs do no
 
 Drive-metric validation is also explicit:
 
+- mean velocity comes from the logged vehicle speed trace
+- mean velocity deviation comes from the logged difference between vehicle speed and the posted speed limit
+- steering angle is derived from the applied steer command and the vehicle's maximum steer angle
+- steering entropy is computed from second-order prediction residuals over the logged steering-angle trace
 - lane error is computed from the logged lane offset values
 - lane invasions come from logged invasion events
 - scenario success is taken from the scenario runtime state rather than guessed from the path alone

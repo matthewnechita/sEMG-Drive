@@ -95,6 +95,8 @@ The per-tick drive log validates the whole control loop by recording:
 - `prediction_seq`
 - requested and applied steering keys
 - the actual steer value
+- vehicle speed and posted speed-limit context
+- an approximate steering angle in radians derived from the applied steer value and the vehicle steer range
 - reverse state
 - lane error estimate
 - lane invasion events
