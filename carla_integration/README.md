@@ -15,7 +15,7 @@ This folder contains the Python-side CARLA files that are maintained in the repo
   - Restored-display CARLA server launcher.
 - `test_run_manual_control_emg_0_9_16.bat`
   - Free-roam practice launcher.
-  - Defaults to `Town03_Opt` with `10` vehicles and `18` pedestrians.
+  - Defaults to `Town03_Opt` with `150` vehicles and `0` pedestrians.
 - `lane_keep_5min.cmd`
   - Named lane-keep scenario wrapper.
 - `highway_overtake.cmd`

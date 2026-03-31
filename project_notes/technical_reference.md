@@ -160,7 +160,7 @@ Free-roam practice launcher:
 
 - `carla_integration/test_run_manual_control_emg_0_9_16.bat`
   - map: `Town03_Opt`
-  - defaults: `10` vehicles, `18` pedestrians
+  - defaults: `150` vehicles, `0` pedestrians
   - `Backspace` respawns a random free-roam vehicle
 
 ## Evaluation

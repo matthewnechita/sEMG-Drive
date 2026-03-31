@@ -31,7 +31,7 @@ if not exist "%PYTHON_EXE%" (
 
 echo !EXTRA_ARGS! | findstr /I /C:"--scenario" >nul
 if errorlevel 1 (
-    set "FREEROAM_AMBIENT_ARGS=--ambient-vehicles 10 --ambient-pedestrians 18"
+    set "FREEROAM_AMBIENT_ARGS=--ambient-vehicles 90 --ambient-pedestrians 0"
 )
 
 set SDL_VIDEO_FULLSCREEN_DISPLAY=2

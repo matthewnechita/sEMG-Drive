@@ -49,7 +49,7 @@ CARLA notes
 - Current named scenario maps:
   - `lane_keep_5min` -> `Town04_Opt`
   - `highway_overtake` -> `Town04_Opt`
-- The free-roam launcher uses `Town03_Opt` with default ambient traffic of `10` vehicles and `18` pedestrians.
+- The free-roam launcher uses `Town03_Opt` with default ambient traffic of `150` vehicles and `0` pedestrians.
 - `manual_control_emg.py` is now keyboard/EMG vehicle-only; wheel, walker, GNSS, and multi-camera mode support have been removed from the maintained path.
 - Weather hotkeys are still kept:
   - `C` = next weather

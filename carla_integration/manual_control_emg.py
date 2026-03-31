@@ -769,7 +769,7 @@ class ScenarioRuntime(object):
         actor = self._lead_vehicle
         if actor is None or not actor.is_alive or self._traffic_manager is None:
             return
-        reduction_pct = max(0.0, min(100.0, float(reduction_pct)))
+        reduction_pct = max(-100.0, min(100.0, float(reduction_pct)))
         if (
             self._lead_speed_reduction_pct is not None
             and abs(float(self._lead_speed_reduction_pct) - reduction_pct) < 0.25
@@ -848,21 +848,24 @@ class ScenarioRuntime(object):
             return
 
         base_target_speed_mps = speed_limit_mps * max(0.0, 1.0 - (base_reduction_pct / 100.0))
-        match_ratio = max(0.0, min(1.0, float(getattr(self.preset, "lead_reactive_match_ratio", 0.85))))
-        ego_margin_mps = max(0.5, float(getattr(self.preset, "lead_reactive_ego_margin_mps", 2.5)))
-        fastest_allowed_reduction_pct = max(
+        target_speed_ratio = max(
             0.0,
+            float(getattr(self.preset, "lead_reactive_target_speed_ratio", 0.85)),
+        )
+        min_reduction_pct = max(
+            -100.0,
             min(100.0, float(getattr(self.preset, "lead_reactive_min_reduction_pct", 22.0))),
         )
 
-        ego_challenge_speed_mps = max(base_target_speed_mps, float(ego_speed_mps) - ego_margin_mps)
-        desired_target_speed_mps = base_target_speed_mps + (
-            max(0.0, ego_challenge_speed_mps - base_target_speed_mps) * match_ratio
+        # A ratio of 1.12 means the lead tries to hold 112% of ego speed
+        # while the response is active, subject to the configured TM cap.
+        desired_target_speed_mps = max(
+            base_target_speed_mps,
+            float(ego_speed_mps) * target_speed_ratio,
         )
         desired_target_speed_mps = min(
             desired_target_speed_mps,
-            ego_challenge_speed_mps,
-            speed_limit_mps * max(0.0, 1.0 - (fastest_allowed_reduction_pct / 100.0)),
+            speed_limit_mps * max(0.0, 1.0 - (min_reduction_pct / 100.0)),
         )
         if desired_target_speed_mps <= (base_target_speed_mps + 0.1):
             self._lead_response_active = False
@@ -1367,7 +1370,7 @@ class AmbientTrafficManager(object):
                     carla.Location(
                         x=float(location.x),
                         y=float(location.y),
-                        z=float(location.z) + 0.5,
+                        z=float(location.z),
                     )
                 )
             )
@@ -1409,7 +1412,7 @@ class AmbientTrafficManager(object):
             walker_batch.append(carla.command.SpawnActor(walker_blueprint, spawn_point))
 
         spawned_walkers = []
-        for response, speed in zip(self._client.apply_batch_sync(walker_batch, False), walker_speeds):
+        for response, speed in zip(self._client.apply_batch_sync(walker_batch, True), walker_speeds):
             if response.error:
                 continue
             spawned_walkers.append((int(response.actor_id), float(speed)))
@@ -1427,7 +1430,7 @@ class AmbientTrafficManager(object):
         walker_controller_speeds = []
         failed_walker_ids = []
         for response, (walker_actor_id, speed) in zip(
-            self._client.apply_batch_sync(controller_batch, False),
+            self._client.apply_batch_sync(controller_batch, True),
             spawned_walkers,
         ):
             if response.error:
@@ -1451,8 +1454,30 @@ class AmbientTrafficManager(object):
         except RuntimeError:
             pass
 
+        try:
+            world_settings = self._world.get_settings()
+            if bool(getattr(world_settings, "synchronous_mode", False)):
+                self._world.tick()
+            else:
+                self._world.wait_for_tick()
+        except RuntimeError:
+            pass
+
+        controller_actors = {}
+        if self._walker_controller_ids:
+            try:
+                controller_actors = {
+                    int(actor.id): actor
+                    for actor in self._world.get_actors(list(self._walker_controller_ids))
+                    if actor is not None
+                }
+            except (RuntimeError, TypeError):
+                controller_actors = {}
+
         for controller_id, speed in zip(self._walker_controller_ids, walker_controller_speeds):
-            controller = self._world.get_actor(int(controller_id))
+            controller = controller_actors.get(int(controller_id))
+            if controller is None:
+                controller = self._world.get_actor(int(controller_id))
             if controller is None:
                 continue
             try:
@@ -2205,7 +2230,8 @@ class HUD(object):
             self._info_text += scenario_lines
         if len(vehicles) > 1:
             self._info_text += ['Nearby vehicles:']
-            distance = lambda l: math.sqrt((l.x - t.location.x)**2 + (l.y - t.location.y)**2 + (l.z - t.location.z)**2)
+            player_location = world.player.get_location()
+            distance = lambda l: _location_distance(l, player_location)
             vehicles = [(distance(x.get_location()), x) for x in vehicles if x.id != world.player.id]
             for d, vehicle in sorted(vehicles):
                 if d > 200.0:

@@ -45,8 +45,7 @@ class ScenarioPreset:
     lead_reactive_trigger_distance_m: float = 24.0
     lead_reactive_trigger_gap_m: float = 28.0
     lead_reactive_release_gap_m: float = 6.0
-    lead_reactive_match_ratio: float = 0.85
-    lead_reactive_ego_margin_mps: float = 2.5
+    lead_reactive_target_speed_ratio: float = 0.85
     lead_reactive_min_reduction_pct: float = 22.0
     overtake_finish_margin_m: float = 12.0
     require_return_to_start_lane: bool = True
@@ -87,9 +86,8 @@ SCENARIO_PRESETS: Dict[str, ScenarioPreset] = {
         lead_reactive_trigger_distance_m=28.0,
         lead_reactive_trigger_gap_m=30.0,
         lead_reactive_release_gap_m=7.0,
-        lead_reactive_match_ratio=0.82,
-        lead_reactive_ego_margin_mps=2.5,
-        lead_reactive_min_reduction_pct=24.0,
+        lead_reactive_target_speed_ratio=1.12,
+        lead_reactive_min_reduction_pct=-12.0,
         overtake_finish_margin_m=15.0,
         require_return_to_start_lane=True,
     ),

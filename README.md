@@ -243,8 +243,8 @@ The maintained CARLA client keeps a practical, simplified interface:
 Free roam currently defaults to:
 
 - map: `Town03_Opt`
-- `10` ambient vehicles
-- `18` pedestrians
+- `150` ambient vehicles
+- `0` pedestrians
 
 Named scenarios currently use:
 
