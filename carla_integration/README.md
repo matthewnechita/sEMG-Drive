@@ -7,7 +7,7 @@ This folder contains the Python-side CARLA files that are maintained in the repo
 - `manual_control_emg.py`
   - Maintained EMG/CARLA client.
   - Loads named scenarios, starts realtime inference, and can write evaluation logs.
-  - Uses keyboard + EMG vehicle control only in the maintained repo state.
+  - Preferred evaluation path uses keyboard + EMG vehicle control, but the current client also retains optional steering-wheel throttle/brake support when one joystick is detected.
 
 ## Wrapper scripts
 
@@ -15,7 +15,7 @@ This folder contains the Python-side CARLA files that are maintained in the repo
   - Restored-display CARLA server launcher.
 - `test_run_manual_control_emg_0_9_16.bat`
   - Free-roam practice launcher.
-  - Defaults to `Town03_Opt` with `150` vehicles and `0` pedestrians.
+  - Defaults to `Town03_Opt` with `90` vehicles and `0` pedestrians.
 - `lane_keep_5min.cmd`
   - Named lane-keep scenario wrapper.
 - `highway_overtake.cmd`
@@ -99,10 +99,16 @@ The dedicated eval wrappers above apply those `--eval-log-dir` arguments automat
   - Previous weather preset.
 - `F1`
   - Toggle the HUD.
+- `Tab`
+  - Toggle the inherited camera view.
+- `P`
+  - Toggle autopilot.
+- `Q`, `M`, `,`, `.`
+  - Retained manual-gear hotkeys inherited from the base manual-control client.
 
 ## Notes
 
 - For evaluation runs, prefer the named scenario wrappers and eval wrappers instead of typing long CLI commands manually.
 - Named scenario presets choose their own maps.
 - `manual_control_emg.py` also supports direct free-roam runs with `--map`, `--ambient-vehicles`, and `--ambient-pedestrians`.
-- The maintained camera path is a single standard RGB camera view.
+- The preferred evaluation view is the standard RGB camera, but the inherited camera toggle is still available.

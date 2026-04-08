@@ -20,10 +20,11 @@ def _to_float(value):
 
 
 def _label_for_row(row):
+    scenario = str(row.get("drive_scenario_name") or "").strip()
     task = str(row.get("task") or "").strip()
     scope = str(row.get("model_scope") or "").strip()
     arm = str(row.get("arm") or "").strip().title()
-    parts = [part for part in (task, scope, arm) if part]
+    parts = [part for part in (scenario, task, scope, arm) if part]
     if parts:
         return "\n".join(parts)
     return str(row.get("row_id") or "").strip() or "row"
@@ -79,26 +80,38 @@ def main(argv=None):
         raise ValueError("No aggregate CARLA rows matched the requested filters.")
 
     labels = [_label_for_row(row) for row in filtered]
+    success_rate = [(_to_float(row.get("drive_scenario_success_rate")) or 0.0) * 100.0 for row in filtered]
+    completion = [_to_float(row.get("drive_completion_time_s_mean")) for row in filtered]
+    completion_sd = [_to_float(row.get("drive_completion_time_s_sd")) or 0.0 for row in filtered]
+    mean_velocity = [_to_float(row.get("drive_mean_velocity_mps_mean")) for row in filtered]
+    mean_velocity_sd = [_to_float(row.get("drive_mean_velocity_mps_sd")) or 0.0 for row in filtered]
+    lane_offset = [_to_float(row.get("drive_lane_offset_mean_m_mean")) for row in filtered]
+    lane_offset_sd = [_to_float(row.get("drive_lane_offset_mean_m_sd")) or 0.0 for row in filtered]
+    steering_angle = [_to_float(row.get("drive_steering_angle_mean_rad_mean")) for row in filtered]
+    steering_angle_sd = [_to_float(row.get("drive_steering_angle_mean_rad_sd")) or 0.0 for row in filtered]
+    steering_entropy = [_to_float(row.get("drive_steering_entropy_mean")) for row in filtered]
+    steering_entropy_sd = [_to_float(row.get("drive_steering_entropy_sd")) or 0.0 for row in filtered]
     lane_rmse = [_to_float(row.get("drive_lane_error_rmse_m_mean")) for row in filtered]
     lane_rmse_sd = [_to_float(row.get("drive_lane_error_rmse_m_sd")) or 0.0 for row in filtered]
     invasions = [_to_float(row.get("drive_lane_invasions_mean")) for row in filtered]
     invasions_sd = [_to_float(row.get("drive_lane_invasions_sd")) or 0.0 for row in filtered]
-    completion = [_to_float(row.get("drive_completion_time_s_mean")) for row in filtered]
-    completion_sd = [_to_float(row.get("drive_completion_time_s_sd")) or 0.0 for row in filtered]
-    success_rate = [(_to_float(row.get("drive_scenario_success_rate")) or 0.0) * 100.0 for row in filtered]
 
     from matplotlib import pyplot as plt
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
+    fig, axes = plt.subplots(4, 2, figsize=(15, 14), constrained_layout=True)
     fig.suptitle(args.title.strip() or "CARLA Performance Summary", fontsize=14, fontweight="bold")
     x = list(range(len(filtered)))
     color = "#1f4b99"
 
     plots = [
-        (axes[0][0], lane_rmse, lane_rmse_sd, "Lane Error RMSE (m)"),
-        (axes[0][1], invasions, invasions_sd, "Lane Invasions"),
-        (axes[1][0], completion, completion_sd, "Completion Time (s)"),
-        (axes[1][1], success_rate, None, "Scenario Success Rate (%)"),
+        (axes[0][0], success_rate, None, "Scenario Success Rate (%)"),
+        (axes[0][1], completion, completion_sd, "Completion Time (s)"),
+        (axes[1][0], mean_velocity, mean_velocity_sd, "Mean Velocity (m/s)"),
+        (axes[1][1], lane_offset, lane_offset_sd, "Lane Offset Mean (m)"),
+        (axes[2][0], steering_angle, steering_angle_sd, "Steering Angle Mean (rad)"),
+        (axes[2][1], steering_entropy, steering_entropy_sd, "Steering Entropy"),
+        (axes[3][0], lane_rmse, lane_rmse_sd, "Lane Error RMSE (m)"),
+        (axes[3][1], invasions, invasions_sd, "Lane Invasions"),
     ]
 
     for ax, values, errors, ylabel in plots:

@@ -58,6 +58,8 @@ def _gesture_bucket(labels, path: Path):
     count = len(labels)
     if count == 3:
         return "3_gesture"
+    if count == 4:
+        return "4_gesture"
     if count == 5:
         return "5_gesture"
     if count == 6:

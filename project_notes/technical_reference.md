@@ -136,8 +136,8 @@ Important behavior:
 - treats dual-horn as the reverse toggle request
 - can load named scenarios
 - can write per-tick drive logs and forwarded realtime logs
-- uses keyboard/EMG vehicle control only in the maintained repo state
-- keeps one standard RGB camera view
+- prefers keyboard/EMG vehicle control in the maintained evaluation path, but the current client still retains optional steering-wheel throttle/brake support
+- keeps one preferred standard RGB camera view for evaluation, while the inherited camera toggle remains available
 - keeps keyboard weather controls (`C`, `Shift+C`)
 
 Named scenarios in `carla_integration/scenario_presets.py`:
@@ -160,7 +160,7 @@ Free-roam practice launcher:
 
 - `carla_integration/test_run_manual_control_emg_0_9_16.bat`
   - map: `Town03_Opt`
-  - defaults: `150` vehicles, `0` pedestrians
+  - defaults: `90` vehicles, `0` pedestrians
   - `Backspace` respawns a random free-roam vehicle
 
 ## Evaluation

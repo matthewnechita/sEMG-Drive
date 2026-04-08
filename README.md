@@ -149,6 +149,10 @@ The final maintained metric set is:
 - CARLA:
   - scenario success
   - completion time
+  - mean velocity
+  - lane offset mean
+  - steering angle mean
+  - steering entropy
   - lane error RMSE
   - lane invasions
 
@@ -175,8 +179,8 @@ The current repo has been cleaned down to the active workflow only:
 - fixed sensor placement workflow
 - fixed 4-gesture contract
 - dual-arm realtime inference
-- keyboard + EMG CARLA control
-- one maintained CARLA camera view
+- keyboard-first + EMG CARLA control, with optional steering-wheel throttle/brake support still present in the client
+- one preferred CARLA camera view for evaluation, while the default camera toggle remains available in code
 
 Older experimental branches, unused model families, deprecated calibration paths, and stale evaluation scripts are not part of the maintained code path anymore.
 
@@ -235,7 +239,7 @@ carla_integration\highway_overtake_eval.cmd
 
 The maintained CARLA client keeps a practical, simplified interface:
 
-- standard RGB camera view only
+- standard RGB camera view preferred for evaluation, with `Tab` still wired to the inherited camera toggle
 - keyboard weather control with `C` and `Shift+C`
 - `Backspace` restarts the vehicle
 - in free roam, `Backspace` respawns a random vehicle
@@ -243,7 +247,7 @@ The maintained CARLA client keeps a practical, simplified interface:
 Free roam currently defaults to:
 
 - map: `Town03_Opt`
-- `150` ambient vehicles
+- `90` ambient vehicles
 - `0` pedestrians
 
 Named scenarios currently use:
@@ -255,15 +259,124 @@ More CARLA-specific detail lives in [carla_integration/README.md](/C:/Users/matt
 
 ## Evaluation Workflow
 
-The usual evaluation flow is:
+Use this order when collecting and processing final evaluation runs.
 
-1. run CARLA scenarios with logging enabled
-2. harvest model metrics from saved bundles
-3. analyze latency and driving logs
-4. build participant-level and aggregate tables
-5. generate the final offline and CARLA summary plots
+### 1. Collect raw evaluation runs
 
-Evaluation documentation and commands live in [eval_metrics/README.md](/C:/Users/matth/Desktop/capstone/capstone-emg/eval_metrics/README.md).
+Run the named eval wrappers:
+
+```bat
+carla_integration\lane_keep_5min_eval.cmd
+carla_integration\highway_overtake_eval.cmd
+```
+
+Each wrapper launches `manual_control_emg.py` with `--eval-log-dir`, which auto-saves:
+
+- `carla_drive_<timestamp>.csv`
+- `realtime_predictions_<timestamp>.csv`
+
+Saved locations:
+
+- `eval_metrics/out/lane_keep_eval/`
+- `eval_metrics/out/highway_overtake_eval/`
+
+The filenames are timestamp-based, not manually chosen, so the raw logs are preserved automatically as long as the run starts cleanly.
+
+### 2. Harvest offline model metrics
+
+Run this once for the current strict model bundles:
+
+```powershell
+python eval_metrics/harvest_model_metrics.py --models-root models/strict --output-csv eval_metrics/out/model_metrics.csv --output-json eval_metrics/out/model_metrics.json
+```
+
+This exports:
+
+- `balanced_accuracy`
+- `macro_precision`
+- `macro_recall`
+- `macro_f1`
+- `worst_class_recall`
+
+### 3. Analyze CARLA latency and driving metrics
+
+If you want the convenience path after a batch of runs, use:
+
+```powershell
+python eval_metrics/gather_current_metrics.py
+```
+
+That stages discovered run summaries under:
+
+- `eval_metrics/out/current_metrics/`
+
+If you want the manual per-run path instead, run:
+
+```powershell
+python eval_metrics/analyze_latency.py --realtime-log <realtime_csv> --carla-log <carla_csv> --output-json <latency_json> --output-csv <latency_joined_csv>
+python eval_metrics/analyze_drive_metrics.py --log <carla_csv> --output-json <drive_summary_json>
+```
+
+These produce the maintained live-run metrics:
+
+- Latency:
+  - mean end-to-end latency
+  - p95 end-to-end latency
+- CARLA:
+  - scenario success
+  - completion time
+  - mean velocity
+  - lane offset mean
+  - steering angle mean
+  - steering entropy
+  - lane error RMSE
+  - lane invasions
+
+For `highway_overtake`, success/fail is carried by `scenario_success` on those overtake rows.
+
+### 4. Build report and paper tables
+
+Create or refresh the manifest template:
+
+```powershell
+python eval_metrics/build_eval_tables.py --write-template-manifest eval_metrics/table_manifest.csv
+```
+
+Then build participant and aggregate tables:
+
+```powershell
+python eval_metrics/build_eval_tables.py --manifest eval_metrics/table_manifest.csv --model-metrics eval_metrics/out/model_metrics.csv --output-dir eval_metrics/out/tables
+```
+
+Important: if you want `lane_keep_5min` and `highway_overtake` reported separately, keep them as separate manifest rows or separate conditions. The current table builder preserves the scenario name so those rows can stay distinct.
+
+### 5. Generate summary plots
+
+Offline model summary:
+
+```powershell
+python eval_metrics/plot_model_summary.py --input-csv eval_metrics/out/model_metrics.csv --gesture-bucket 4_gesture --latest-only
+```
+
+Optional single-metric offline figure:
+
+```powershell
+python eval_metrics/plot_model_accuracy_bars.py --input-csv eval_metrics/out/model_metrics.csv --gesture-bucket 4_gesture --latest-only
+```
+
+CARLA summary figure:
+
+```powershell
+python eval_metrics/plot_carla_summary_bars.py --input-csv eval_metrics/out/tables/evaluation_aggregate_table.csv --deliverable-bucket capstone_report
+```
+
+Latency summary figure:
+
+```powershell
+python eval_metrics/plot_latency_summary.py --input-csv eval_metrics/out/tables/evaluation_aggregate_table.csv --deliverable-bucket capstone_report
+```
+
+Evaluation documentation and script details also live in [eval_metrics/README.md](/C:/Users/matth/Desktop/capstone/capstone-emg/eval_metrics/README.md).
 
 ## Technical Reference
 

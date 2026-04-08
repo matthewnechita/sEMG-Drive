@@ -6,6 +6,15 @@ from pathlib import Path
 from matplotlib.patches import Rectangle
 
 
+METRICS = [
+    ("balanced_accuracy", "Balanced Accuracy"),
+    ("macro_precision", "Macro Precision"),
+    ("macro_recall", "Macro Recall"),
+    ("macro_f1", "Macro F1"),
+    ("worst_class_recall", "Worst-Class Recall"),
+]
+
+
 def _load_rows(path: Path):
     if not path.exists():
         raise FileNotFoundError(path)
@@ -55,8 +64,6 @@ def _arm_order(value):
 def _latest_rows(rows):
     latest = {}
     for row in rows:
-        # Collapse reruns down to the newest bundle for each logical slot so the
-        # plot reflects the current maintained models, not every historical export.
         key = (
             str(row.get("bundle_scope") or "").strip().lower(),
             str(row.get("arm") or "").strip().lower(),
@@ -83,7 +90,7 @@ def _mean_sd(values):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Plot aggregate offline model metrics from harvested bundle rows."
+        description="Plot a multi-metric offline model summary from harvested bundle rows."
     )
     parser.add_argument(
         "--input-csv",
@@ -92,20 +99,8 @@ def build_parser():
         help="CSV from harvest_model_metrics.py",
     )
     parser.add_argument(
-        "--metric",
-        default="balanced_accuracy",
-        choices=[
-            "balanced_accuracy",
-            "macro_precision",
-            "macro_recall",
-            "macro_f1",
-            "worst_class_recall",
-        ],
-        help="Metric column to aggregate and plot.",
-    )
-    parser.add_argument(
         "--gesture-bucket",
-        default="",
+        default="4_gesture",
         help="Optional gesture bucket filter such as 4_gesture.",
     )
     parser.add_argument(
@@ -123,12 +118,12 @@ def build_parser():
     parser.add_argument(
         "--output-png",
         type=Path,
-        default=Path("eval_metrics") / "out" / "current_metrics" / "model_accuracy_bars.png",
+        default=Path("eval_metrics") / "out" / "current_metrics" / "model_summary.png",
         help="Path to save the output PNG.",
     )
     parser.add_argument(
         "--title",
-        default="",
+        default="Offline Model Summary",
         help="Optional custom plot title.",
     )
     parser.add_argument(
@@ -151,9 +146,6 @@ def main(argv=None):
 
     filtered = []
     for row in rows:
-        metric_value = _to_float(row.get(args.metric))
-        if metric_value is None:
-            continue
         if target_bucket and str(row.get("gesture_bucket") or "").strip().lower() != target_bucket:
             continue
         if not _row_matches_tokens(row, include_tokens, exclude_tokens):
@@ -172,31 +164,13 @@ def main(argv=None):
             str(row.get("bundle_scope") or "").strip().lower(),
             str(row.get("arm") or "").strip().lower(),
         )
-        grouped[key].append(_to_float(row.get(args.metric)))
+        grouped[key].append(row)
 
-    plot_rows = []
-    for (scope, arm), values in sorted(grouped.items(), key=lambda item: (_scope_order(item[0][0]), _arm_order(item[0][1]))):
-        mean, sd = _mean_sd(values)
-        if mean is None:
-            continue
-        plot_rows.append(
-            {
-                "scope": scope,
-                "arm": arm,
-                "mean": mean * 100.0,
-                "sd": (sd * 100.0) if sd is not None else 0.0,
-            }
-        )
+    if not grouped:
+        raise ValueError("No grouped model rows were produced.")
 
-    if not plot_rows:
-        raise ValueError("No aggregate plot rows were produced.")
-
-    scope_keys = sorted({item["scope"] for item in plot_rows}, key=_scope_order)
-    arm_keys = sorted({item["arm"] for item in plot_rows}, key=_arm_order)
-    stats_by_scope_arm = {
-        (item["scope"], item["arm"]): item
-        for item in plot_rows
-    }
+    scope_keys = sorted({key[0] for key in grouped}, key=_scope_order)
+    arm_keys = sorted({key[1] for key in grouped}, key=_arm_order)
     scope_labels = {
         "cross_subject": "Cross-subject",
         "per_subject": "Per-subject",
@@ -212,70 +186,69 @@ def main(argv=None):
 
     from matplotlib import pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+    fig, axes = plt.subplots(3, 2, figsize=(14, 11), constrained_layout=True)
+    fig.suptitle(args.title.strip() or "Offline Model Summary", fontsize=14, fontweight="bold")
+    axes_flat = list(axes.flatten())
     x = list(range(len(scope_keys)))
     bar_width = 0.34
-    all_values = []
-    legend_handles = []
-    for arm_index, arm in enumerate(arm_keys):
-        offset = (arm_index - (len(arm_keys) - 1) / 2.0) * bar_width
-        arm_positions = []
-        arm_means = []
-        arm_sds = []
-        for scope_index, scope in enumerate(scope_keys):
-            stats = stats_by_scope_arm.get((scope, arm))
-            if stats is None:
-                continue
-            arm_positions.append(float(scope_index) + offset)
-            arm_means.append(float(stats["mean"]))
-            arm_sds.append(float(stats["sd"]))
-        bars = ax.bar(
-            arm_positions,
-            arm_means,
-            yerr=arm_sds,
-            capsize=4,
-            color=arm_colors.get(arm, "#666666"),
-            width=bar_width,
-            label=arm_labels.get(arm, arm.title()),
-        )
-        legend_handles.append(
-            Rectangle((0, 0), 1, 1, color=arm_colors.get(arm, "#666666"), label=arm_labels.get(arm, arm.title()))
-        )
-        all_values.extend(arm_means)
-        for bar, value in zip(bars, arm_means):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                value + 0.8,
-                f"{value:.1f}%",
-                ha="center",
-                va="bottom",
-                fontsize=9,
-                fontweight="bold",
-                color="#333333",
-            )
 
-    metric_labels = {
-        "balanced_accuracy": "Balanced accuracy",
-        "macro_precision": "Macro precision",
-        "macro_recall": "Macro recall",
-        "macro_f1": "Macro F1",
-        "worst_class_recall": "Worst-class recall",
-    }
-    metric_label = metric_labels.get(args.metric, args.metric.replace("_", " ").title())
-    title = args.title.strip() or f"Offline {metric_label}"
-    ax.set_title(title)
-    ax.set_ylabel(f"{metric_label} (%)")
-    xtick_labels = [str(scope_labels.get(scope) or scope.replace("_", " ").title()) for scope in scope_keys]
-    ax.set_xticks(x)
-    ax.set_xticklabels(xtick_labels)
-    min_value = min(all_values) if all_values else 0.0
-    lower_bound = 75.0 if min_value >= 75.0 else max(0.0, 5.0 * math.floor(min_value / 5.0))
-    ax.set_ylim(lower_bound, max(100.0, max(all_values) + 6.0))
-    ax.grid(axis="y", alpha=0.25)
-    ax.set_axisbelow(True)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.legend(handles=legend_handles, loc="upper left", frameon=False)
+    for axis_index, (metric_key, metric_label) in enumerate(METRICS):
+        ax = axes_flat[axis_index]
+        all_values = []
+        legend_handles = []
+        for arm_index, arm in enumerate(arm_keys):
+            offset = (arm_index - (len(arm_keys) - 1) / 2.0) * bar_width
+            arm_positions = []
+            arm_means = []
+            arm_sds = []
+            for scope_index, scope in enumerate(scope_keys):
+                values = [_to_float(row.get(metric_key)) for row in grouped.get((scope, arm), [])]
+                mean, sd = _mean_sd(values)
+                if mean is None:
+                    continue
+                arm_positions.append(float(scope_index) + offset)
+                arm_means.append(mean * 100.0)
+                arm_sds.append((sd * 100.0) if sd is not None else 0.0)
+            bars = ax.bar(
+                arm_positions,
+                arm_means,
+                yerr=arm_sds,
+                capsize=4,
+                color=arm_colors.get(arm, "#666666"),
+                width=bar_width,
+                label=arm_labels.get(arm, arm.title()),
+            )
+            legend_handles.append(
+                Rectangle((0, 0), 1, 1, color=arm_colors.get(arm, "#666666"), label=arm_labels.get(arm, arm.title()))
+            )
+            all_values.extend(arm_means)
+            for bar, value in zip(bars, arm_means):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    value + 0.8,
+                    f"{value:.1f}%",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    fontweight="bold",
+                    color="#333333",
+                )
+
+        ax.set_title(metric_label)
+        ax.set_ylabel("Percent")
+        ax.set_xticks(x)
+        ax.set_xticklabels([scope_labels.get(scope, scope.replace("_", " ").title()) for scope in scope_keys])
+        min_value = min(all_values) if all_values else 0.0
+        lower_bound = 75.0 if min_value >= 75.0 else max(0.0, 5.0 * math.floor(min_value / 5.0))
+        ax.set_ylim(lower_bound, max(100.0, max(all_values) + 6.0 if all_values else 100.0))
+        ax.grid(axis="y", alpha=0.25)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        if axis_index == 0:
+            ax.legend(handles=legend_handles, loc="upper left", frameon=False)
+
+    axes_flat[-1].axis("off")
 
     args.output_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output_png, dpi=180, bbox_inches="tight")

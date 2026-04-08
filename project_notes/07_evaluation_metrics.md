@@ -11,6 +11,8 @@ The active scripts live in `eval_metrics/`:
 - `analyze_drive_metrics.py`
 - `build_eval_tables.py`
 - `gather_current_metrics.py`
+- `plot_model_summary.py`
+- `plot_latency_summary.py`
 - `plot_model_accuracy_bars.py`
 - `plot_carla_summary_bars.py`
 
@@ -80,8 +82,10 @@ The key design choice is participant-first aggregation. The script averages mult
 
 The plotting scripts then summarize the final outputs:
 
-- `plot_model_accuracy_bars.py` builds the offline summary figure
-- `plot_carla_summary_bars.py` builds the CARLA summary figure
+- `plot_model_summary.py` builds the maintained multi-metric offline summary figure
+- `plot_latency_summary.py` builds the maintained latency summary figure
+- `plot_carla_summary_bars.py` builds the maintained CARLA summary figure
+- `plot_model_accuracy_bars.py` remains available as an optional single-metric offline figure
 
 `gather_current_metrics.py` is a convenience script that stages a fresh current snapshot by running the core evaluation scripts and collecting discovered CARLA run pairs into one output area.
 

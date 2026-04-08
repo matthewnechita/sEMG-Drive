@@ -9,7 +9,7 @@
 - converting published gestures into vehicle control actions
 - logging per-tick drive data for later evaluation
 
-In the maintained path, this client is vehicle-only and keyboard/EMG-only.
+In the preferred evaluation path, this client is vehicle-only and keyboard/EMG-first. The current code still retains optional steering-wheel throttle/brake support when one joystick is connected.
 
 Here, the client is the Python program that connects the EMG system to the CARLA simulator and applies the resulting control actions inside the simulated vehicle.
 
@@ -71,7 +71,13 @@ The client still keeps a small set of keyboard controls that matter operationall
 - `Shift+C` goes to the previous weather
 - `F1` toggles the HUD
 
-For visualization, the maintained path keeps one standard RGB camera view and a simplified HUD.
+The client also still retains several inherited manual-control hotkeys:
+
+- `Tab` toggles the camera view
+- `P` toggles autopilot
+- `Q`, `M`, `,`, and `.` control manual gearing
+
+For visualization, the preferred evaluation view is one standard RGB camera with a simplified HUD, even though the inherited camera toggle remains available in code.
 
 For evaluation, the client can write:
 
