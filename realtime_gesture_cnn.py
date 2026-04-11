@@ -188,18 +188,18 @@ MODEL_RIGHT = os.path.join(
     BASE_DIR,
     "models",
     "strict",
-    "per_subject",
+    "cross_subject",
     "right",
-    "Matthewv6_4_gestures.pt",
+    "v6_4_gestures_2.pt",
 )
 
 MODEL_LEFT = os.path.join(
     BASE_DIR,
     "models",
     "strict",
-    "per_subject",
+    "cross_subject",
     "left",
-    "Matthewv6_4_gestures.pt",
+    "v6_4_gestures_2.pt",
 )
 class _StreamingHandler:
     def __init__(self):
