@@ -116,6 +116,7 @@ DEFAULT_HUD_VISIBLE = False
 HUD_VISIBLE_BY_DEFAULT = DEFAULT_HUD_VISIBLE
 REVERSE_TOGGLE_COOLDOWN_S = 1.0
 REVERSE_TOGGLE_MAX_SPEED_MPS = 0.75
+MANUAL_EARLY_CLOSE_REASON = "closed_early"
 
 
 def _now_stamp():
@@ -1033,6 +1034,16 @@ class ScenarioRuntime(object):
     def should_exit(self):
         return bool(self._should_exit)
 
+    def abort(self, world, reason=MANUAL_EARLY_CLOSE_REASON):
+        if self._finished:
+            return False
+        if self._status == "setup_failed":
+            self._should_exit = True
+            return False
+        sim_time = float(getattr(world.hud, 'simulation_time', self._last_sim_time))
+        self._finish(world, sim_time, False, reason)
+        return True
+
     def tick(self, world):
         if self._status == "setup_failed":
             self._should_exit = True
@@ -1654,6 +1665,13 @@ class World(object):
     def scenario_exit_requested(self):
         return bool(self._scenario_exit_requested)
 
+    def abort_active_scenario(self, reason=MANUAL_EARLY_CLOSE_REASON):
+        if self._scenario_runtime is None:
+            return False
+        aborted = self._scenario_runtime.abort(self, reason=reason)
+        self._scenario_exit_requested = self._scenario_runtime.should_exit()
+        return bool(aborted)
+
     def destroy(self):
         if self._scenario_runtime is not None:
             self._scenario_runtime.destroy()
@@ -1702,6 +1720,7 @@ class DualControl(object):
         self._latest_applied_steer_key = "neutral"
         self._last_lane_invasion_count = 0
         self._drive_logger = DriveCSVLogger(carla_log_path) if carla_log_path else None
+        self._exit_log_written = False
         self._realtime_log_path = str(realtime_log_path or '').strip()
         
         # Gestures -> steering only (NO throttle/brake from gestures)
@@ -1741,6 +1760,9 @@ class DualControl(object):
         if self._drive_logger is not None:
             self._drive_logger.close()
             self._drive_logger = None
+
+    def finalize_exit(self, world):
+        self._write_exit_log(world)
 
     def _init_wheel_controls(self):
         pygame.joystick.init()
@@ -1806,9 +1828,13 @@ class DualControl(object):
         self._sync_world_refs(world, reset_state_on_change=True)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                world.abort_active_scenario()
+                self.finalize_exit(world)
                 return True
             elif event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
+                    world.abort_active_scenario()
+                    self.finalize_exit(world)
                     return True
                 elif event.key == K_BACKSPACE:
                     world.restart()
@@ -2122,6 +2148,12 @@ class DualControl(object):
             'scenario_completion_time_s': scenario.get('scenario_completion_time_s', ''),
         }
         self._drive_logger.write_row(row)
+
+    def _write_exit_log(self, world):
+        if self._exit_log_written:
+            return
+        self._log_drive_step(world)
+        self._exit_log_written = True
 
     @staticmethod
     def _is_quit_shortcut(key):
@@ -2535,6 +2567,7 @@ def game_loop(args):
             world.render(display)
             pygame.display.flip()
             if world.scenario_exit_requested():
+                controller.finalize_exit(world)
                 time.sleep(1.0)
                 return
 
