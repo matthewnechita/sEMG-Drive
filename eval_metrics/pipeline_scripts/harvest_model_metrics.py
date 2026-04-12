@@ -3,9 +3,15 @@ import csv
 import json
 import pickle
 import re
+import sys
 from pathlib import Path
 
 import torch
+
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from eval_metrics.config import ACTIVE_OFFLINE_MODEL_NAMES, CURRENT_METRICS_ROOT, MODELS_ROOT
 
 
 CORE_METRIC_KEYS = [
@@ -15,6 +21,22 @@ CORE_METRIC_KEYS = [
     "macro_f1",
     "worst_class_recall",
 ]
+
+
+def _latest_rows(rows):
+    latest = {}
+    for row in rows:
+        key = (
+            str(row.get("bundle_scope") or "").strip().lower(),
+            str(row.get("arm") or "").strip().lower(),
+            str(row.get("subject") or row.get("target_subject") or "").strip().lower(),
+            str(row.get("gesture_bucket") or "").strip().lower(),
+        )
+        created_at = str(row.get("created_at") or "").strip()
+        current = latest.get(key)
+        if current is None or created_at > str(current.get("created_at") or "").strip():
+            latest[key] = row
+    return list(latest.values())
 
 
 def _normalize_label_map(raw_map):
@@ -161,7 +183,21 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Harvest stored offline metrics from saved model bundles."
     )
-    parser.add_argument("--models-root", type=Path, default=Path("models"))
+    parser.add_argument("--models-root", type=Path, default=MODELS_ROOT)
+    parser.add_argument(
+        "--model-name",
+        action="append",
+        default=[],
+        help=(
+            "Optional exact bundle filename or stem to keep. "
+            "Repeatable. Examples: v6_4_gestures_2.pt or v6_4_gestures_2"
+        ),
+    )
+    parser.add_argument(
+        "--all-versions",
+        action="store_true",
+        help="Include historical bundle versions instead of keeping only the latest bundle per logical model slot.",
+    )
     parser.add_argument(
         "--suffixes",
         nargs="+",
@@ -171,12 +207,12 @@ def build_parser():
     parser.add_argument(
         "--output-csv",
         type=Path,
-        default=Path("eval_metrics") / "out" / "model_metrics.csv",
+        default=CURRENT_METRICS_ROOT / "model_metrics.csv",
     )
     parser.add_argument(
         "--output-json",
         type=Path,
-        default=Path("eval_metrics") / "out" / "model_metrics.json",
+        default=CURRENT_METRICS_ROOT / "model_metrics.json",
     )
     return parser
 
@@ -185,11 +221,34 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     root = Path(args.models_root)
     suffixes = {str(s).lower() for s in args.suffixes}
-    files = sorted(path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in suffixes)
+    requested_names = {str(name).strip().lower() for name in args.model_name if str(name).strip()}
+    if not requested_names:
+        requested_names = {
+            str(name).strip().lower()
+            for name in ACTIVE_OFFLINE_MODEL_NAMES
+            if str(name).strip()
+        }
+    files = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in suffixes:
+            continue
+        if requested_names:
+            name = path.name.lower()
+            stem = path.stem.lower()
+            if name not in requested_names and stem not in requested_names:
+                continue
+        files.append(path)
     if not files:
+        if requested_names:
+            requested_text = ", ".join(sorted(requested_names))
+            raise FileNotFoundError(
+                f"No model bundles found under {root} matching requested model name(s): {requested_text}"
+            )
         raise FileNotFoundError(f"No model bundles found under {root}")
 
     rows = [summarize_bundle(path) for path in files]
+    if not args.all_versions:
+        rows = _latest_rows(rows)
     _print_summary(rows)
 
     _write_csv(Path(args.output_csv), rows)

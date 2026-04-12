@@ -261,6 +261,25 @@ More CARLA-specific detail lives in [carla_integration/README.md](/C:/Users/matt
 
 Use this order when collecting and processing final evaluation runs.
 
+For normal use, you should not need any CLI flags.
+
+If the maintained model filenames changed, update only these lines in [eval_metrics/config.py](/C:/Users/matth/Desktop/capstone/capstone-emg/eval_metrics/config.py):
+
+- `ACTIVE_PER_SUBJECT_MODEL_NAME`
+- `ACTIVE_CROSS_SUBJECT_MODEL_NAME`
+
+Then the normal full refresh is just:
+
+```powershell
+python eval_metrics/run_current_eval.py
+```
+
+If you only want to refresh the report-grade figures from already staged data, run:
+
+```powershell
+python eval_metrics/plot_scripts/make_report_figures.py
+```
+
 ### 1. Collect raw evaluation runs
 
 Run the named eval wrappers:
@@ -284,10 +303,12 @@ The filenames are timestamp-based, not manually chosen, so the raw logs are pres
 
 ### 2. Harvest offline model metrics
 
-Run this once for the current strict model bundles:
+For the normal no-flag path, the maintained model filenames come from `eval_metrics/config.py`.
+
+If you want to refresh only the offline bundle harvest, run:
 
 ```powershell
-python eval_metrics/harvest_model_metrics.py --models-root models/strict --output-csv eval_metrics/out/model_metrics.csv --output-json eval_metrics/out/model_metrics.json
+python eval_metrics/pipeline_scripts/harvest_model_metrics.py
 ```
 
 This exports:
@@ -303,7 +324,7 @@ This exports:
 If you want the convenience path after a batch of runs, use:
 
 ```powershell
-python eval_metrics/gather_current_metrics.py
+python eval_metrics/pipeline_scripts/gather_current_metrics.py
 ```
 
 That stages discovered run summaries under:
@@ -313,8 +334,8 @@ That stages discovered run summaries under:
 If you want the manual per-run path instead, run:
 
 ```powershell
-python eval_metrics/analyze_latency.py --realtime-log <realtime_csv> --carla-log <carla_csv> --output-json <latency_json> --output-csv <latency_joined_csv>
-python eval_metrics/analyze_drive_metrics.py --log <carla_csv> --output-json <drive_summary_json>
+python eval_metrics/pipeline_scripts/analyze_latency.py --realtime-log <realtime_csv> --carla-log <carla_csv> --output-json <latency_json> --output-csv <latency_joined_csv>
+python eval_metrics/pipeline_scripts/analyze_drive_metrics.py --log <carla_csv> --output-json <drive_summary_json>
 ```
 
 These produce the maintained live-run metrics:
@@ -336,45 +357,58 @@ For `highway_overtake`, success/fail is carried by `scenario_success` on those o
 
 ### 4. Build report and paper tables
 
-Create or refresh the manifest template:
+For the normal no-flag path, refresh the filled manifest and rebuild the tables:
 
 ```powershell
-python eval_metrics/build_eval_tables.py --write-template-manifest eval_metrics/table_manifest.csv
-```
-
-Then build participant and aggregate tables:
-
-```powershell
-python eval_metrics/build_eval_tables.py --manifest eval_metrics/table_manifest.csv --model-metrics eval_metrics/out/model_metrics.csv --output-dir eval_metrics/out/tables
+python eval_metrics/pipeline_scripts/fill_table_manifest.py
+python eval_metrics/pipeline_scripts/build_eval_tables.py
 ```
 
 Important: if you want `lane_keep_5min` and `highway_overtake` reported separately, keep them as separate manifest rows or separate conditions. The current table builder preserves the scenario name so those rows can stay distinct.
 
-### 5. Generate summary plots
+For convenience, the final aggregate tables are also copied to the top level of `eval_metrics/`:
 
-Offline model summary:
+- `eval_metrics/final_capstone_table.csv`
+- `eval_metrics/final_research_table.csv`
 
-```powershell
-python eval_metrics/plot_model_summary.py --input-csv eval_metrics/out/model_metrics.csv --gesture-bucket 4_gesture --latest-only
-```
+### 5. Generate report-grade figures
 
-Optional single-metric offline figure:
+The maintained figure set is:
 
-```powershell
-python eval_metrics/plot_model_accuracy_bars.py --input-csv eval_metrics/out/model_metrics.csv --gesture-bucket 4_gesture --latest-only
-```
+- `confusion_matrix_row_norm.png`
+- `latency_ecdf.png`
+- `carla_run_distributions.png`
+- `model_accuracy_forest.png`
+- `model_metric_heatmap.png`
+- `gesture_embedding_clusters.png`
+- `drive_trace_representative.png`
 
-CARLA summary figure:
-
-```powershell
-python eval_metrics/plot_carla_summary_bars.py --input-csv eval_metrics/out/tables/evaluation_aggregate_table.csv --deliverable-bucket capstone_report
-```
-
-Latency summary figure:
+You can refresh the figure pack directly with:
 
 ```powershell
-python eval_metrics/plot_latency_summary.py --input-csv eval_metrics/out/tables/evaluation_aggregate_table.csv --deliverable-bucket capstone_report
+python eval_metrics/plot_scripts/make_report_figures.py
 ```
+
+The maintained CARLA figure is `carla_run_distributions.png`, not the old summary-bar figure. It includes:
+
+- completion time
+- mean velocity
+- lane offset mean
+- steering angle mean
+- steering entropy
+- lane error RMSE
+- lane invasions
+
+The maintained offline model figures are:
+
+- `model_accuracy_forest.png`
+  - balanced accuracy by model with fold dots and a confidence interval where stored
+- `model_metric_heatmap.png`
+  - annotated comparison across balanced accuracy, macro precision, macro recall, macro F1, and worst-class recall
+- `gesture_embedding_clusters.png`
+  - qualitative 2D view of each current model's learned gesture embedding space
+- `drive_trace_representative.png`
+  - one representative lane-keep run and one representative highway-overtake run, plotted over time
 
 Evaluation documentation and script details also live in [eval_metrics/README.md](/C:/Users/matth/Desktop/capstone/capstone-emg/eval_metrics/README.md).
 

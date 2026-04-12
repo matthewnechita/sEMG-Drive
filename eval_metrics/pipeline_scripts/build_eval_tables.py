@@ -3,8 +3,19 @@ import csv
 import json
 import math
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from eval_metrics.config import (
+    CURRENT_METRICS_ROOT,
+    FINAL_CAPSTONE_TABLE_CSV,
+    FINAL_RESEARCH_TABLE_CSV,
+    TABLES_ROOT,
+)
 
 
 TEMPLATE_COLUMNS = [
@@ -609,6 +620,13 @@ def _write_deliverable_tables(output_dir: Path, deliverable_bucket: str, partici
         )
 
 
+def _write_top_level_final_tables(capstone_rows, research_rows):
+    if capstone_rows:
+        _write_csv(FINAL_CAPSTONE_TABLE_CSV, capstone_rows, AGGREGATE_COLUMNS)
+    if research_rows:
+        _write_csv(FINAL_RESEARCH_TABLE_CSV, research_rows, AGGREGATE_COLUMNS)
+
+
 def _write_template_manifest(path: Path):
     _write_csv(path, TEMPLATE_ROWS, TEMPLATE_COLUMNS)
 
@@ -626,13 +644,13 @@ def build_parser():
     parser.add_argument(
         "--model-metrics",
         type=Path,
-        default=Path("eval_metrics") / "out" / "model_metrics.csv",
+        default=CURRENT_METRICS_ROOT / "model_metrics.csv",
         help="Offline metrics CSV from harvest_model_metrics.py",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("eval_metrics") / "out" / "tables",
+        default=TABLES_ROOT,
     )
     parser.add_argument(
         "--write-template-manifest",
@@ -683,11 +701,17 @@ def main(argv=None):
         _filter_deliverable(participant_rows, "research_paper"),
         _filter_deliverable(aggregate_rows, "research_paper"),
     )
+    _write_top_level_final_tables(
+        _filter_deliverable(aggregate_rows, "capstone_report"),
+        _filter_deliverable(aggregate_rows, "research_paper"),
+    )
 
     print(f"Loaded {len(manifest_rows)} manifest row(s)")
     print(f"Built {len(participant_rows)} participant row(s)")
     print(f"Built {len(aggregate_rows)} aggregate row(s)")
     print(f"Saved tables under {output_dir}")
+    print(f"Saved top-level final capstone table to {FINAL_CAPSTONE_TABLE_CSV}")
+    print(f"Saved top-level final research table to {FINAL_RESEARCH_TABLE_CSV}")
 
 
 if __name__ == "__main__":
