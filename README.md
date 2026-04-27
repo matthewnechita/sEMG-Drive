@@ -1,16 +1,14 @@
 # EMG Driving Control Capstone
 
-This repository contains the maintained codebase for a capstone project on EMG-driven vehicle control. The project uses Delsys surface EMG sensors, consistent sensor placement, CNN-based gesture recognition, and CARLA driving scenarios to test whether upper-limb muscle activity can serve as a practical control interface for simple driving tasks.
+This repository contains the maintained codebase for a capstone project on EMG-driven vehicle control. The project uses Delsys surface EMG sensors, CNN-based gesture recognition, and CARLA driving scenarios to test whether upper-limb muscle activity can serve as a practical control interface for simple driving tasks.
 
-The repo is organized around the full system, not just a classifier. It covers data collection, preprocessing, training, live inference, CARLA control, and evaluation.
+The repo is organized around the full system. It covers data collection, preprocessing, training, live inference, CARLA control, and evaluation.
 
 ## Why This Project Was Built
 
 Traditional driving controls assume that the user can reliably operate a steering wheel, pedals, and other physical interfaces. This project explores a different control pathway: using electromyography (EMG) from the forearms to recognize intentional gestures and convert them into vehicle commands in simulation.
 
-The goal is not to claim that EMG should replace conventional controls. The goal is to evaluate whether a small, well-defined EMG gesture set can support usable vehicle control in a constrained driving environment, and to measure the limits of that approach with both model metrics and end-to-end driving metrics.
-
-That is why this repo includes both machine-learning code and CARLA scenario code. The real question is not just "can the model classify gestures?" It is "can a person use this system to complete driving tasks with acceptable accuracy, timing, and control quality?"
+The goal is to evaluate whether a small, well-defined EMG gesture set can support usable vehicle control in a constrained driving environment, and to measure the limits of that approach with both model metrics and driving metrics.
 
 ## What The System Does
 
