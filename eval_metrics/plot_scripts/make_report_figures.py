@@ -109,6 +109,8 @@ def main(argv=None) -> None:
         [
             sys.executable,
             str(PLOT_SCRIPTS_ROOT / "plot_drive_trace_representative.py"),
+            "--run-index",
+            str(Path(args.run_index)),
             "--output-png",
             str(output_dir / "drive_trace_representative.png"),
         ]

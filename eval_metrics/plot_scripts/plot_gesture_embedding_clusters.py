@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import math
 import os
 import sys
@@ -367,20 +368,82 @@ def _project_embedding_2d(embedding: np.ndarray) -> np.ndarray:
         return PCA(n_components=2).fit_transform(working)
 
     perplexity = min(30.0, max(5.0, (float(working.shape[0]) - 1.0) / 3.0))
-    tsne = TSNE(
+    tsne_kwargs = dict(
         n_components=2,
         perplexity=perplexity,
         init="pca",
         learning_rate=200.0,
-        n_iter=1000,
         random_state=RANDOM_STATE,
+    )
+    if "max_iter" in inspect.signature(TSNE.__init__).parameters:
+        tsne_kwargs["max_iter"] = 1000
+    else:
+        tsne_kwargs["n_iter"] = 1000
+    tsne = TSNE(
+        **tsne_kwargs,
     )
     return tsne.fit_transform(working)
 
 
-def _panel_title(entry: dict[str, object], source_label: str, n_points: int, balance_accuracy: float | None) -> str:
+def _class_centroids(projection: np.ndarray, labels: np.ndarray) -> dict[str, np.ndarray]:
+    centroids: dict[str, np.ndarray] = {}
+    for raw_label in np.unique(np.asarray(labels, dtype=object)):
+        label = str(raw_label)
+        mask = np.asarray(labels == raw_label, dtype=bool)
+        if not np.any(mask):
+            continue
+        centroids[label] = np.mean(np.asarray(projection[mask], dtype=float), axis=0)
+    return centroids
+
+
+def _orient_projection_for_readability(projection: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    points = np.asarray(projection, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] == 0:
+        return points
+
+    centered = points - np.mean(points, axis=0, keepdims=True)
+    best = centered
+    best_score = -float("inf")
+
+    for swap_axes in (False, True):
+        base = centered[:, [1, 0]] if swap_axes else centered.copy()
+        for flip_x in (-1.0, 1.0):
+            for flip_y in (-1.0, 1.0):
+                candidate = base.copy()
+                candidate[:, 0] *= flip_x
+                candidate[:, 1] *= flip_y
+                centroids = _class_centroids(candidate, labels)
+
+                score = 0.0
+                left = centroids.get("left_turn")
+                right = centroids.get("right_turn")
+                horn = centroids.get("horn")
+                neutral = centroids.get("neutral")
+
+                if left is not None:
+                    score += float(-left[0]) - 0.15 * float(abs(left[1]))
+                if right is not None:
+                    score += float(right[0]) - 0.15 * float(abs(right[1]))
+                if horn is not None:
+                    score += float(horn[1]) - 0.15 * float(abs(horn[0]))
+                if neutral is not None:
+                    score += float(-neutral[1]) - 0.15 * float(abs(neutral[0]))
+
+                if left is not None and right is not None:
+                    score += 0.5 * float(right[0] - left[0])
+                if horn is not None and neutral is not None:
+                    score += 0.5 * float(horn[1] - neutral[1])
+
+                if score > best_score:
+                    best_score = score
+                    best = candidate
+
+    return best
+
+
+def _panel_title(entry: dict[str, object], n_points: int, balance_accuracy: float | None) -> str:
     line1 = str(entry["display_label"])
-    line2 = f"{source_label} | sampled windows={n_points}"
+    line2 = f"sampled windows={n_points}"
     if balance_accuracy is None:
         return f"{line1}\n{line2}"
     return f"{line1}\n{line2}\nbalanced accuracy {balance_accuracy * 100.0:.1f}%"
@@ -437,6 +500,7 @@ def main(argv=None) -> None:
         )
         embedding = _extract_embeddings(bundle, X_plot)
         projection = _project_embedding_2d(embedding)
+        projection = _orient_projection_for_readability(projection, y_plot)
         panels.append(
             {
                 "entry": entry,
@@ -488,7 +552,6 @@ def main(argv=None) -> None:
         ax.set_title(
             _panel_title(
                 panel["entry"],
-                str(panel["source_label"]),
                 int(panel["n_points"]),
                 float(panel["balanced_accuracy"]) if panel["balanced_accuracy"] is not None else None,
             ),

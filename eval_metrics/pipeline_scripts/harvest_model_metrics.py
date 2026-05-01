@@ -23,6 +23,44 @@ CORE_METRIC_KEYS = [
 ]
 
 
+def _mean(values):
+    values = [float(value) for value in values]
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def _extract_loso_metric_means(metadata):
+    if not isinstance(metadata, dict):
+        return {}
+    zero_shot_loso = metadata.get("zero_shot_loso")
+    if not isinstance(zero_shot_loso, dict):
+        evaluation = metadata.get("evaluation")
+        if isinstance(evaluation, dict):
+            zero_shot_loso = evaluation.get("zero_shot_loso")
+    if not isinstance(zero_shot_loso, dict):
+        return {}
+
+    folds = zero_shot_loso.get("folds")
+    if not isinstance(folds, list):
+        return {}
+
+    out = {}
+    valid_folds = [fold for fold in folds if isinstance(fold, dict) and isinstance(fold.get("metrics"), dict)]
+    if valid_folds:
+        out["loso_subject_count"] = len(valid_folds)
+    for key in CORE_METRIC_KEYS:
+        values = [
+            fold["metrics"].get(key)
+            for fold in valid_folds
+            if fold["metrics"].get(key) not in (None, "")
+        ]
+        mean_value = _mean(values)
+        if mean_value is not None:
+            out[f"loso_{key}"] = mean_value
+    return out
+
+
 def _latest_rows(rows):
     latest = {}
     for row in rows:
@@ -155,6 +193,7 @@ def summarize_bundle(path: Path):
     }
     for key in CORE_METRIC_KEYS:
         row[key] = metrics.get(key)
+    row.update(_extract_loso_metric_means(metadata))
     return row
 
 

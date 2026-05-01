@@ -1,9 +1,0 @@
-{
-  "join_key": "prediction_seq",
-  "rows_joined": 2,
-  "end_to_end_latency_ms": {
-    "count": 2,
-    "mean_ms": 274.9999999999999,
-    "p95_ms": 297.49999999999983
-  }
-}

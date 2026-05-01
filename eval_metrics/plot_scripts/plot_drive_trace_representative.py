@@ -61,11 +61,32 @@ def _load_drive_summary(path: Path) -> dict[str, object]:
     return full_route
 
 
-def _candidate_runs(run_index_rows: list[dict[str, str]], run_dir: str) -> list[dict[str, object]]:
+def _pretty_scope(scope: str) -> str:
+    text = str(scope or "").strip().lower()
+    if "cross" in text:
+        return "Cross-subject"
+    if "per" in text:
+        return "Per-subject"
+    return str(scope or "").replace("_", " ").strip().title()
+
+
+def _normalize_scope(scope: str) -> str:
+    text = str(scope or "").strip().lower()
+    if "cross" in text:
+        return "cross_subject"
+    if "per" in text:
+        return "per_subject"
+    return text.replace(" ", "_")
+
+
+def _candidate_runs(run_index_rows: list[dict[str, str]], run_dir: str, model_scope: str | None = None) -> list[dict[str, object]]:
     candidates = []
     for row in run_index_rows:
         if str(row.get("run_dir") or "").strip() != run_dir:
             continue
+        if model_scope:
+            if _normalize_scope(row.get("model_scope", "")) != _normalize_scope(model_scope):
+                continue
         drive_json = Path(str(row.get("drive_json") or "").strip())
         if not drive_json.exists():
             continue
@@ -83,6 +104,7 @@ def _candidate_runs(run_index_rows: list[dict[str, str]], run_dir: str) -> list[
                 "status": status,
                 "latency_ok": _to_bool(row.get("latency_ok")),
                 "stamp": str(row.get("stamp") or "").strip(),
+                "model_scope": str(row.get("model_scope") or "").strip(),
             }
         )
     return candidates
@@ -97,6 +119,11 @@ def _metric_mad(values: list[float], median: float) -> float:
     return mad if mad > 1e-6 else 1.0
 
 
+def _rank_map(values: list[float]) -> dict[float, int]:
+    ordered = sorted(set(float(value) for value in values))
+    return {value: idx for idx, value in enumerate(ordered)}
+
+
 def _representative_run(candidates: list[dict[str, object]]) -> dict[str, object]:
     if not candidates:
         raise ValueError("No candidate runs were available for representative selection.")
@@ -106,7 +133,31 @@ def _representative_run(candidates: list[dict[str, object]]) -> dict[str, object
         for item in candidates
         if item["status"] == "success" or item["summary"].get("scenario_success") is True
     ]
-    pool = preferred if preferred else [item for item in candidates if bool(item["latency_ok"])]
+    if preferred:
+        feature_keys = ["completion_time_s", "lane_error_rmse_m", "lane_invasions"]
+        feature_ranks = {}
+        for key in feature_keys:
+            values = [
+                _to_float(item["summary"].get(key))
+                for item in preferred
+                if _to_float(item["summary"].get(key)) is not None
+            ]
+            if values:
+                feature_ranks[key] = _rank_map(values)
+
+        def success_key(item: dict[str, object]) -> tuple[float, int, str]:
+            total_rank = 0.0
+            for key in feature_keys:
+                value = _to_float(item["summary"].get(key))
+                if value is None or key not in feature_ranks:
+                    continue
+                total_rank += feature_ranks[key][float(value)]
+            latency_penalty = 0 if bool(item["latency_ok"]) else 1
+            return total_rank, latency_penalty, str(item["stamp"])
+
+        return sorted(preferred, key=success_key)[0]
+
+    pool = [item for item in candidates if bool(item["latency_ok"])]
     if not pool:
         pool = candidates
 
@@ -212,18 +263,26 @@ def main(argv=None) -> None:
     run_index_rows = _load_run_index(Path(args.run_index))
 
     scenario_order = ["lane_keep_eval", "highway_overtake_eval"]
+    available_scopes = [
+        scope for scope in ["Cross-subject", "Per-subject"]
+        if any(_normalize_scope(row.get("model_scope", "")) == _normalize_scope(scope) for row in run_index_rows)
+    ]
+    if not available_scopes:
+        available_scopes = [""]
+
     selected_runs = []
-    for run_dir in scenario_order:
-        candidates = _candidate_runs(run_index_rows, run_dir)
-        if not candidates:
-            continue
-        selected_runs.append((run_dir, _representative_run(candidates)))
+    for model_scope in available_scopes:
+        for run_dir in scenario_order:
+            candidates = _candidate_runs(run_index_rows, run_dir, model_scope if model_scope else None)
+            if not candidates:
+                continue
+            selected_runs.append((model_scope, run_dir, _representative_run(candidates)))
 
     if not selected_runs:
         raise ValueError("No representative drive runs could be selected.")
 
     plotted_runs = []
-    for run_dir, selected in selected_runs:
+    for model_scope, run_dir, selected in selected_runs:
         carla_log = Path(str(selected["row"].get("carla_log") or "").strip())
         rows = _load_csv_rows(carla_log)
         time_s = _time_series(rows)
@@ -235,6 +294,7 @@ def main(argv=None) -> None:
         plotted_runs.append(
             {
                 "run_dir": run_dir,
+                "model_scope": model_scope,
                 "stamp": str(selected["stamp"]),
                 "status": str(selected["status"]),
                 "summary": selected["summary"],
@@ -295,12 +355,12 @@ def main(argv=None) -> None:
 
         completion = _to_float(item["summary"].get("completion_time_s"))
         completion_text = f"{completion:.1f} s" if completion is not None else "n/a"
-        lane_ax.set_title(
-            f"{SCENARIO_LABELS.get(item['run_dir'], item['run_dir'])}\n"
-            f"representative run {item['stamp']} | {item['status']} | completion {completion_text}",
-            fontsize=11.5,
-            fontweight="bold",
-        )
+        title_bits = []
+        if str(item.get("model_scope") or "").strip():
+            title_bits.append(_pretty_scope(str(item["model_scope"])))
+        title_bits.append(SCENARIO_LABELS.get(item["run_dir"], item["run_dir"]))
+        title_bits.append(f"Example run | completion {completion_text}")
+        lane_ax.set_title("\n".join(title_bits), fontsize=11.5, fontweight="bold")
 
         speed_ax = axes_array[1, col_idx]
         speed_ax.plot(time_s, speed, color=METRIC_COLORS["speed"], linewidth=1.4, label="Vehicle speed")

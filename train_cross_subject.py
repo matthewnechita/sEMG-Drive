@@ -38,7 +38,7 @@ from project_paths import STRICT_MODELS_ROOT, STRICT_RESAMPLED_ROOT, strict_arm_
 # -- Config --------------------------------------------------------------------
 ARM = "left"  # Set to "right" or "left" before running.
 DATA_ROOT  = strict_arm_root(STRICT_RESAMPLED_ROOT, ARM)
-MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "v6_4_gestures_2.pt"
+MODEL_OUT  = STRICT_MODELS_ROOT / "cross_subject" / ARM / "v6_4_gestures_4.pt"
 PATTERN    = "*_filtered.npz"
 
 WINDOW_SIZE = 200
@@ -77,7 +77,7 @@ INCLUDED_GESTURES: set[str] | None = {"neutral", "left_turn", "right_turn", "hor
 # LOSO evaluation must be run before deploying the cross-subject model.
 # This measures true cross-subject accuracy on held-out participants.
 # Minimum recommended LOSO accuracy before deployment: 65%.
-LOSO_EVAL = False
+LOSO_EVAL = True
 TRAIN_FINAL_MODEL = True
 
 # -- Label utilities ---------------------------------------------------------

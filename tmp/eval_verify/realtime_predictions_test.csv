@@ -1,3 +1,0 @@
-timestamp,prediction_seq,window_end_ts,prediction_ts,publish_ts,mode,pred_label,pred_conf,right_label,right_conf,left_label,left_conf,combined_label,combined_conf
-1.3,1,1.0,1.1,1.12,single,left_turn,0.91,neutral,0.4,left_turn,0.91,left_turn,0.91
-2.35,2,2.0,2.09,2.11,single,neutral,0.88,neutral,0.88,neutral,0.76,neutral,0.88

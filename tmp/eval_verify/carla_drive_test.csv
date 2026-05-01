@@ -1,3 +1,0 @@
-timestamp,control_apply_ts,simulation_time,prediction_seq,steer_key,applied_steer_key,steer,throttle,brake,reverse,hand_brake,speed_mps,speed_limit_mps,velocity_deviation_mps,steering_angle_rad,lane_error_m,lane_invasion_event,scenario_name,scenario_kind,scenario_status,scenario_finished,scenario_success,scenario_failure_reason,scenario_elapsed_s,scenario_completion_time_s
-1.2,1.25,10.0,1,left_strong,left_strong,-0.3,0.2,0.0,False,False,4.0,8.33,4.33,0.12,0.45,False,lane_keep_5min,lane_keep,running,False,,,2.0,
-2.2,2.3,11.0,2,neutral,neutral,0.0,0.2,0.0,False,False,4.5,8.33,3.83,0.04,0.25,True,lane_keep_5min,lane_keep,finished,True,True,,3.0,3.0

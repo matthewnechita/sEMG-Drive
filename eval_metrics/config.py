@@ -18,7 +18,7 @@ FINAL_RESEARCH_TABLE_CSV = EVAL_ROOT / "final_research_table.csv"
 # Normal use: only edit these two lines when the maintained model selection
 # changes. Each filename covers the correlated left/right pair for that family.
 ACTIVE_PER_SUBJECT_MODEL_NAME = "Matthewv6_4_gestures.pt"
-ACTIVE_CROSS_SUBJECT_MODEL_NAME = "v6_4_gestures_2.pt"
+ACTIVE_CROSS_SUBJECT_MODEL_NAME = "v6_4_gestures_4.pt"
 
 # Offline model harvesting/plots use both the current per-subject and current
 # evaluated model families by default.

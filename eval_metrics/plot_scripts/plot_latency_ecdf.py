@@ -41,6 +41,42 @@ def _pretty_scenario(name: str, run_dir: str) -> str:
     return fallback.title() or "Scenario"
 
 
+def _pretty_scope(scope: str) -> str:
+    text = str(scope or "").strip().lower()
+    if "cross" in text:
+        return "Cross-subject"
+    if "per" in text:
+        return "Per-subject"
+    return str(scope or "").replace("_", " ").strip().title()
+
+
+def _group_label(run_row: dict[str, str], scenario_name: str) -> str:
+    scope = str(run_row.get("model_scope") or "").strip()
+    if not scope:
+        return scenario_name
+    return f"{_pretty_scope(scope)} | {scenario_name}"
+
+
+def _group_sort_key(label: str) -> tuple[int, int, str]:
+    if " | " in label:
+        scope_text, scenario_text = label.split(" | ", 1)
+        scope_key = 0 if scope_text == "Cross-subject" else 1 if scope_text == "Per-subject" else 99
+        scenario_key = 0 if scenario_text == "Highway overtake" else 1 if scenario_text == "Lane keep" else 99
+        return scope_key, scenario_key, label
+    scenario_key = 0 if label == "Highway overtake" else 1 if label == "Lane keep" else 99
+    return 0, scenario_key, label
+
+
+def _line_style(label: str) -> tuple[str | None, str]:
+    if " | " not in label:
+        color = "#dc2626" if "Highway overtake" in label else "#1d4ed8"
+        return color, "-"
+    scope_text, scenario_text = label.split(" | ", 1)
+    color = "#dc2626" if scenario_text == "Highway overtake" else "#1d4ed8"
+    linestyle = "-" if scope_text == "Cross-subject" else "--"
+    return color, linestyle
+
+
 def _load_drive_summary(path_text: str) -> dict[str, object]:
     path = Path(str(path_text or "").strip())
     if not path.exists():
@@ -97,34 +133,31 @@ def main(argv=None) -> None:
             str(drive_summary.get("scenario_name") or ""),
             str(run_row.get("run_dir") or ""),
         )
-        grouped[scenario_name].extend(values)
-        run_counts[scenario_name] += 1
+        label = _group_label(run_row, scenario_name)
+        grouped[label].extend(values)
+        run_counts[label] += 1
 
     if not grouped:
         raise ValueError(
             "No populated latency_joined.csv files were found in the staged current_metrics run index."
         )
 
-    colors = {
-        "Lane keep": "#1d4ed8",
-        "Highway overtake": "#dc2626",
-    }
-
     from matplotlib import pyplot as plt
 
     fig, ax = plt.subplots(figsize=(11, 6.5), constrained_layout=True)
     summary_lines = []
     global_max = 0.0
-    for scenario_name in sorted(grouped):
+    for scenario_name in sorted(grouped, key=_group_sort_key):
         values = np.sort(np.asarray(grouped[scenario_name], dtype=float))
         y = np.arange(1, values.size + 1, dtype=float) / float(values.size)
-        color = colors.get(scenario_name, None)
+        color, linestyle = _line_style(scenario_name)
         ax.step(
             values,
             y,
             where="post",
             linewidth=2.4,
             color=color,
+            linestyle=linestyle,
             label=f"{scenario_name} (runs={run_counts[scenario_name]}, latency samples={values.size})",
         )
         mean_ms = float(values.mean())

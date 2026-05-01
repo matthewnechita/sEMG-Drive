@@ -129,6 +129,12 @@ PARTICIPANT_COLUMNS = [
     "offline_macro_recall",
     "offline_macro_f1",
     "offline_worst_class_recall",
+    "offline_loso_subject_count",
+    "offline_loso_balanced_accuracy",
+    "offline_loso_macro_precision",
+    "offline_loso_macro_recall",
+    "offline_loso_macro_f1",
+    "offline_loso_worst_class_recall",
     "offline_channel_count",
     "offline_window_size_samples",
     "offline_window_step_samples",
@@ -169,6 +175,7 @@ AGGREGATE_COLUMNS = [
     "comparison_group",
     "notes",
     "participant_count",
+    "source_run_count",
     "offline_balanced_accuracy_mean",
     "offline_balanced_accuracy_sd",
     "offline_macro_precision_mean",
@@ -179,6 +186,18 @@ AGGREGATE_COLUMNS = [
     "offline_macro_f1_sd",
     "offline_worst_class_recall_mean",
     "offline_worst_class_recall_sd",
+    "offline_loso_subject_count_mean",
+    "offline_loso_subject_count_sd",
+    "offline_loso_balanced_accuracy_mean",
+    "offline_loso_balanced_accuracy_sd",
+    "offline_loso_macro_precision_mean",
+    "offline_loso_macro_precision_sd",
+    "offline_loso_macro_recall_mean",
+    "offline_loso_macro_recall_sd",
+    "offline_loso_macro_f1_mean",
+    "offline_loso_macro_f1_sd",
+    "offline_loso_worst_class_recall_mean",
+    "offline_loso_worst_class_recall_sd",
     "lat_e2e_mean_ms_mean",
     "lat_e2e_mean_ms_sd",
     "lat_e2e_p95_ms_mean",
@@ -204,6 +223,39 @@ AGGREGATE_COLUMNS = [
     "drive_command_success_rate_sd",
 ]
 
+PUBLICATION_OFFLINE_COLUMNS = [
+    "Model",
+    "Arm",
+    "Bundled balanced accuracy (%)",
+    "Bundled macro precision (%)",
+    "Bundled macro recall (%)",
+    "Bundled macro F1 (%)",
+    "Bundled worst-class recall (%)",
+    "LOSO held-out subjects",
+    "LOSO balanced accuracy (%)",
+    "LOSO macro precision (%)",
+    "LOSO macro recall (%)",
+    "LOSO macro F1 (%)",
+    "LOSO worst-class recall (%)",
+]
+
+PUBLICATION_RUNTIME_COLUMNS = [
+    "Model",
+    "Scenario",
+    "Runs",
+    "Latency mean (ms)",
+    "Latency p95 (ms)",
+    "Scenario success rate (%)",
+    "Completion time (s)",
+    "Mean velocity (m/s)",
+    "Mean velocity deviation (m/s)",
+    "Lane offset mean (m)",
+    "Steering angle mean (rad)",
+    "Steering entropy",
+    "Lane error RMSE (m)",
+    "Lane invasions",
+]
+
 
 NUMERIC_PARTICIPANT_METRICS = [
     "offline_balanced_accuracy",
@@ -211,6 +263,12 @@ NUMERIC_PARTICIPANT_METRICS = [
     "offline_macro_recall",
     "offline_macro_f1",
     "offline_worst_class_recall",
+    "offline_loso_subject_count",
+    "offline_loso_balanced_accuracy",
+    "offline_loso_macro_precision",
+    "offline_loso_macro_recall",
+    "offline_loso_macro_f1",
+    "offline_loso_worst_class_recall",
     "lat_e2e_mean_ms",
     "lat_e2e_p95_ms",
     "drive_completion_time_s",
@@ -277,6 +335,15 @@ def _write_csv(path: Path, rows, columns):
         writer.writeheader()
         for row in rows:
             writer.writerow({column: row.get(column, "") for column in columns})
+
+
+def _safe_write_csv(path: Path, rows, columns):
+    try:
+        _write_csv(path, rows, columns)
+        return True
+    except PermissionError:
+        print(f"Warning: could not write {path} because it is open in another program.")
+        return False
 
 
 def _write_json(path: Path, payload):
@@ -353,6 +420,47 @@ def _mean_sd(values):
     return mean, math.sqrt(variance)
 
 
+def _round_or_blank(value, digits=1):
+    number = _to_float(value)
+    if number is None:
+        return ""
+    return round(number, digits)
+
+
+def _percent_or_blank(value, digits=1):
+    number = _to_float(value)
+    if number is None:
+        return ""
+    return round(number * 100.0, digits)
+
+
+def _pretty_scope(text):
+    slug = _normalize_scope(text)
+    if slug == "cross_subject":
+        return "Cross-subject"
+    if slug == "per_subject":
+        return "Per-subject"
+    return str(text or "").replace("_", " ").strip().title()
+
+
+def _pretty_arm(text):
+    arm = str(text or "").strip().lower()
+    if arm == "left":
+        return "Left arm"
+    if arm == "right":
+        return "Right arm"
+    return str(text or "").replace("_", " ").strip().title()
+
+
+def _pretty_scenario(text):
+    value = str(text or "").strip().lower()
+    if value == "lane_keep_5min":
+        return "Lane keep"
+    if value == "highway_overtake":
+        return "Highway overtake"
+    return str(text or "").replace("_", " ").strip().title()
+
+
 def _flatten_latency(summary):
     if not isinstance(summary, dict) or not summary:
         return {}
@@ -403,6 +511,12 @@ def _offline_from_model_row(row):
         "offline_macro_recall": row.get("macro_recall", ""),
         "offline_macro_f1": row.get("macro_f1", ""),
         "offline_worst_class_recall": row.get("worst_class_recall", ""),
+        "offline_loso_subject_count": row.get("loso_subject_count", ""),
+        "offline_loso_balanced_accuracy": row.get("loso_balanced_accuracy", ""),
+        "offline_loso_macro_precision": row.get("loso_macro_precision", ""),
+        "offline_loso_macro_recall": row.get("loso_macro_recall", ""),
+        "offline_loso_macro_f1": row.get("loso_macro_f1", ""),
+        "offline_loso_worst_class_recall": row.get("loso_worst_class_recall", ""),
         "offline_channel_count": row.get("channel_count", ""),
         "offline_window_size_samples": row.get("window_size_samples", ""),
         "offline_window_step_samples": row.get("window_step_samples", ""),
@@ -558,6 +672,7 @@ def _build_aggregate_rows(participant_rows):
             "comparison_group": template_row.get("comparison_group", ""),
             "notes": template_row.get("notes", ""),
             "participant_count": len(participant_summaries),
+            "source_run_count": len(rows),
         }
 
         for metric in [
@@ -566,6 +681,12 @@ def _build_aggregate_rows(participant_rows):
             "offline_macro_recall",
             "offline_macro_f1",
             "offline_worst_class_recall",
+            "offline_loso_subject_count",
+            "offline_loso_balanced_accuracy",
+            "offline_loso_macro_precision",
+            "offline_loso_macro_recall",
+            "offline_loso_macro_f1",
+            "offline_loso_worst_class_recall",
             "lat_e2e_mean_ms",
             "lat_e2e_p95_ms",
             "drive_completion_time_s",
@@ -622,9 +743,129 @@ def _write_deliverable_tables(output_dir: Path, deliverable_bucket: str, partici
 
 def _write_top_level_final_tables(capstone_rows, research_rows):
     if capstone_rows:
-        _write_csv(FINAL_CAPSTONE_TABLE_CSV, capstone_rows, AGGREGATE_COLUMNS)
+        _safe_write_csv(FINAL_CAPSTONE_TABLE_CSV, capstone_rows, AGGREGATE_COLUMNS)
     if research_rows:
-        _write_csv(FINAL_RESEARCH_TABLE_CSV, research_rows, AGGREGATE_COLUMNS)
+        _safe_write_csv(FINAL_RESEARCH_TABLE_CSV, research_rows, AGGREGATE_COLUMNS)
+
+
+def _publication_offline_rows(aggregate_rows, deliverable_bucket):
+    picked = {}
+    for row in aggregate_rows:
+        if str(row.get("deliverable_bucket", "")).strip() != deliverable_bucket:
+            continue
+        key = (
+            str(row.get("model_scope", "")).strip().lower(),
+            str(row.get("arm", "")).strip().lower(),
+        )
+        if key not in picked:
+            picked[key] = row
+
+    ordered = sorted(
+        picked.values(),
+        key=lambda row: (
+            0 if _normalize_scope(row.get("model_scope", "")) == "cross_subject" else 1,
+            0 if str(row.get("arm", "")).strip().lower() == "left" else 1,
+        ),
+    )
+    out = []
+    for row in ordered:
+        out.append(
+            {
+                "Model": _pretty_scope(row.get("model_scope", "")),
+                "Arm": _pretty_arm(row.get("arm", "")),
+                "Bundled balanced accuracy (%)": _percent_or_blank(row.get("offline_balanced_accuracy_mean")),
+                "Bundled macro precision (%)": _percent_or_blank(row.get("offline_macro_precision_mean")),
+                "Bundled macro recall (%)": _percent_or_blank(row.get("offline_macro_recall_mean")),
+                "Bundled macro F1 (%)": _percent_or_blank(row.get("offline_macro_f1_mean")),
+                "Bundled worst-class recall (%)": _percent_or_blank(row.get("offline_worst_class_recall_mean")),
+                "LOSO held-out subjects": _round_or_blank(row.get("offline_loso_subject_count_mean"), 0),
+                "LOSO balanced accuracy (%)": _percent_or_blank(row.get("offline_loso_balanced_accuracy_mean")),
+                "LOSO macro precision (%)": _percent_or_blank(row.get("offline_loso_macro_precision_mean")),
+                "LOSO macro recall (%)": _percent_or_blank(row.get("offline_loso_macro_recall_mean")),
+                "LOSO macro F1 (%)": _percent_or_blank(row.get("offline_loso_macro_f1_mean")),
+                "LOSO worst-class recall (%)": _percent_or_blank(row.get("offline_loso_worst_class_recall_mean")),
+            }
+        )
+    return out
+
+
+def _publication_runtime_rows(aggregate_rows, deliverable_bucket):
+    grouped = defaultdict(list)
+    for row in aggregate_rows:
+        if str(row.get("deliverable_bucket", "")).strip() != deliverable_bucket:
+            continue
+        scenario_name = str(row.get("drive_scenario_name", "")).strip()
+        if not scenario_name:
+            continue
+        key = (
+            str(row.get("model_scope", "")).strip(),
+            scenario_name,
+        )
+        grouped[key].append(row)
+
+    scenario_order = {
+        "highway_overtake": 0,
+        "lane_keep_5min": 1,
+    }
+    scope_order = {
+        "cross_subject": 0,
+        "per_subject": 1,
+    }
+    out = []
+    for (model_scope, scenario_name), rows in sorted(
+        grouped.items(),
+        key=lambda item: (
+            scope_order.get(_normalize_scope(item[0][0]), 99),
+            scenario_order.get(str(item[0][1]).strip().lower(), 99),
+        ),
+    ):
+        out.append(
+            {
+                "Model": _pretty_scope(model_scope),
+                "Scenario": _pretty_scenario(scenario_name),
+                "Runs": _round_or_blank(_mean(_to_float(row.get("source_run_count")) for row in rows), 0),
+                "Latency mean (ms)": _round_or_blank(_mean(_to_float(row.get("lat_e2e_mean_ms_mean")) for row in rows), 1),
+                "Latency p95 (ms)": _round_or_blank(_mean(_to_float(row.get("lat_e2e_p95_ms_mean")) for row in rows), 1),
+                "Scenario success rate (%)": _percent_or_blank(_mean(_to_float(row.get("drive_scenario_success_rate")) for row in rows)),
+                "Completion time (s)": _round_or_blank(_mean(_to_float(row.get("drive_completion_time_s_mean")) for row in rows), 1),
+                "Mean velocity (m/s)": _round_or_blank(_mean(_to_float(row.get("drive_mean_velocity_mps_mean")) for row in rows), 2),
+                "Mean velocity deviation (m/s)": _round_or_blank(_mean(_to_float(row.get("drive_mean_velocity_deviation_mps_mean")) for row in rows), 2),
+                "Lane offset mean (m)": _round_or_blank(_mean(_to_float(row.get("drive_lane_offset_mean_m_mean")) for row in rows), 3),
+                "Steering angle mean (rad)": _round_or_blank(_mean(_to_float(row.get("drive_steering_angle_mean_rad_mean")) for row in rows), 3),
+                "Steering entropy": _round_or_blank(_mean(_to_float(row.get("drive_steering_entropy_mean")) for row in rows), 3),
+                "Lane error RMSE (m)": _round_or_blank(_mean(_to_float(row.get("drive_lane_error_rmse_m_mean")) for row in rows), 3),
+                "Lane invasions": _round_or_blank(_mean(_to_float(row.get("drive_lane_invasions_mean")) for row in rows), 1),
+            }
+        )
+    return out
+
+
+def _write_publication_tables(capstone_rows, research_rows):
+    root = FINAL_CAPSTONE_TABLE_CSV.parent
+    outputs = [
+        (
+            root / "final_capstone_offline_table.csv",
+            _publication_offline_rows(capstone_rows, "capstone_report"),
+            PUBLICATION_OFFLINE_COLUMNS,
+        ),
+        (
+            root / "final_capstone_runtime_table.csv",
+            _publication_runtime_rows(capstone_rows, "capstone_report"),
+            PUBLICATION_RUNTIME_COLUMNS,
+        ),
+        (
+            root / "final_research_offline_table.csv",
+            _publication_offline_rows(research_rows, "research_paper"),
+            PUBLICATION_OFFLINE_COLUMNS,
+        ),
+        (
+            root / "final_research_runtime_table.csv",
+            _publication_runtime_rows(research_rows, "research_paper"),
+            PUBLICATION_RUNTIME_COLUMNS,
+        ),
+    ]
+    for path, rows, columns in outputs:
+        _safe_write_csv(path, rows, columns)
 
 
 def _write_template_manifest(path: Path):
@@ -705,6 +946,10 @@ def main(argv=None):
         _filter_deliverable(aggregate_rows, "capstone_report"),
         _filter_deliverable(aggregate_rows, "research_paper"),
     )
+    _write_publication_tables(
+        _filter_deliverable(aggregate_rows, "capstone_report"),
+        _filter_deliverable(aggregate_rows, "research_paper"),
+    )
 
     print(f"Loaded {len(manifest_rows)} manifest row(s)")
     print(f"Built {len(participant_rows)} participant row(s)")
@@ -712,6 +957,8 @@ def main(argv=None):
     print(f"Saved tables under {output_dir}")
     print(f"Saved top-level final capstone table to {FINAL_CAPSTONE_TABLE_CSV}")
     print(f"Saved top-level final research table to {FINAL_RESEARCH_TABLE_CSV}")
+    print(f"Saved publication-ready capstone tables to {FINAL_CAPSTONE_TABLE_CSV.parent}")
+    print(f"Saved publication-ready research tables to {FINAL_RESEARCH_TABLE_CSV.parent}")
 
 
 if __name__ == "__main__":

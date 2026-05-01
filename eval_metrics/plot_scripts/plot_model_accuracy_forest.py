@@ -101,6 +101,7 @@ def main(argv=None) -> None:
                     if not fold_values
                     else str(entry["display_label"])
                 ),
+                "scope": str(entry["scope"]),
                 "final_value": final_value,
                 "fold_values": fold_values,
                 "mean_value": mean_value,
@@ -119,10 +120,14 @@ def main(argv=None) -> None:
     fig, ax = plt.subplots(figsize=(13.4, 6.8), constrained_layout=True)
     rng = np.random.default_rng(11)
     y_positions = np.arange(len(rows), dtype=float)[::-1]
+    label_positions: list[float] = []
 
     for idx, row in enumerate(rows):
         y = y_positions[idx]
         ax.axhline(y, color="#e5e7eb", linewidth=0.8, zorder=0)
+        show_bundle = str(row.get("scope") or "").strip().lower() == "cross_subject" or not row["fold_values"]
+        if show_bundle:
+            label_positions.append(float(row["final_value"]) + 1.6)
         if row["fold_values"]:
             jitter = rng.uniform(-0.10, 0.10, size=len(row["fold_values"]))
             ax.scatter(
@@ -139,26 +144,51 @@ def main(argv=None) -> None:
                 hi = row["mean_value"] + row["ci95"]
                 ax.hlines(y, lo, hi, color="#111827", linewidth=2.2, zorder=3)
                 ax.vlines([lo, hi], y - 0.08, y + 0.08, color="#111827", linewidth=1.2, zorder=3)
+                ax.scatter(
+                    [row["mean_value"]],
+                    [y],
+                    marker="s",
+                    s=64,
+                    color="#111827",
+                    edgecolors="white",
+                    linewidths=0.8,
+                    zorder=4,
+                )
+                label_positions.append(float(max(hi, row["mean_value"])) + 1.6)
+                ax.text(
+                    float(row["mean_value"]) + 0.55,
+                    y - 0.16,
+                    f"{row['mean_value']:.1f}%",
+                    va="center",
+                    ha="left",
+                    fontsize=8.7,
+                    color="#111827",
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.92, "pad": 1.2},
+                    zorder=5,
+                )
 
-        ax.scatter(
-            [row["final_value"]],
-            [y],
-            marker="D",
-            s=88,
-            color=row["color"],
-            edgecolors="white",
-            linewidths=0.9,
-            zorder=4,
-        )
-        ax.text(
-            row["final_value"] + 0.55,
-            y,
-            f"{row['final_value']:.1f}%",
-            va="center",
-            ha="left",
-            fontsize=9,
-            color="#111827",
-        )
+        if show_bundle:
+            ax.scatter(
+                [row["final_value"]],
+                [y],
+                marker="D",
+                s=88,
+                color=row["color"],
+                edgecolors="white",
+                linewidths=0.9,
+                zorder=4,
+            )
+            ax.text(
+                float(row["final_value"]) + 0.55,
+                y + 0.16,
+                f"{row['final_value']:.1f}%",
+                va="center",
+                ha="left",
+                fontsize=8.7,
+                color="#111827",
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.92, "pad": 1.2},
+                zorder=5,
+            )
 
     metric_label = metric_labels.get(args.metric, args.metric.replace("_", " ").title())
     title = args.title.strip() or f"Offline {metric_label}"
@@ -175,7 +205,8 @@ def main(argv=None) -> None:
     min_value = min(all_values) if all_values else 0.0
     max_value = max(all_values) if all_values else 100.0
     lower_bound = 75.0 if min_value >= 75.0 else max(0.0, 5.0 * math.floor((min_value - 2.0) / 5.0))
-    upper_bound = max(100.0, 5.0 * math.ceil((max_value + 2.0) / 5.0))
+    label_bound = max(label_positions) if label_positions else max_value
+    upper_bound = max(100.0, 5.0 * math.ceil((max(max_value + 2.0, label_bound + 3.0)) / 5.0))
     ax.set_xlim(lower_bound, upper_bound)
 
     legend_handles = [
@@ -187,7 +218,7 @@ def main(argv=None) -> None:
             markerfacecolor="#334155",
             markeredgecolor="white",
             markersize=8,
-            label=f"Saved {metric_label.lower()}",
+            label=f"Bundled {metric_label.lower()}",
         ),
         Line2D(
             [0],
@@ -202,9 +233,20 @@ def main(argv=None) -> None:
         Line2D(
             [0],
             [0],
+            marker="s",
+            markersize=7,
+            markerfacecolor="#111827",
+            markeredgecolor="white",
             color="#111827",
             linewidth=2.2,
-            label=f"Mean per-fold {metric_label.lower()} +/- 95% confidence interval",
+            label=f"Mean per-fold {metric_label.lower()}",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color="#111827",
+            linewidth=2.2,
+            label="95% confidence interval around per-fold mean",
         ),
     ]
     ax.legend(

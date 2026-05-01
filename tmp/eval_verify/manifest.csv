@@ -1,2 +1,0 @@
-row_id,deliverable,task,model_scope,condition,arm,subject,status,comparison_group,model_path,model_filename,latency_json,drive_metrics_json,notes
-CR_4_PER,Capstone final report,4-gesture,Per-subject,current_cnn_pipeline,left,Matthew,Complete,,models/strict/per_subject/left/Matthewv6_4_gestures.pt,,tmp\eval_verify\latency_summary.json,tmp\eval_verify\drive_metrics_summary.json,synthetic verification

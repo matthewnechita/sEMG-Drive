@@ -49,6 +49,8 @@ def main() -> None:
     _remove_obsolete_outputs()
     _run(PIPELINE_SCRIPTS_ROOT / "gather_current_metrics.py")
     _run(PIPELINE_SCRIPTS_ROOT / "fill_table_manifest.py")
+    _run(PIPELINE_SCRIPTS_ROOT / "build_research_runtime_selection.py")
+    _run(PIPELINE_SCRIPTS_ROOT / "build_research_control_stability.py")
     _run(PIPELINE_SCRIPTS_ROOT / "build_eval_tables.py")
     _run(PLOT_SCRIPTS_ROOT / "make_report_figures.py")
 

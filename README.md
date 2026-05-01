@@ -1,3 +1,32 @@
+## AI Use Statement
+
+Tools and mode:
+- ChatGPT (OpenAI, public web interface; exact model/version varied over the project and was not always recorded)
+- GitHub Copilot (IDE coding assistant)
+- Local Codex agent using GPT-5.4
+
+What it did:
+- Helped generate and refine a refactor plan to improve the original CNN workflow, particularly the `GestureCNNv2` model path and the training scripts `train_per_subject.py` and `train_cross_subject.py`.
+- Assisted with debugging and improving the EMG resampling workflow, especially issues related to aligning multi- sensor streams onto a common time base in `emg/resample_raw_dataset.py`.
+- Assisted with general debugging and integration work across the EMG preprocessing, realtime inference, and CARLA- control code so that training, live inference, and simulator control used compatible assumptions.
+- Helped implement and refine automatic metric logging in `carla_integration/manual_control_emg.py`, including paired `carla_drive_*.csv` and `realtime_predictions_*.csv` outputs for later analysis.
+- Used in planning developing the simple scripts for the evaluation pipeline under `eval_metrics/`, including model-metric harvesting, latency analysis, CARLA metric analysis, and the scripts used to generate final plots and CSV tables for the report.
+
+Data exposure:
+- No sponsor-confidential information or participant-identifiable data were shared with public AI tools.
+- AI assistance was limited to code structure, debugging context, metric/reporting workflows, and documentation
+support based on repository materials and non-restricted project information.
+
+Verification:
+- All AI-assisted code changes were reviewed by the team before acceptance.
+- Model and pipeline changes were checked by running the affected scripts, inspecting outputs, and confirming behavior against the expected EMG, realtime inference, and CARLA workflows.
+- Evaluation-related outputs were verified against saved logs, generated CSV files, final figures, and the report tables derived from those artifacts.
+- Final technical claims and reported metrics were cross-checked against the repository code, generated outputs, and the team’s final evaluation materials.
+
+The team accepts full responsibility for the correctness, safety, originality, and integrity of the final repository
+contents.
+
+
 # EMG Driving Control Capstone
 
 This repository contains the maintained codebase for a capstone project on EMG-driven vehicle control. The project uses Delsys surface EMG sensors, consistent sensor placement, CNN-based gesture recognition, and CARLA driving scenarios to test whether upper-limb muscle activity can serve as a practical control interface for simple driving tasks.
