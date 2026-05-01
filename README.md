@@ -1,32 +1,3 @@
-## AI Use Statement
-
-Tools and mode:
-- ChatGPT (OpenAI, public web interface; exact model/version varied over the project and was not always recorded)
-- GitHub Copilot (IDE coding assistant)
-- Local Codex agent using GPT-5.4
-
-What it did:
-- Helped generate and refine a refactor plan to improve the original CNN workflow, particularly the `GestureCNNv2` model path and the training scripts `train_per_subject.py` and `train_cross_subject.py`.
-- Assisted with debugging and improving the EMG resampling workflow, especially issues related to aligning multi- sensor streams onto a common time base in `emg/resample_raw_dataset.py`.
-- Assisted with general debugging and integration work across the EMG preprocessing, realtime inference, and CARLA- control code so that training, live inference, and simulator control used compatible assumptions.
-- Helped implement and refine automatic metric logging in `carla_integration/manual_control_emg.py`, including paired `carla_drive_*.csv` and `realtime_predictions_*.csv` outputs for later analysis.
-- Used in planning developing the simple scripts for the evaluation pipeline under `eval_metrics/`, including model-metric harvesting, latency analysis, CARLA metric analysis, and the scripts used to generate final plots and CSV tables for the report.
-
-Data exposure:
-- No sponsor-confidential information or participant-identifiable data were shared with public AI tools.
-- AI assistance was limited to code structure, debugging context, metric/reporting workflows, and documentation
-support based on repository materials and non-restricted project information.
-
-Verification:
-- All AI-assisted code changes were reviewed by the team before acceptance.
-- Model and pipeline changes were checked by running the affected scripts, inspecting outputs, and confirming behavior against the expected EMG, realtime inference, and CARLA workflows.
-- Evaluation-related outputs were verified against saved logs, generated CSV files, final figures, and the report tables derived from those artifacts.
-- Final technical claims and reported metrics were cross-checked against the repository code, generated outputs, and the team’s final evaluation materials.
-
-The team accepts full responsibility for the correctness, safety, originality, and integrity of the final repository
-contents.
-
-
 # EMG Driving Control Capstone
 
 This repository contains the maintained codebase for a capstone project on EMG-driven vehicle control. The project uses Delsys surface EMG sensors, CNN-based gesture recognition, and CARLA driving scenarios to test whether upper-limb muscle activity can serve as a practical control interface for simple driving tasks.
@@ -209,8 +180,6 @@ The current repo has been cleaned down to the active workflow only:
 - keyboard-first + EMG CARLA control, with optional steering-wheel throttle/brake support still present in the client
 - one preferred CARLA camera view for evaluation, while the default camera toggle remains available in code
 
-Older experimental branches, unused model families, deprecated calibration paths, and stale evaluation scripts are not part of the maintained code path anymore.
-
 ## Quick Start
 
 ### 1. Collect and preprocess data
@@ -381,63 +350,6 @@ These produce the maintained live-run metrics:
   - lane invasions
 
 For `highway_overtake`, success/fail is carried by `scenario_success` on those overtake rows.
-
-### 4. Build report and paper tables
-
-For the normal no-flag path, refresh the filled manifest and rebuild the tables:
-
-```powershell
-python eval_metrics/pipeline_scripts/fill_table_manifest.py
-python eval_metrics/pipeline_scripts/build_eval_tables.py
-```
-
-Important: if you want `lane_keep_5min` and `highway_overtake` reported separately, keep them as separate manifest rows or separate conditions. The current table builder preserves the scenario name so those rows can stay distinct.
-
-For convenience, the final aggregate tables are also copied to the top level of `eval_metrics/`:
-
-- `eval_metrics/final_capstone_table.csv`
-- `eval_metrics/final_research_table.csv`
-
-### 5. Generate report-grade figures
-
-The maintained figure set is:
-
-- `confusion_matrix_row_norm.png`
-- `latency_ecdf.png`
-- `carla_run_distributions.png`
-- `model_accuracy_forest.png`
-- `model_metric_heatmap.png`
-- `gesture_embedding_clusters.png`
-- `drive_trace_representative.png`
-
-You can refresh the figure pack directly with:
-
-```powershell
-python eval_metrics/plot_scripts/make_report_figures.py
-```
-
-The maintained CARLA figure is `carla_run_distributions.png`, not the old summary-bar figure. It includes:
-
-- completion time
-- mean velocity
-- lane offset mean
-- steering angle mean
-- steering entropy
-- lane error RMSE
-- lane invasions
-
-The maintained offline model figures are:
-
-- `model_accuracy_forest.png`
-  - balanced accuracy by model with fold dots and a confidence interval where stored
-- `model_metric_heatmap.png`
-  - annotated comparison across balanced accuracy, macro precision, macro recall, macro F1, and worst-class recall
-- `gesture_embedding_clusters.png`
-  - qualitative 2D view of each current model's learned gesture embedding space
-- `drive_trace_representative.png`
-  - one representative lane-keep run and one representative highway-overtake run, plotted over time
-
-Evaluation documentation and script details also live in [eval_metrics/README.md](/C:/Users/matth/Desktop/capstone/capstone-emg/eval_metrics/README.md).
 
 ## Technical Reference
 
